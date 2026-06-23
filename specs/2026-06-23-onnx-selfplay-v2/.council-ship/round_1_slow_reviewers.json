@@ -1,0 +1,7 @@
+[
+  {
+    "role_id": "domain_fidelity",
+    "model": "google/gemini-3.1-pro-preview",
+    "seconds": 235.8
+  }
+]

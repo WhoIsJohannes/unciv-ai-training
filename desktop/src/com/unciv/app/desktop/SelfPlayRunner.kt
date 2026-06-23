@@ -110,13 +110,15 @@ object SelfPlayRunner {
         players.last().setNationTransient(ruleset)
     }
 
-    /** Resolve a map-size NAME (CLI arg) to its predefined [MapSize]; unknown ⇒ Tiny. */
+    /** Resolve a map-size NAME (CLI arg) to its predefined [MapSize]. Fails LOUD on an unknown name
+     *  (council 🟡) — a silent Tiny fallback would corrupt a Medium experiment on a typo. */
     private fun resolveMapSize(name: String): MapSize = when (name) {
+        "Tiny" -> MapSize.Tiny
         "Small" -> MapSize.Small
         "Medium" -> MapSize.Medium
         "Large" -> MapSize.Large
         "Huge" -> MapSize.Huge
-        else -> MapSize.Tiny
+        else -> error("unknown map size '$name' (expected Tiny|Small|Medium|Large|Huge)")
     }
 
     private fun mapParameters(seed: Long = 0, mapSizeName: String = "Tiny"): MapParameters = MapParameters().apply {
@@ -373,8 +375,10 @@ object SelfPlayRunner {
         }
         val env = OrtEnvironment.getEnvironment()
         val session = env.createSession(File(model).absolutePath, OrtSession.SessionOptions())
-        val inputs = OnnxPolicy.richTensorsFromArrays(env, global, acting, tokens)
+        // build tensors INSIDE the try so a build/parse failure still closes the session (council 🟡)
+        var inputs: LinkedHashMap<String, OnnxTensor>? = null
         try {
+            inputs = OnnxPolicy.richTensorsFromArrays(env, global, acting, tokens)
             session.run(inputs).use { res ->
                 @Suppress("UNCHECKED_CAST")
                 val tech = (res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor).value as Array<FloatArray>
@@ -385,7 +389,7 @@ object SelfPlayRunner {
                 )
             }
         } finally {
-            for (tt in inputs.values) try { tt.close() } catch (_: Exception) {}
+            inputs?.values?.forEach { tt -> try { tt.close() } catch (_: Exception) {} }
             session.close()
         }
         println("PARITY_RUN_RICH -> $logitsOut")

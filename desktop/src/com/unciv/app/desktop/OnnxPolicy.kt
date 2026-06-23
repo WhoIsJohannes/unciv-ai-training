@@ -61,6 +61,17 @@ class OnnxPolicy(
             "OnnxPolicy: model contract_version=$mContract not in {${SampleSchema.OnnxContract.CONTRACT_VERSION}, ${SampleSchema.OnnxContract.CONTRACT_VERSION_RICH}}"
         }
         check(mFingerprint == expectedRulesetFingerprint) { "OnnxPolicy: model ruleset_fingerprint mismatch (regenerate against the live ruleset)" }
+        // PROVENANCE (council): a v2 model must actually expose the full multi-tensor input inventory —
+        // catches a contract_version=2 model whose token set drifted from the contract.
+        if (rich) {
+            val want = mutableListOf(SampleSchema.OnnxContract.INPUT_GLOBAL, SampleSchema.OnnxContract.INPUT_ACTING)
+            for (n in SampleSchema.OnnxContract.RICH_TOKEN_NAMES) {
+                want += n; want += n + SampleSchema.OnnxContract.MASK_SUFFIX
+            }
+            val have = session.inputNames
+            val missing = want.filter { it !in have }
+            check(missing.isEmpty()) { "OnnxPolicy: rich (v2) model missing expected inputs $missing (model has $have)" }
+        }
     }
 
     /** One forward pass per (game, civ, turn), reused across the two head calls of that turn.
@@ -133,13 +144,25 @@ class OnnxPolicy(
         /** Build the contract-v2 multi-tensor input from a live [Observation]. Shared by inference
          *  and the parity harness so JVM tensor construction is identical in both. Caller closes the
          *  returned tensors. u8 blocks (spatial) are fed as float32 (matches the training dtype). */
+        // Fallback per-token widths if a block is absent from the Observation (a real shard always
+        // emits all six, even empty ones — this just avoids a decision-time crash if a future schema
+        // change drops one; the empty token set is handled by the masked pool).
+        private val FALLBACK_WIDTH = mapOf("own_units" to 8, "opp_units" to 8,
+                                           "own_cities" to 16, "opp_cities" to 16, "civ_tokens" to 84)
+
         fun buildRichTensors(env: OrtEnvironment, obs: Observation): LinkedHashMap<String, OnnxTensor> {
             val tokens = SampleSchema.OnnxContract.RICH_TOKEN_NAMES.map { name ->
-                val width = if (name == "spatial") SampleSchema.NUM_SPATIAL_CHANNELS
-                            else obs.blocks.first { it.name == name }.perItem
-                Triple(name, obs.block(name), width)
+                val blk = obs.blocks.firstOrNull { it.name == name }   // defensive: absent → empty set
+                val width = when {
+                    name == "spatial" -> SampleSchema.NUM_SPATIAL_CHANNELS
+                    blk != null && blk.perItem > 0 -> blk.perItem
+                    else -> FALLBACK_WIDTH.getValue(name)
+                }
+                Triple(name, blk?.values ?: FloatArray(0), width)
             }
-            return richTensorsFromArrays(env, obs.block("global"), obs.block("acting_civ"), tokens)
+            val g = obs.blocks.firstOrNull { it.name == "global" }?.values ?: FloatArray(0)
+            val a = obs.blocks.firstOrNull { it.name == "acting_civ" }?.values ?: FloatArray(0)
+            return richTensorsFromArrays(env, g, a, tokens)
         }
 
         /** Single source of truth for v2 tensor construction (used by live inference AND the parity
@@ -150,14 +173,19 @@ class OnnxPolicy(
             tokens: List<Triple<String, FloatArray, Int>>,
         ): LinkedHashMap<String, OnnxTensor> {
             val out = LinkedHashMap<String, OnnxTensor>()
-            out[SampleSchema.OnnxContract.INPUT_GLOBAL] = vecTensor(env, global)
-            out[SampleSchema.OnnxContract.INPUT_ACTING] = vecTensor(env, acting)
-            for ((name, values, width) in tokens) {
-                val (tok, mask) = tokenTensors(env, values, width)
-                out[name] = tok
-                out[name + SampleSchema.OnnxContract.MASK_SUFFIX] = mask
+            try {  // leak-safe (council 🔴): close any partially-built tensors if createTensor throws
+                out[SampleSchema.OnnxContract.INPUT_GLOBAL] = vecTensor(env, global)
+                out[SampleSchema.OnnxContract.INPUT_ACTING] = vecTensor(env, acting)
+                for ((name, values, width) in tokens) {
+                    val (tok, mask) = tokenTensors(env, values, width)
+                    out[name] = tok
+                    out[name + SampleSchema.OnnxContract.MASK_SUFFIX] = mask
+                }
+                return out
+            } catch (e: Throwable) {
+                for (t in out.values) try { t.close() } catch (_: Exception) {}
+                throw e
             }
-            return out
         }
 
         private fun vecTensor(env: OrtEnvironment, v: FloatArray): OnnxTensor =

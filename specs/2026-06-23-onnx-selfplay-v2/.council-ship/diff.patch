@@ -1,0 +1,1827 @@
+diff --git a/core/src/com/unciv/logic/simulation/dataplane/SampleSchema.kt b/core/src/com/unciv/logic/simulation/dataplane/SampleSchema.kt
+index ec8488bd9..3fff2585f 100644
+--- a/core/src/com/unciv/logic/simulation/dataplane/SampleSchema.kt
++++ b/core/src/com/unciv/logic/simulation/dataplane/SampleSchema.kt
+@@ -34,12 +34,22 @@ object SampleSchema {
+      * per-entity heads keep the heuristic/RandomPolicy fallback.
+      */
+     object OnnxContract {
++        /** Contract v1 = blind single-tensor input ("obs"); v1-reinforce + blind-critic models. */
+         const val CONTRACT_VERSION = 1
+-        /** Net input tensor: concat(observation block "global", block "acting_civ"), float32. */
++        /** Contract v2 = rich MULTI-TENSOR input (global, acting_civ, per-type token sets + masks);
++         *  rich-critic models. OnnxPolicy reads META_CONTRACT_VERSION and selects the build path,
++         *  so v1 and v2 models coexist (the provenance gate accepts either). */
++        const val CONTRACT_VERSION_RICH = 2
++        /** Net input tensor (v1): concat(observation block "global", block "acting_civ"), float32. */
+         const val INPUT_NAME = "obs"
++        // v2 named multi-tensor inputs. Each token set pairs with a "<name>_mask" presence mask.
++        const val INPUT_GLOBAL = "global"
++        const val INPUT_ACTING = "acting_civ"
++        val RICH_TOKEN_NAMES = listOf("spatial", "own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens")
++        const val MASK_SUFFIX = "_mask"
+         const val OUTPUT_TECH = "tech_logits"
+         const val OUTPUT_POLICY = "policy_logits"
+-        /** The civ-level heads the net controls in v1, in `actions`-block order. */
++        /** The civ-level heads the net controls, in `actions`-block order. */
+         val MODELED_HEADS = listOf("tech", "policy")
+         // ONNX metadata_props keys (provenance gate — read on the JVM via session.getMetadata()).
+         const val META_SCHEMA_VERSION = "schema_version"
+@@ -48,6 +58,7 @@ object SampleSchema {
+         const val META_INPUT_WIDTH = "input_width"
+         const val META_TECH_WIDTH = "tech_width"
+         const val META_POLICY_WIDTH = "policy_width"
++        const val META_INPUT_NAMES = "input_names"   // comma-joined ordered tensor names (v2)
+     }
+ 
+     // numpy-style little-endian dtype tags recorded in the header (cross-checked by the reader).
+diff --git a/desktop/src/com/unciv/app/desktop/OnnxPolicy.kt b/desktop/src/com/unciv/app/desktop/OnnxPolicy.kt
+index b177a9491..9bdddf985 100644
+--- a/desktop/src/com/unciv/app/desktop/OnnxPolicy.kt
++++ b/desktop/src/com/unciv/app/desktop/OnnxPolicy.kt
+@@ -7,6 +7,7 @@ import com.unciv.logic.automation.unit.UnitAutomation
+ import com.unciv.logic.civilization.Civilization
+ import com.unciv.logic.map.mapunit.MapUnit
+ import com.unciv.logic.simulation.dataplane.Featurizer
++import com.unciv.logic.simulation.dataplane.Observation
+ import com.unciv.logic.simulation.dataplane.PolicyProvider
+ import com.unciv.logic.simulation.dataplane.SampleConfig
+ import com.unciv.logic.simulation.dataplane.SampleSchema
+@@ -39,6 +40,8 @@ class OnnxPolicy(
+ 
+     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
+     private val session: OrtSession
++    /** True when the loaded model is contract v2 (rich multi-tensor input). */
++    private val rich: Boolean
+ 
+     init {
+         val f = java.io.File(modelPath)
+@@ -46,13 +49,17 @@ class OnnxPolicy(
+         val opts = OrtSession.SessionOptions().apply { setIntraOpNumThreads(1) }
+         session = env.createSession(f.absolutePath, opts)
+         // PROVENANCE gate (criterion 6): refuse a model whose contract/schema/ruleset mismatches.
++        // Accepts contract v1 (blind) OR v2 (rich) — the build path is selected by `rich`.
+         val meta = session.metadata.customMetadata
+         fun req(key: String) = meta[key] ?: error("OnnxPolicy: model missing ONNX metadata '$key'")
+         val mSchema = req(SampleSchema.OnnxContract.META_SCHEMA_VERSION).toInt()
+         val mContract = req(SampleSchema.OnnxContract.META_CONTRACT_VERSION).toInt()
+         val mFingerprint = req(SampleSchema.OnnxContract.META_RULESET_FINGERPRINT)
+         check(mSchema == expectedSchemaVersion) { "OnnxPolicy: model schema_version=$mSchema != live $expectedSchemaVersion (regenerate)" }
+-        check(mContract == SampleSchema.OnnxContract.CONTRACT_VERSION) { "OnnxPolicy: model contract_version=$mContract != ${SampleSchema.OnnxContract.CONTRACT_VERSION}" }
++        rich = mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_RICH
++        check(mContract == SampleSchema.OnnxContract.CONTRACT_VERSION || rich) {
++            "OnnxPolicy: model contract_version=$mContract not in {${SampleSchema.OnnxContract.CONTRACT_VERSION}, ${SampleSchema.OnnxContract.CONTRACT_VERSION_RICH}}"
++        }
+         check(mFingerprint == expectedRulesetFingerprint) { "OnnxPolicy: model ruleset_fingerprint mismatch (regenerate against the live ruleset)" }
+     }
+ 
+@@ -67,9 +74,12 @@ class OnnxPolicy(
+     private val decisions = java.util.concurrent.atomic.AtomicLong(0)
+     fun decisionCount(): Long = decisions.get()
+ 
+-    /** Public single-input inference for the PARITY test (no masking/sampling). */
++    /** Public single-input inference for the blind PARITY test (no masking/sampling). */
+     fun infer(input: FloatArray): Pair<FloatArray, FloatArray> = forward(input)
+ 
++    /** True when the loaded model uses the rich multi-tensor contract (v2). */
++    fun isRich(): Boolean = rich
++
+     override fun chooseIndex(head: String, civ: Civilization, legalMask: BooleanArray, turn: Int): Int {
+         if (head !in SampleSchema.OnnxContract.MODELED_HEADS) return -1
+         val logits = logitsFor(head, civ, turn)
+@@ -83,8 +93,8 @@ class OnnxPolicy(
+         val cached = memo.get()
+         val m = if (cached != null && cached.key == key) cached else run {
+             val obs = Featurizer(civ.gameInfo, vocab, config).observe(civ)
+-            val input = obs.block("global") + obs.block("acting_civ")
+-            val (tech, policy) = forward(input)
++            val (tech, policy) = if (rich) forwardRich(obs)
++                                 else forward(obs.block("global") + obs.block("acting_civ"))
+             Memo(key, tech, policy).also { memo.set(it) }
+         }
+         return if (head == "tech") m.techLogits else m.policyLogits
+@@ -100,9 +110,72 @@ class OnnxPolicy(
+         }
+     }
+ 
++    /** Rich (contract v2) forward: build the SAME multi-tensor input the trainer pads (per-tile
++     *  spatial token set + per-type entity token sets, each with a presence mask), feed onnxruntime,
++     *  read the policy logits. EVERY created [OnnxTensor] is closed (no native leak — council R7). */
++    private fun forwardRich(obs: Observation): Pair<FloatArray, FloatArray> {
++        val inputs = buildRichTensors(env, obs)
++        try {
++            session.run(inputs).use { res ->
++                val tech = row(res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor)
++                val policy = row(res.get(SampleSchema.OnnxContract.OUTPUT_POLICY).get() as OnnxTensor)
++                return tech to policy
++            }
++        } finally {
++            for (t in inputs.values) try { t.close() } catch (_: Exception) {}
++        }
++    }
++
+     @Suppress("UNCHECKED_CAST")
+     private fun row(t: OnnxTensor): FloatArray = (t.value as Array<FloatArray>)[0]
+ 
++    companion object {
++        /** Build the contract-v2 multi-tensor input from a live [Observation]. Shared by inference
++         *  and the parity harness so JVM tensor construction is identical in both. Caller closes the
++         *  returned tensors. u8 blocks (spatial) are fed as float32 (matches the training dtype). */
++        fun buildRichTensors(env: OrtEnvironment, obs: Observation): LinkedHashMap<String, OnnxTensor> {
++            val tokens = SampleSchema.OnnxContract.RICH_TOKEN_NAMES.map { name ->
++                val width = if (name == "spatial") SampleSchema.NUM_SPATIAL_CHANNELS
++                            else obs.blocks.first { it.name == name }.perItem
++                Triple(name, obs.block(name), width)
++            }
++            return richTensorsFromArrays(env, obs.block("global"), obs.block("acting_civ"), tokens)
++        }
++
++        /** Single source of truth for v2 tensor construction (used by live inference AND the parity
++         *  harness, so JVM↔Python parity tests exactly what runs in play). `tokens` = ordered
++         *  (name, flat-values, perItem-width). */
++        fun richTensorsFromArrays(
++            env: OrtEnvironment, global: FloatArray, acting: FloatArray,
++            tokens: List<Triple<String, FloatArray, Int>>,
++        ): LinkedHashMap<String, OnnxTensor> {
++            val out = LinkedHashMap<String, OnnxTensor>()
++            out[SampleSchema.OnnxContract.INPUT_GLOBAL] = vecTensor(env, global)
++            out[SampleSchema.OnnxContract.INPUT_ACTING] = vecTensor(env, acting)
++            for ((name, values, width) in tokens) {
++                val (tok, mask) = tokenTensors(env, values, width)
++                out[name] = tok
++                out[name + SampleSchema.OnnxContract.MASK_SUFFIX] = mask
++            }
++            return out
++        }
++
++        private fun vecTensor(env: OrtEnvironment, v: FloatArray): OnnxTensor =
++            OnnxTensor.createTensor(env, FloatBuffer.wrap(v), longArrayOf(1, v.size.toLong()))
++
++        /** [1, N, width] token tensor + [1, N] presence mask. Empty set ⇒ N=1 zero-token, mask=[0]
++         *  (so the model's masked pool sees N≥1 — matches the trainer's pad-to-max(1,count)). */
++        private fun tokenTensors(env: OrtEnvironment, values: FloatArray, width: Int): Pair<OnnxTensor, OnnxTensor> {
++            val count = if (width > 0) values.size / width else 0
++            val n = maxOf(1, count)
++            val data = if (count > 0) values else FloatArray(width)
++            val mask = FloatArray(n) { if (it < count) 1f else 0f }
++            val tok = OnnxTensor.createTensor(env, FloatBuffer.wrap(data), longArrayOf(1, n.toLong(), width.toLong()))
++            val msk = OnnxTensor.createTensor(env, FloatBuffer.wrap(mask), longArrayOf(1, n.toLong()))
++            return tok to msk
++        }
++    }
++
+     override fun actUnit(unit: MapUnit) = UnitAutomation.automateUnitMoves(unit)
+ 
+     override fun close() {
+diff --git a/desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt b/desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt
+index 65e46fc41..b7a8769ee 100644
+--- a/desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt
++++ b/desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt
+@@ -69,6 +69,8 @@ object SelfPlayRunner {
+             "eval" -> { bootstrap(); eval(args) }
+             "parity-dump" -> { bootstrap(); parityDump(args) }
+             "parity-run" -> parityRun(args)   // ORT only — no engine bootstrap needed
++            "parity-dump-rich" -> { bootstrap(); parityDumpRich(args) }
++            "parity-run-rich" -> parityRunRich(args)   // ORT only — multi-tensor v2 contract
+             "trace" -> { bootstrap(); trace(args) }
+             else -> error("unknown mode '$mode'")
+         }
+@@ -108,8 +110,17 @@ object SelfPlayRunner {
+         players.last().setNationTransient(ruleset)
+     }
+ 
+-    private fun mapParameters(seed: Long = 0): MapParameters = MapParameters().apply {
+-        mapSize = MapSize.Tiny
++    /** Resolve a map-size NAME (CLI arg) to its predefined [MapSize]; unknown ⇒ Tiny. */
++    private fun resolveMapSize(name: String): MapSize = when (name) {
++        "Small" -> MapSize.Small
++        "Medium" -> MapSize.Medium
++        "Large" -> MapSize.Large
++        "Huge" -> MapSize.Huge
++        else -> MapSize.Tiny
++    }
++
++    private fun mapParameters(seed: Long = 0, mapSizeName: String = "Tiny"): MapParameters = MapParameters().apply {
++        mapSize = resolveMapSize(mapSizeName)
+         noRuins = true
+         noNaturalWonders = true
+         legendaryStart = true
+@@ -121,8 +132,8 @@ object SelfPlayRunner {
+ 
+     /** Template game info Simulation re-starts each iteration from (with per-iteration seeds). */
+     @ExperimentalTime
+-    private fun buildBaseGameInfo(ruleset: Ruleset): GameInfo {
+-        val gsi = GameSetupInfo(gameParameters(ruleset), mapParameters())
++    private fun buildBaseGameInfo(ruleset: Ruleset, mapSizeName: String = "Tiny"): GameInfo {
++        val gsi = GameSetupInfo(gameParameters(ruleset), mapParameters(0, mapSizeName))
+         val newGame = GameStarter.startNewGame(gsi)
+         newGame.gameParameters.victoryTypes = ArrayList(newGame.ruleset.victories.keys)
+         UncivGame.Current.gameInfo = newGame
+@@ -137,6 +148,7 @@ object SelfPlayRunner {
+         val maxTurns = args.getOrNull(4)?.toIntOrNull() ?: 325
+         val threads = args.getOrNull(5)?.toIntOrNull() ?: 1
+         val seed = args.getOrNull(6)?.toLongOrNull() ?: 1L
++        val mapSizeName = args.getOrNull(7) ?: "Tiny"
+ 
+         val ruleset = setupRuleset()
+         val fingerprint = RulesetFingerprint.compute(ruleset)
+@@ -149,7 +161,7 @@ object SelfPlayRunner {
+             else OnnxPolicy(modelArg, vocab, config, DataPlaneHooks.defaultRngFor(), eval = false, SampleSchema.VERSION, fingerprint)
+         val policy = RoutingPolicy(LEARNER, learner, RandomPolicy(DataPlaneHooks.defaultRngFor()))
+ 
+-        val base = buildBaseGameInfo(ruleset)
++        val base = buildBaseGameInfo(ruleset, mapSizeName)
+         val perThread = (nGames + threads - 1) / threads
+         val sim = Simulation(
+             base, simulationsPerThread = perThread, threadsNumber = threads, maxTurns = maxTurns,
+@@ -158,7 +170,7 @@ object SelfPlayRunner {
+         )
+         sim.start()
+         (learner as? OnnxPolicy)?.close()
+-        println("SELFPLAY_GEN_DONE games=${sim.steps.size} dir=$outDir model=$modelArg seed=$seed")
++        println("SELFPLAY_GEN_DONE games=${sim.steps.size} dir=$outDir model=$modelArg seed=$seed mapSize=$mapSizeName")
+     }
+ 
+     @ExperimentalTime
+@@ -168,6 +180,7 @@ object SelfPlayRunner {
+         val maxTurns = args.getOrNull(3)?.toIntOrNull() ?: 325
+         val threads = args.getOrNull(4)?.toIntOrNull() ?: 1
+         val seed = args.getOrNull(5)?.toLongOrNull() ?: 999_000L
++        val mapSizeName = args.getOrNull(6) ?: "Tiny"
+ 
+         val ruleset = setupRuleset()
+         val fingerprint = RulesetFingerprint.compute(ruleset)
+@@ -178,7 +191,7 @@ object SelfPlayRunner {
+         val onnx = OnnxPolicy(modelArg, vocab, config, DataPlaneHooks.defaultRngFor(), eval = true, SampleSchema.VERSION, fingerprint)
+         val policy = RoutingPolicy(LEARNER, onnx, RandomPolicy(DataPlaneHooks.defaultRngFor()))
+ 
+-        val base = buildBaseGameInfo(ruleset)
++        val base = buildBaseGameInfo(ruleset, mapSizeName)
+         val perThread = (mGames + threads - 1) / threads
+         val sim = Simulation(
+             base, simulationsPerThread = perThread, threadsNumber = threads, maxTurns = maxTurns,
+@@ -300,4 +313,81 @@ object SelfPlayRunner {
+         }
+         println("PARITY_RUN -> $logitsOut")
+     }
++
++    // --- Rich (contract v2) multi-tensor parity ---------------------------------------------------
++    // Fixture text format (shared with the Python test, one block per line):
++    //   "<name> vec <floats...>"                      — global, acting_civ
++    //   "<name> set <count> <width> <floats...>"       — spatial + entity token sets (flat row-major)
++
++    @ExperimentalTime
++    private fun parityDumpRich(args: Array<String>) {
++        val seed = args.getOrNull(1)?.toLongOrNull() ?: 4242L
++        val obsOut = args.getOrNull(2) ?: "parity-obs-rich.txt"
++        val mapSizeName = args.getOrNull(3) ?: "Tiny"
++        val ruleset = setupRuleset()
++        val vocab = Vocab(ruleset)
++        val config = SampleConfig(enabled = false, caps = SampleCaps.DEFAULT)
++        val gsi = GameSetupInfo(gameParameters(ruleset), mapParameters(seed, mapSizeName))
++        val game = GameStarter.startNewGame(gsi)
++        UncivGame.Current.gameInfo = game
++        val learner = game.civilizations.first { it.civID == LEARNER }
++        val obs = Featurizer(game, vocab, config).observe(learner)
++        val sb = StringBuilder()
++        sb.appendLine("global vec " + obs.block("global").joinToString(" "))
++        sb.appendLine("acting_civ vec " + obs.block("acting_civ").joinToString(" "))
++        for (name in SampleSchema.OnnxContract.RICH_TOKEN_NAMES) {
++            val width = if (name == "spatial") SampleSchema.NUM_SPATIAL_CHANNELS
++                        else obs.blocks.first { it.name == name }.perItem
++            val vals = obs.block(name)
++            val count = if (width > 0) vals.size / width else 0
++            sb.appendLine("$name set $count $width " + vals.joinToString(" "))
++        }
++        File(obsOut).writeText(sb.toString())
++        println("PARITY_DUMP_RICH seed=$seed mapSize=$mapSizeName -> $obsOut")
++    }
++
++    private fun parityRunRich(args: Array<String>) {
++        val model = args.getOrNull(1) ?: error("parity-run-rich: model path required")
++        val obsIn = args.getOrNull(2) ?: error("parity-run-rich: obs file required")
++        val logitsOut = args.getOrNull(3) ?: "parity-jvm-logits-rich.json"
++
++        var global = FloatArray(0)
++        var acting = FloatArray(0)
++        val tokens = ArrayList<Triple<String, FloatArray, Int>>()
++        for (raw in File(obsIn).readLines()) {
++            val line = raw.trim()
++            if (line.isEmpty()) continue
++            val t = line.split(Regex("\\s+"))
++            val name = t[0]
++            when (t[1]) {
++                "vec" -> {
++                    val v = FloatArray(t.size - 2) { t[it + 2].toFloat() }
++                    if (name == "global") global = v else if (name == "acting_civ") acting = v
++                }
++                "set" -> {
++                    val count = t[2].toInt(); val width = t[3].toInt()
++                    val v = FloatArray(count * width) { t[it + 4].toFloat() }
++                    tokens.add(Triple(name, v, width))
++                }
++            }
++        }
++        val env = OrtEnvironment.getEnvironment()
++        val session = env.createSession(File(model).absolutePath, OrtSession.SessionOptions())
++        val inputs = OnnxPolicy.richTensorsFromArrays(env, global, acting, tokens)
++        try {
++            session.run(inputs).use { res ->
++                @Suppress("UNCHECKED_CAST")
++                val tech = (res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor).value as Array<FloatArray>
++                @Suppress("UNCHECKED_CAST")
++                val policy = (res.get(SampleSchema.OnnxContract.OUTPUT_POLICY).get() as OnnxTensor).value as Array<FloatArray>
++                File(logitsOut).writeText(
++                    "{\"tech\":[${tech[0].joinToString(",")}],\"policy\":[${policy[0].joinToString(",")}]}"
++                )
++            }
++        } finally {
++            for (tt in inputs.values) try { tt.close() } catch (_: Exception) {}
++            session.close()
++        }
++        println("PARITY_RUN_RICH -> $logitsOut")
++    }
+ }
+diff --git a/python/run_acceptance.sh b/python/run_acceptance.sh
+new file mode 100755
+index 000000000..a01a3f75c
+--- /dev/null
++++ b/python/run_acceptance.sh
+@@ -0,0 +1,42 @@
++#!/usr/bin/env bash
++# Full v2 acceptance run (reproducible). Resumable: each run uses --resume, so re-launching
++# continues from the last completed round (per-round curve.csv + checkpoints). Bounded by D13.
++#
++#   THREADS=12 OUT_ROOT=../training-runs/v2 ./run_acceptance.sh
++#
++# Produces, under $OUT_ROOT:
++#   {v1-reinforce,blind-critic,rich-critic}-tiny/curve.csv   (AC1 + AC2)
++#   {blind-critic,rich-critic}-medium/curve.csv              (AC3)
++#   acceptance-report.md + overlay plots                      (analyze.py)
++set -uo pipefail
++cd "$(dirname "$0")"
++export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home}"
++PY=.venv/bin/python
++ROOT="${OUT_ROOT:-../training-runs/v2}"
++TH="${THREADS:-12}"
++TINY_ROUNDS="${TINY_ROUNDS:-12}"
++MED_ROUNDS="${MED_ROUNDS:-8}"
++mkdir -p "$ROOT"
++log() { echo "[$(date -u +%H:%M:%S)] $*"; }
++
++# --- Tiny: the three attributable variants (AC1 curves; AC2 = v1-reinforce vs blind-critic) ---
++for V in v1-reinforce blind-critic rich-critic; do
++  log "TINY $V ($TINY_ROUNDS rounds)"
++  $PY -m unciv_train.run_loop --variant "$V" --map-size Tiny --rounds "$TINY_ROUNDS" \
++      --gen-games 24 --eval-games 100 --turn-cap 250 --threads "$TH" \
++      --out "$ROOT/$V-tiny" --resume || log "TINY $V FAILED (continuing)"
++done
++
++# --- Medium: blind vs rich (AC3 ceiling — where positional/board info should matter) ---
++for V in blind-critic rich-critic; do
++  log "MEDIUM $V ($MED_ROUNDS rounds)"
++  $PY -m unciv_train.run_loop --variant "$V" --map-size Medium --rounds "$MED_ROUNDS" \
++      --gen-games 16 --eval-games 80 --turn-cap 250 --threads "$TH" \
++      --out "$ROOT/$V-medium" --resume || log "MEDIUM $V FAILED (continuing)"
++done
++
++# --- Acceptance analysis (AC1/AC2/AC3 + plots; runs a final high-N Medium ceiling eval) ---
++log "ANALYZE"
++$PY -m unciv_train.analyze --root "$ROOT" --ceiling-games 200 --turn-cap 250 --threads "$TH" \
++    || log "ANALYZE FAILED"
++log "DONE"
+diff --git a/python/tests/test_gae.py b/python/tests/test_gae.py
+new file mode 100644
+index 000000000..faeceda05
+--- /dev/null
++++ b/python/tests/test_gae.py
+@@ -0,0 +1,81 @@
++"""RED-first spec for v2 Stage A: actor-critic value head + GAE + terminal-only reward.
++
++Pins the contracts the build must satisfy:
++  1. PolicyNet has a value head; forward() returns (tech_logits, policy_logits, value).
++  2. compute_gae() implements episodic GAE with V(terminal)=0 bootstrap, reward 0
++     except the terminal step (terminal-only ±1 — no shaped intermediate reward).
++  3. The EXPORTED play ONNX drops the value head (policy-only contract).
++
++These FAIL on v1 (forward is a 2-tuple; no value_head; no compute_gae) and go GREEN
++after Stage A.
++"""
++import numpy as np
++import pytest
++
++from unciv_train.contract import Dims
++from unciv_train.model import PolicyNet
++
++torch = pytest.importorskip("torch")
++
++
++def _dims() -> Dims:
++    # synthetic small contract (same shape family as the GnK contract)
++    return Dims(global_w=4, acting_w=4, tech_w=5, policy_w=4)
++
++
++def test_model_forward_returns_value():
++    net = PolicyNet(_dims())
++    assert hasattr(net, "value_head"), "PolicyNet must have a value_head (training-only critic)"
++    obs = torch.zeros(3, _dims().input_w)
++    out = net(obs)
++    assert len(out) == 3, "forward() must return (tech_logits, policy_logits, value)"
++    tech, policy, value = out
++    assert tech.shape == (3, 5)
++    assert policy.shape == (3, 4)
++    # value is a per-state scalar
++    assert value.reshape(3, -1).shape[1] == 1
++
++
++def test_compute_gae_terminal_only_reward():
++    """Hand-computed episodic GAE, V(terminal)=0, reward 0 except terminal +1.
++
++    T=2, V=[0.5,0.2], r=[0,1], gamma=0.99, lam=0.95:
++      d1 = 1 + 0.99*0 - 0.2  = 0.8
++      d0 = 0 + 0.99*0.2 - 0.5 = -0.302
++      A1 = d1                 = 0.8
++      A0 = d0 + 0.99*0.95*A1  = 0.4504
++      R  = A + V              = [0.9504, 1.0]
++    """
++    from unciv_train.train import compute_gae
++
++    values = np.array([0.5, 0.2], dtype=np.float32)
++    rewards = np.array([0.0, 1.0], dtype=np.float32)  # terminal-only
++    adv, ret = compute_gae(rewards, values, gamma=0.99, lam=0.95)
++    np.testing.assert_allclose(adv, [0.4504, 0.8], atol=1e-4)
++    np.testing.assert_allclose(ret, [0.9504, 1.0], atol=1e-4)
++
++
++def test_gae_loss_reward_is_terminal_only():
++    """Guard AC7: the trajectory's reward vector is zero everywhere except the last step."""
++    from unciv_train.train import compute_gae
++
++    values = np.array([0.1, 0.1, 0.1, 0.1], dtype=np.float32)
++    rewards = np.zeros(4, dtype=np.float32)
++    rewards[-1] = -1.0  # a loss; still terminal-only
++    adv, ret = compute_gae(rewards, values, gamma=0.99, lam=0.95)
++    # final-step advantage = r_T + gamma*0 - V_T = -1 - 0.1 = -1.1
++    np.testing.assert_allclose(adv[-1], -1.1, atol=1e-4)
++
++
++def test_export_drops_value_head(tmp_path):
++    """Exported play ONNX is policy-only — value head provably dropped (council 🟡)."""
++    import onnx
++    from unciv_train import export_onnx
++
++    dims = _dims()
++    net = PolicyNet(dims)
++    out = tmp_path / "m.onnx"
++    export_onnx.export(net, dims, out, schema_version=2, ruleset_fingerprint="deadbeef")
++    model = onnx.load(str(out))
++    names = {o.name for o in model.graph.output}
++    assert names == {"tech_logits", "policy_logits"}, f"value head leaked into export: {names}"
+diff --git a/python/tests/test_parity.py b/python/tests/test_parity.py
+index 7cf5c6e71..7acc1d224 100644
+--- a/python/tests/test_parity.py
++++ b/python/tests/test_parity.py
+@@ -64,3 +64,68 @@ def test_jvm_python_logits_match(tmp_path):
+ 
+     assert np.allclose(py_tech, jvm_tech, atol=ATOL), f"tech logits drift > {ATOL}: {py_tech} vs {jvm_tech}"
+     assert np.allclose(py_policy, jvm_policy, atol=ATOL), f"policy logits drift > {ATOL}: {py_policy} vs {jvm_policy}"
++
++
++def _fixture_line_vec(name: str, v: np.ndarray) -> str:
++    return f"{name} vec " + " ".join(repr(float(x)) for x in v)
++
++
++def _fixture_line_set(name: str, arr: np.ndarray, width: int) -> str:
++    return f"{name} set {arr.shape[0]} {width} " + " ".join(repr(float(x)) for x in arr.reshape(-1))
++
++
++@pytest.mark.skipif(not _toolchain_ok(), reason="JVM toolchain (gradlew + JDK) not available")
++def test_jvm_python_rich_logits_match(tmp_path):
++    """AC4 over the contract-v2 MULTI-TENSOR input: JVM-built tensors + logits must match the Python
++    reference for a fixed rich observation (incl. an empty entity set → the masked-pool NaN guard)."""
++    from unciv_train.export_onnx import export_rich
++    from unciv_train.features import build_rich_single
++    from unciv_train.model import RichPolicyValueNet
++
++    dims = Dims(global_w=4, acting_w=4, tech_w=5, policy_w=4)
++    token_specs = {"spatial": 3, "own_units": 2, "opp_units": 2,
++                   "own_cities": 2, "opp_cities": 2, "civ_tokens": 3}
++    torch.manual_seed(7)
++    net = RichPolicyValueNet(dims, token_specs, token_dim=8, hidden=16)
++    model = tmp_path / "parity_rich.onnx"
++    export_rich(net, dims, token_specs, model, schema_version=2, ruleset_fingerprint="paritytest")
++
++    rng = np.random.default_rng(0)
++    blocks = {
++        "global": rng.standard_normal(4).astype(np.float32),
++        "acting_civ": rng.standard_normal(4).astype(np.float32),
++        "spatial": rng.standard_normal((7, 3)).astype(np.float32),
++        "own_units": rng.standard_normal((2, 2)).astype(np.float32),
++        "opp_units": np.zeros((0, 2), np.float32),        # empty set → NaN-guard path
++        "own_cities": rng.standard_normal((1, 2)).astype(np.float32),
++        "opp_cities": np.zeros((0, 2), np.float32),
++        "civ_tokens": rng.standard_normal((2, 3)).astype(np.float32),
++    }
++
++    # Python reference: build the same multi-tensor input and run ORT.
++    feed = {k: (v.numpy() if hasattr(v, "numpy") else np.asarray(v))
++            for k, v in build_rich_single(blocks, token_specs).items()}
++    sess = ort.InferenceSession(str(model))
++    py = sess.run([contract.OUTPUT_TECH, contract.OUTPUT_POLICY], feed)
++    py_tech, py_policy = py[0][0], py[1][0]
++
++    # JVM side: write the shared fixture, run parity-run-rich.
++    obs_file = tmp_path / "obs_rich.txt"
++    lines = [_fixture_line_vec("global", blocks["global"]),
++             _fixture_line_vec("acting_civ", blocks["acting_civ"])]
++    for name in ["spatial", "own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"]:
++        lines.append(_fixture_line_set(name, blocks[name], token_specs[name]))
++    obs_file.write_text("\n".join(lines) + "\n")
++
++    out_file = tmp_path / "jvm_rich.json"
++    env = dict(os.environ, JAVA_HOME=JAVA_HOME)
++    cmd = [str(GRADLEW), "selfPlay", "--console=plain",
++           "--args=" + f"parity-run-rich {model} {obs_file} {out_file}"]
++    p = subprocess.run(cmd, cwd=str(REPO), env=env, capture_output=True, text=True, timeout=600)
++    assert p.returncode == 0, p.stdout[-2000:] + p.stderr[-2000:]
++    assert out_file.is_file(), "JVM parity-run-rich produced no logits file"
++    jvm = json.loads(out_file.read_text())
++    jvm_tech, jvm_policy = np.array(jvm["tech"], np.float32), np.array(jvm["policy"], np.float32)
++
++    assert np.allclose(py_tech, jvm_tech, atol=ATOL), f"rich tech drift > {ATOL}: {py_tech} vs {jvm_tech}"
++    assert np.allclose(py_policy, jvm_policy, atol=ATOL), f"rich policy drift > {ATOL}: {py_policy} vs {jvm_policy}"
+diff --git a/python/tests/test_v2_units.py b/python/tests/test_v2_units.py
+new file mode 100644
+index 000000000..2b9278727
+--- /dev/null
++++ b/python/tests/test_v2_units.py
+@@ -0,0 +1,127 @@
++"""v2 unit tests closing the traceability gaps: trajectory loader (R1 — keep no-action steps,
++terminal-only reward), masked-pool NaN guard (R3), rich batch assembly, rich export value-drop."""
++from __future__ import annotations
++
++import json
++import struct
++import zlib
++
++import numpy as np
++import pytest
++
++from unciv_train import dataset
++
++torch = pytest.importorskip("torch")
++
++MAGIC = b"UNCVSMP1"
++
++
++def _shard_with_steps(steps_spec, *, global_w=4, acting_w=3, tech_w=5, policy_w=4,
++                      terminal_reward=1.0, fingerprint="deadbeef"):
++    """steps_spec = list of (a_tech, a_policy) for non-terminal learner steps, then a terminal."""
++    n_tiles = 10
++    layout = [
++        {"name": "global", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": global_w},
++        {"name": "acting_civ", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": acting_w},
++        {"name": "mask_tech", "dtype": "<u1", "kind": "fixed", "perItem": 0, "len": tech_w},
++        {"name": "mask_policy", "dtype": "<u1", "kind": "fixed", "perItem": 0, "len": policy_w},
++        {"name": "actions", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
++        {"name": "spatial", "dtype": "<u1", "kind": "fixed", "perItem": 0, "len": n_tiles * 13},
++        {"name": "own_units", "dtype": "<f4", "kind": "var", "perItem": 8, "len": 0},
++        {"name": "opp_units", "dtype": "<f4", "kind": "var", "perItem": 8, "len": 0},
++        {"name": "own_cities", "dtype": "<f4", "kind": "var", "perItem": 16, "len": 0},
++        {"name": "opp_cities", "dtype": "<f4", "kind": "var", "perItem": 16, "len": 0},
++        {"name": "civ_tokens", "dtype": "<f4", "kind": "var", "perItem": 84, "len": 0},
++    ]
++    header = json.dumps({
++        "schemaVersion": 2, "rulesetFingerprint": fingerprint, "gameId": "ep-0", "seed": 1,
++        "majorCivSlots": [{"slot": 0, "civId": "SimulationCiv1"}], "nTiles": n_tiles, "layout": layout,
++    }).encode("utf-8")
++
++    def step(turn, is_terminal, reward, a_tech, a_policy):
++        body = struct.pack("<ii4Bf", turn, 0, 0, 0, is_terminal, 0, reward)
++        body += np.zeros(global_w, "<f4").tobytes()
++        body += np.zeros(acting_w, "<f4").tobytes()
++        body += np.ones(tech_w, "<u1").tobytes()
++        body += np.ones(policy_w, "<u1").tobytes()
++        body += np.array([a_tech, a_policy, -1, -1], "<f4").tobytes()
++        body += np.zeros(n_tiles * 13, "<u1").tobytes()           # spatial (FIXED u8)
++        for _ in range(5):                                         # 5 VARIABLE entity blocks, count 0
++            body += struct.pack("<H", 0)
++        return body
++
++    records = b""
++    t = 1
++    for (at, ap) in steps_spec:
++        records += (lambda b: struct.pack("<I", len(b)) + b)(step(t, 0, 0.0, at, ap)); t += 1
++    term = step(t, 1, terminal_reward, -1.0, -1.0)
++    records += struct.pack("<I", len(term)) + term
++    out = MAGIC + struct.pack("<H", 2) + struct.pack("<I", len(header)) + header + records
++    out += struct.pack("<II", len(steps_spec) + 1, zlib.crc32(records) & 0xFFFFFFFF)
++    return out
++
++
++def test_load_trajectories_keeps_noaction_and_terminal_only_reward(tmp_path):
++    # one no-action step (both heads -1) FOLLOWED by an acting step → R1: BOTH kept, in order.
++    p = tmp_path / "traj.bin"
++    p.write_bytes(_shard_with_steps([(-1, -1), (2, 1)], terminal_reward=1.0))
++    trajs = dataset.load_trajectories([p], expected_version=2, expected_fingerprint="deadbeef")
++    assert len(trajs) == 1
++    tj = trajs[0]
++    assert len(tj.rewards) == 2, "no-action step must NOT be dropped (GAE needs the full sequence)"
++    assert tj.a_tech.tolist() == [-1, 2] and tj.a_policy.tolist() == [-1, 1]
++    np.testing.assert_array_equal(tj.rewards, [0.0, 1.0])  # terminal-only: 0 except last
++
++
++def test_load_trajectories_rich_blocks_present(tmp_path):
++    p = tmp_path / "traj.bin"
++    p.write_bytes(_shard_with_steps([(2, 1)]))
++    trajs = dataset.load_trajectories([p], expected_version=2, expected_fingerprint="deadbeef", rich=True)
++    assert trajs[0].rich is not None and "spatial" in trajs[0].rich[0]
++
++
++def test_masked_pool_empty_set_is_zero_no_nan():
++    from unciv_train.model import masked_pool
++    tokens = torch.zeros(1, 1, 2)
++    mask = torch.zeros(1, 1)               # no present tokens
++    out = masked_pool(tokens, mask)
++    assert out.shape == (1, 4)             # mean(2) ‖ max(2)
++    assert torch.isfinite(out).all() and float(out.abs().sum()) == 0.0
++
++
++def test_masked_pool_mean_max_correct():
++    from unciv_train.model import masked_pool
++    tokens = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [9.0, 9.0]]])
++    mask = torch.tensor([[1.0, 1.0, 0.0]])  # third token is padding → excluded
++    out = masked_pool(tokens, mask)[0]
++    assert out[:2].tolist() == [2.0, 3.0]   # mean of [1,3],[2,4]
++    assert out[2:].tolist() == [3.0, 4.0]   # max excludes the padded [9,9]
++
++
++def test_build_rich_batch_pads_and_masks():
++    from unciv_train.features import build_rich_batch
++    from unciv_train.contract import Dims
++    from unciv_train.dataset import TrainTrajectory
++    specs = {"spatial": 3, "own_units": 2}
++    rich = [{"global": np.zeros(4, np.float32), "acting_civ": np.zeros(4, np.float32),
++             "spatial": np.ones((5, 3), np.float32), "own_units": np.zeros((0, 2), np.float32)}]
++    tj = TrainTrajectory(np.zeros((1, 8), np.float32), np.array([0]), np.array([0]),
++                         np.ones((1, 5), np.float32), np.ones((1, 4), np.float32),
++                         np.array([1.0], np.float32), rich)
++    b = build_rich_batch([tj], Dims(4, 4, 5, 4), specs)
++    assert b["spatial"].shape == (1, 5, 3) and b["spatial_mask"].sum().item() == 5
++    assert b["own_units"].shape == (1, 1, 2) and b["own_units_mask"].sum().item() == 0  # empty → pad1 mask0
++
++
++def test_export_rich_drops_value(tmp_path):
++    import onnx
++    from unciv_train.contract import Dims
++    from unciv_train.model import RichPolicyValueNet
++    from unciv_train import export_onnx
++    dims = Dims(4, 4, 5, 4)
++    specs = {"spatial": 3, "own_units": 2}
++    net = RichPolicyValueNet(dims, specs, token_dim=8, hidden=16)
++    out = tmp_path / "rich.onnx"
++    export_onnx.export_rich(net, dims, specs, out, schema_version=2, ruleset_fingerprint="x")
++    names = {o.name for o in onnx.load(str(out)).graph.output}
++    assert names == {"tech_logits", "policy_logits"}, f"value head leaked: {names}"
+diff --git a/python/unciv_train/analyze.py b/python/unciv_train/analyze.py
+new file mode 100644
+index 000000000..858398951
+--- /dev/null
++++ b/python/unciv_train/analyze.py
+@@ -0,0 +1,150 @@
++"""Acceptance analysis: read the per-variant curve.csv files, compute the operationalized criteria,
++and write a report + overlaid comparison plots.
++
++AC1  attributable curves        — overlay v1-reinforce / blind-critic / rich-critic (Tiny).
++AC2  convergence (the critic)   — last-K=4 win-rate stddev: blind-critic vs v1-reinforce (+ mean late
++                                  win-rate, since "steadier" is only meaningful with the level).
++AC3  ceiling (the board)        — rich-critic vs blind-critic on Medium: a final high-N eval +
++                                  two-proportion z-test (one-sided rich>blind). Reported either way.
++
++No scipy: the binomial/normal tail uses math.erfc. Run AFTER run_acceptance.sh finishes the curves.
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import json
++import math
++from pathlib import Path
++
++import matplotlib
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt  # noqa: E402
++
++from . import run_loop  # reuse evaluate() (gradle eval) for the final ceiling eval  # noqa: E402
++
++LAST_K = 4
++
++
++def _read_curve(path: Path) -> list[dict]:
++    if not path.is_file():
++        return []
++    rows = []
++    with open(path, newline="") as f:
++        for d in csv.DictReader(f):
++            try:
++                rows.append({"round": int(d["round"]), "winrate": float(d["winrate"]),
++                             "games": int(d["games"]), "pval": float(d["pval"])})
++            except (ValueError, KeyError):
++                continue
++    return rows
++
++
++def _stddev(xs: list[float]) -> float:
++    if len(xs) < 2:
++        return 0.0
++    m = sum(xs) / len(xs)
++    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
++
++
++def _two_proportion_z(w1: int, n1: int, w2: int, n2: int) -> tuple[float, float]:
++    """One-sided two-proportion z-test for p1 > p2. Returns (z, p_one_sided)."""
++    if n1 == 0 or n2 == 0:
++        return 0.0, 1.0
++    p1, p2 = w1 / n1, w2 / n2
++    p = (w1 + w2) / (n1 + n2)
++    se = math.sqrt(max(p * (1 - p) * (1 / n1 + 1 / n2), 1e-12))
++    z = (p1 - p2) / se
++    p_one = 0.5 * math.erfc(z / math.sqrt(2))  # P(Z > z)
++    return z, p_one
++
++
++def _overlay(curves: dict[str, list[dict]], png: Path, title: str) -> None:
++    plt.figure(figsize=(8, 4.5))
++    plt.axhline(50, color="gray", ls="--", lw=1, label="RandomPolicy (50%)")
++    for i, (name, rows) in enumerate(curves.items()):
++        if rows:
++            plt.plot([r["round"] for r in rows], [r["winrate"] * 100 for r in rows],
++                     "-o", color=f"C{i}", label=name)
++    plt.xlabel("round"); plt.ylabel("win-rate vs RandomPolicy (%)")
++    plt.title(title); plt.ylim(0, 100); plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
++    plt.savefig(png, dpi=120); plt.close()
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(description="Acceptance analysis over the v2 training runs")
++    ap.add_argument("--root", required=True, help="dir containing <variant>-<size>/curve.csv subdirs")
++    ap.add_argument("--ceiling-games", type=int, default=200, help="final Medium eval game count (AC3)")
++    ap.add_argument("--turn-cap", type=int, default=250)
++    ap.add_argument("--threads", type=int, default=12)
++    ap.add_argument("--eval-seed", type=int, default=4242424)
++    ap.add_argument("--gradle-timeout", type=float, default=3600.0)
++    ap.add_argument("--skip-ceiling-eval", action="store_true", help="use last Medium round instead of a fresh high-N eval")
++    args = ap.parse_args(argv)
++
++    root = Path(args.root)
++    tiny = {v: _read_curve(root / f"{v}-tiny" / "curve.csv")
++            for v in ["v1-reinforce", "blind-critic", "rich-critic"]}
++    medium = {v: _read_curve(root / f"{v}-medium" / "curve.csv")
++              for v in ["blind-critic", "rich-critic"]}
++
++    lines: list[str] = ["# v2 Acceptance Analysis\n"]
++
++    # AC1 — curves
++    lines.append("## AC1 — attributable curves\n")
++    for v, rows in tiny.items():
++        lines.append(f"- Tiny `{v}`: {len(rows)} rounds, final win-rate "
++                     f"{rows[-1]['winrate']*100:.1f}% (n={rows[-1]['games']})" if rows else f"- Tiny `{v}`: (no curve)")
++    _overlay(tiny, root / "curve_tiny_overlay.png", "Tiny — v1-reinforce vs blind-critic vs rich-critic")
++    lines.append(f"\nOverlay plot: `{root / 'curve_tiny_overlay.png'}`\n")
++
++    # AC2 — convergence (last-K stddev: blind-critic vs v1-reinforce)
++    lines.append("## AC2 — convergence (does the critic steady the curve?)\n")
++    def lastk(rows): return [r["winrate"] for r in rows[-LAST_K:]]
++    v1, bc = tiny["v1-reinforce"], tiny["blind-critic"]
++    ac2 = {}
++    if len(v1) >= LAST_K and len(bc) >= LAST_K:
++        sd_v1, sd_bc = _stddev(lastk(v1)), _stddev(lastk(bc))
++        mean_v1 = sum(lastk(v1)) / LAST_K
++        mean_bc = sum(lastk(bc)) / LAST_K
++        steadier = sd_bc < sd_v1
++        ac2 = {"last_k": LAST_K, "stddev_v1_reinforce": sd_v1, "stddev_blind_critic": sd_bc,
++               "mean_winrate_v1_reinforce": mean_v1, "mean_winrate_blind_critic": mean_bc,
++               "blind_critic_steadier": steadier}
++        lines.append(f"- last-{LAST_K} win-rate stddev: v1-reinforce={sd_v1*100:.2f}pp, "
++                     f"blind-critic={sd_bc*100:.2f}pp → blind-critic {'STEADIER ✓' if steadier else 'NOT steadier'}")
++        lines.append(f"- last-{LAST_K} mean win-rate: v1-reinforce={mean_v1*100:.1f}%, blind-critic={mean_bc*100:.1f}%")
++    else:
++        lines.append(f"- insufficient rounds for last-{LAST_K} stddev (v1={len(v1)}, blind={len(bc)})")
++
++    # AC3 — ceiling (rich vs blind on Medium)
++    lines.append("\n## AC3 — ceiling (does seeing the board help on Medium?)\n")
++    ac3 = {}
++    bm = root / "blind-critic-medium" / f"policy_round_{len(medium['blind-critic'])-1}.onnx" if medium["blind-critic"] else None
++    rm = root / "rich-critic-medium" / f"policy_round_{len(medium['rich-critic'])-1}.onnx" if medium["rich-critic"] else None
++    if bm and rm and bm.is_file() and rm.is_file() and not args.skip_ceiling_eval:
++        be = run_loop.evaluate(bm, args.ceiling_games, args.turn_cap, args.threads, args.eval_seed, args.gradle_timeout, "Medium")
++        re_ = run_loop.evaluate(rm, args.ceiling_games, args.turn_cap, args.threads, args.eval_seed, args.gradle_timeout, "Medium")
++        z, p = _two_proportion_z(int(re_["wins"]), int(re_["games"]), int(be["wins"]), int(be["games"]))
++        ac3 = {"blind": be, "rich": re_, "z": z, "p_one_sided_rich_gt_blind": p, "significant_p05": p < 0.05}
++        lines.append(f"- Medium final eval (n={args.ceiling_games}): blind-critic={be['winrate']*100:.1f}%, "
++                     f"rich-critic={re_['winrate']*100:.1f}%")
++        lines.append(f"- two-proportion z={z:.2f}, one-sided p(rich>blind)={p:.4g} → "
++                     f"{'SIGNIFICANT at p<0.05 ✓' if p < 0.05 else 'NOT significant at p<0.05 (reported plainly)'}")
++    else:
++        for v, rows in medium.items():
++            lines.append(f"- Medium `{v}`: {len(rows)} rounds" + (f", final {rows[-1]['winrate']*100:.1f}%" if rows else " (no curve)"))
++        lines.append("- (ceiling eval skipped or models missing — comparison from last Medium rounds above)")
++    _overlay(medium, root / "curve_medium_overlay.png", "Medium — blind-critic vs rich-critic")
++    lines.append(f"\nMedium overlay plot: `{root / 'curve_medium_overlay.png'}`\n")
++
++    report = root / "acceptance-report.md"
++    report.write_text("\n".join(lines) + "\n")
++    (root / "acceptance.json").write_text(json.dumps({"ac2": ac2, "ac3": ac3}, indent=2))
++    print(f"wrote {report}")
++    print("\n".join(lines))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/python/unciv_train/contract.py b/python/unciv_train/contract.py
+index 1ab3fd932..b1589262c 100644
+--- a/python/unciv_train/contract.py
++++ b/python/unciv_train/contract.py
+@@ -11,13 +11,23 @@ import json
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
++# Contract v1 = blind single-tensor input ("obs"); used by v1-reinforce + blind-critic (JVM bridge
++# unchanged). Contract v2 = rich MULTI-TENSOR input; used by rich-critic. The JVM OnnxPolicy reads
++# META_CONTRACT_VERSION and selects the single- vs multi-tensor build path, so both coexist.
+ CONTRACT_VERSION = 1
++CONTRACT_VERSION_RICH = 2
+ 
+-INPUT_NAME = "obs"
++INPUT_NAME = "obs"                 # contract v1 single input
+ OUTPUT_TECH = "tech_logits"
+ OUTPUT_POLICY = "policy_logits"
+ MODELED_HEADS = ["tech", "policy"]
+ 
++# Contract v2 named multi-tensor inputs. Token sets each pair with a "<name>_mask" presence mask.
++INPUT_GLOBAL = "global"
++INPUT_ACTING = "acting_civ"
++# Token sets (name -> perItem width is runtime-derived from schema via token_specs_from_schema).
++RICH_TOKEN_NAMES = ["spatial", "own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"]
++
+ # ONNX metadata_props keys (provenance — read back on the JVM via session.getMetadata()).
+ META_SCHEMA_VERSION = "schema_version"
+ META_RULESET_FINGERPRINT = "ruleset_fingerprint"
+@@ -25,6 +35,7 @@ META_CONTRACT_VERSION = "contract_version"
+ META_INPUT_WIDTH = "input_width"
+ META_TECH_WIDTH = "tech_width"
+ META_POLICY_WIDTH = "policy_width"
++META_INPUT_NAMES = "input_names"   # comma-joined ordered tensor names (contract v2)
+ 
+ # Learner identity (the pinned nation Constants.simulationCiv1). The trainer filters shards to this
+ # civ's steps via the header's per-game slot↔civId mapping.
+@@ -64,3 +75,28 @@ def fingerprint_from_schema(schema_path: str | Path) -> str:
+ 
+ def schema_version_from_schema(schema_path: str | Path) -> int:
+     return int(_schema(schema_path)["schemaVersion"])
++
++
++# Hardcoded fallbacks if a schema layout omits perItem (matches the v1 Featurizer widths).
++_TOKEN_WIDTH_FALLBACK = {"spatial": 13, "own_units": 8, "opp_units": 8,
++                         "own_cities": 16, "opp_cities": 16, "civ_tokens": 84}
++
++
++def token_specs_from_schema(schema_path: str | Path) -> dict:
++    """Per-token feature widths for the rich variant, derived from the generated schema.
++
++    spatial → number of spatial channels (per-tile width); entity blocks → their layout perItem.
++    Falls back to the known v1 Featurizer widths if the schema omits a field.
++    """
++    sch = _schema(schema_path)
++    layout = {b["name"]: b for b in sch.get("layout", [])}
++    specs: dict[str, int] = {}
++    chans = sch.get("spatial_channels") or sch.get("spatialChannels")
++    specs["spatial"] = len(chans) if chans else _TOKEN_WIDTH_FALLBACK["spatial"]
++    for name in ("own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"):
++        entry = layout.get(name)
++        if entry and entry.get("perItem"):
++            specs[name] = int(entry["perItem"])
++        else:
++            specs[name] = _TOKEN_WIDTH_FALLBACK[name]
++    return specs
+diff --git a/python/unciv_train/dataset.py b/python/unciv_train/dataset.py
+index cba6a2fcc..bd55a47c8 100644
+--- a/python/unciv_train/dataset.py
++++ b/python/unciv_train/dataset.py
+@@ -32,6 +32,28 @@ class TrainStep:
+     ret: float             # return-to-go = the civ's terminal reward
+ 
+ 
++# Per-type entity/spatial token blocks consumed by the rich variant (perItem widths come from the
++# generated schema; spatial is FIXED nTiles*13 and reshaped to [nTiles, 13]).
++RICH_TOKEN_BLOCKS = ("spatial", "own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens")
++
++
++@dataclass
++class TrainTrajectory:
++    """One game's ordered learner-step sequence (GAE needs the temporal sequence).
++
++    ALL non-terminal learner steps are kept in emission order — no-action steps are NOT dropped
++    (dropping them would break GAE's temporal contiguity and risk losing the reward-bearing step).
++    The terminal ±1 is placed at the last step's reward slot; reward is 0 everywhere else.
++    """
++    obs: np.ndarray          # [T, input_w] blind concat(global, acting_civ), float32
++    a_tech: np.ndarray       # [T] int (−1 = head did not act)
++    a_policy: np.ndarray     # [T] int
++    mask_tech: np.ndarray    # [T, tech_w] float32
++    mask_policy: np.ndarray  # [T, policy_w] float32
++    rewards: np.ndarray      # [T] float32 — 0 except the terminal ±1 at the last step
++    rich: list | None = None  # per-step dict{name -> np.ndarray} for the rich variant (else None)
++
++
+ def _learner_slot(header: dict, learner_civ_id: str) -> int | None:
+     for entry in header.get("majorCivSlots", []):
+         if entry.get("civId") == learner_civ_id:
+@@ -79,3 +101,65 @@ def load_training_steps(
+                 ret=ret,
+             ))
+     return out
++
++
++def _rich_step_blocks(blocks: dict) -> dict:
++    """Extract the per-step rich token blocks. spatial (FIXED nTiles*13) → [nTiles, 13];
++    entity blocks (VARIABLE) are already [count, perItem]; an absent/empty block → [0, perItem]."""
++    out = {
++        "global": np.asarray(blocks["global"], dtype=np.float32),
++        "acting_civ": np.asarray(blocks["acting_civ"], dtype=np.float32),
++    }
++    spatial = np.asarray(blocks["spatial"], dtype=np.float32).reshape(-1, 13)
++    out["spatial"] = spatial
++    for name in ("own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"):
++        b = blocks.get(name)
++        arr = np.asarray(b, dtype=np.float32) if b is not None else np.zeros((0, 0), np.float32)
++        if arr.ndim == 1:                      # empty VARIABLE block decoded as 1D
++            arr = arr.reshape(0, arr.shape[0] if arr.size else 0)
++        out[name] = arr
++    return out
++
++
++def load_trajectories(
++    paths,
++    learner_civ_id: str = LEARNER_CIV_ID,
++    *,
++    expected_version: int,
++    expected_fingerprint: str,
++    rich: bool = False,
++) -> list[TrainTrajectory]:
++    """Ordered per-game learner-step trajectories for actor-critic + GAE. Same provenance gates as
++    `load_training_steps`. `rich=True` also attaches per-step token blocks for the rich variant.
++    """
++    out: list[TrainTrajectory] = []
++    for p in sorted(str(x) for x in paths):
++        shard = reader.load(p)
++        prov = shard.provenance
++        if prov.schema_version != expected_version:
++            raise ProvenanceError(f"{p}: schema_version {prov.schema_version} != {expected_version}")
++        if prov.ruleset_fingerprint != expected_fingerprint:
++            raise ProvenanceError(
++                f"{p}: ruleset_fingerprint {prov.ruleset_fingerprint!r} != {expected_fingerprint!r} "
++                "(shard was generated against different ruleset content — regenerate)"
++            )
++        slot = _learner_slot(shard.header, learner_civ_id)
++        if slot is None:
++            continue
++        # ALL non-terminal learner steps in emission (chronological) order — keep no-action steps.
++        steps = [s for s in shard.steps if s.civ_slot == slot and not s.is_terminal]
++        terminal = next((s for s in shard.steps if s.civ_slot == slot and s.is_terminal), None)
++        term_r = float(terminal.reward) if terminal is not None else 0.0
++        if not steps:
++            continue
++        t = len(steps)
++        obs = np.stack([np.concatenate([s.blocks["global"], s.blocks["acting_civ"]]) for s in steps]).astype(np.float32)
++        a_tech = np.array([int(s.blocks["actions"][0]) for s in steps], dtype=np.int64)
++        a_policy = np.array([int(s.blocks["actions"][1]) for s in steps], dtype=np.int64)
++        mask_tech = np.stack([s.blocks["mask_tech"] for s in steps]).astype(np.float32)
++        mask_policy = np.stack([s.blocks["mask_policy"] for s in steps]).astype(np.float32)
++        rewards = np.zeros(t, dtype=np.float32)
++        rewards[-1] = term_r                              # terminal-only ±1
++        rich_blocks = [_rich_step_blocks(s.blocks) for s in steps] if rich else None
++        out.append(TrainTrajectory(obs, a_tech, a_policy, mask_tech, mask_policy, rewards, rich_blocks))
++    return out
+diff --git a/python/unciv_train/export_onnx.py b/python/unciv_train/export_onnx.py
+index cbf8df37a..02b815cbc 100644
+--- a/python/unciv_train/export_onnx.py
++++ b/python/unciv_train/export_onnx.py
+@@ -9,12 +9,41 @@ from pathlib import Path
+ 
+ import onnx
+ import torch
++import torch.nn as nn
+ 
+ from . import contract
+ from .contract import Dims
+ from .model import PolicyNet
+ 
+ 
++class _PolicyOnly(nn.Module):
++    """Export wrapper for the BLIND net (single obs tensor): drops the value head so the play
++    ONNX has exactly two outputs (tech_logits, policy_logits)."""
++
++    def __init__(self, net: nn.Module):
++        super().__init__()
++        self.net = net
++
++    def forward(self, obs):
++        tech, policy, _value = self.net(obs)
++        return tech, policy
++
++
++class _RichPolicyOnly(nn.Module):
++    """Export wrapper for the RICH net: takes POSITIONAL tensors (in `names` order — ONNX can't
++    trace a dict input), reassembles the dict the net expects, drops the value head."""
++
++    def __init__(self, net: nn.Module, names: list[str]):
++        super().__init__()
++        self.net = net
++        self.names = names
++
++    def forward(self, *tensors):
++        inputs = {name: t for name, t in zip(self.names, tensors)}
++        tech, policy, _value = self.net(inputs)
++        return tech, policy
++
++
+ def export(
+     net: PolicyNet,
+     dims: Dims,
+@@ -24,12 +53,15 @@ def export(
+     ruleset_fingerprint: str,
+     opset: int = 17,
+ ) -> None:
++    """Blind/contract-v1 export: single `obs` input, policy-only outputs (value dropped). The JVM
++    bridge contract is UNCHANGED — v1-reinforce and blind-critic models load on the v1 path."""
+     out_path = str(out_path)
+     net.eval()
++    wrapped = _PolicyOnly(net)
+     dummy = torch.zeros(1, dims.input_w)
+     dyn = {0: "batch"}
+     torch.onnx.export(
+-        net, dummy, out_path,
++        wrapped, dummy, out_path,
+         input_names=[contract.INPUT_NAME],
+         output_names=[contract.OUTPUT_TECH, contract.OUTPUT_POLICY],
+         dynamic_axes={contract.INPUT_NAME: dyn, contract.OUTPUT_TECH: dyn, contract.OUTPUT_POLICY: dyn},
+@@ -45,3 +77,62 @@ def export(
+         contract.META_POLICY_WIDTH: str(dims.policy_w),
+     })
+     onnx.save(model, out_path)
++
++
++def export_rich(
++    net,
++    dims: Dims,
++    token_specs: dict[str, int],
++    out_path: str | Path,
++    *,
++    schema_version: int,
++    ruleset_fingerprint: str,
++    sample_inputs: dict | None = None,
++    opset: int = 17,
++) -> None:
++    """Rich/contract-v2 export: MULTI-TENSOR named input (global, acting_civ, each token set +
++    its presence mask) with dynamic axes; policy-only outputs (value dropped). Stamps
++    CONTRACT_VERSION_RICH so the JVM bridge selects the multi-tensor path."""
++    import numpy as np
++
++    out_path = str(out_path)
++    net.eval()
++
++    # Ordered tensor names: global, acting_civ, then each token set + its presence mask.
++    names = [contract.INPUT_GLOBAL, contract.INPUT_ACTING]
++    dummy: dict[str, torch.Tensor] = {
++        contract.INPUT_GLOBAL: torch.zeros(1, dims.global_w),
++        contract.INPUT_ACTING: torch.zeros(1, dims.acting_w),
++    }
++    dyn = {contract.INPUT_GLOBAL: {0: "batch"}, contract.INPUT_ACTING: {0: "batch"},
++           contract.OUTPUT_TECH: {0: "batch"}, contract.OUTPUT_POLICY: {0: "batch"}}
++    for name, width in token_specs.items():
++        n0 = 2
++        dummy[name] = torch.zeros(1, n0, width)
++        dummy[name + "_mask"] = torch.ones(1, n0)
++        names += [name, name + "_mask"]
++        dyn[name] = {0: "batch", 1: "n_" + name}
++        dyn[name + "_mask"] = {0: "batch", 1: "n_" + name}
++    if sample_inputs is not None:
++        dummy.update({k: torch.as_tensor(np.asarray(v, dtype=np.float32)) for k, v in sample_inputs.items()})
++
++    wrapped = _RichPolicyOnly(net, names)
++    args = tuple(dummy[n] for n in names)  # POSITIONAL tensors in name order (ONNX-traceable)
++    torch.onnx.export(
++        wrapped, args, out_path,
++        input_names=names,
++        output_names=[contract.OUTPUT_TECH, contract.OUTPUT_POLICY],
++        dynamic_axes=dyn,
++        opset_version=opset,
++    )
++    model = onnx.load(out_path)
++    onnx.helper.set_model_props(model, {
++        contract.META_SCHEMA_VERSION: str(schema_version),
++        contract.META_RULESET_FINGERPRINT: ruleset_fingerprint,
++        contract.META_CONTRACT_VERSION: str(contract.CONTRACT_VERSION_RICH),
++        contract.META_INPUT_WIDTH: str(dims.input_w),
++        contract.META_TECH_WIDTH: str(dims.tech_w),
++        contract.META_POLICY_WIDTH: str(dims.policy_w),
++        contract.META_INPUT_NAMES: ",".join(names),
++    })
++    onnx.save(model, out_path)
+diff --git a/python/unciv_train/features.py b/python/unciv_train/features.py
+new file mode 100644
+index 000000000..9d7687939
+--- /dev/null
++++ b/python/unciv_train/features.py
+@@ -0,0 +1,69 @@
++"""Assemble the rich multi-tensor input from per-step observation blocks.
++
++The spatial block (FIXED nTiles*13) becomes a per-tile token SET; each entity block
++(own_units/opp_units/own_cities/opp_cities/civ_tokens) is a present-only token set. All are padded
++to the batch-max count with a presence mask (1 = real token, 0 = padding) so the model's masked
++pool ignores padding. This is the SAME layout the JVM builds at decision time — the parity test
++guards that the two agree.
++"""
++from __future__ import annotations
++
++import numpy as np
++import torch
++
++from .contract import Dims
++
++
++def _pad_token_set(arrays: list[np.ndarray], width: int) -> tuple[np.ndarray, np.ndarray]:
++    """Pad a list of [n_i, width] arrays to [B, maxN, width] + mask [B, maxN]."""
++    b = len(arrays)
++    counts = [int(a.shape[0]) for a in arrays]
++    maxn = max(1, max(counts) if counts else 1)
++    padded = np.zeros((b, maxn, width), dtype=np.float32)
++    mask = np.zeros((b, maxn), dtype=np.float32)
++    for i, a in enumerate(arrays):
++        c = int(a.shape[0])
++        if c:
++            w = min(width, int(a.shape[1]))
++            padded[i, :c, :w] = a[:, :w]
++            mask[i, :c] = 1.0
++    return padded, mask
++
++
++def build_rich_batch(trajectories, dims: Dims, token_specs: dict[str, int]) -> dict:
++    """Flatten all trajectories' per-step rich blocks into one padded multi-tensor batch.
++    Returns {name: tensor, name+"_mask": tensor, "global": tensor, "acting_civ": tensor}.
++    """
++    steps = [blk for t in trajectories for blk in (t.rich or [])]
++    n = len(steps)
++    out: dict[str, torch.Tensor] = {
++        "global": torch.tensor(np.stack([s["global"] for s in steps]).astype(np.float32)),
++        "acting_civ": torch.tensor(np.stack([s["acting_civ"] for s in steps]).astype(np.float32)),
++    }
++    assert n > 0, "build_rich_batch called with no steps"
++    for name, width in token_specs.items():
++        padded, mask = _pad_token_set([s[name] for s in steps], width)
++        out[name] = torch.tensor(padded)
++        out[name + "_mask"] = torch.tensor(mask)
++    return out
++
++
++def build_rich_single(step_blocks: dict, token_specs: dict[str, int]) -> dict:
++    """Batch-of-1 multi-tensor input from ONE step's raw blocks (the parity / inference reference).
++
++    `step_blocks` holds: global, acting_civ (1D), spatial (nTiles*13 flat OR [nTiles,13]), and each
++    entity block as [count, perItem] (possibly empty). Mirrors exactly what the JVM builds.
++    """
++    g = np.asarray(step_blocks["global"], dtype=np.float32).reshape(1, -1)
++    a = np.asarray(step_blocks["acting_civ"], dtype=np.float32).reshape(1, -1)
++    out: dict[str, torch.Tensor] = {"global": torch.tensor(g), "acting_civ": torch.tensor(a)}
++    for name, width in token_specs.items():
++        arr = np.asarray(step_blocks[name], dtype=np.float32)
++        if name == "spatial":
++            arr = arr.reshape(-1, width)
++        elif arr.ndim == 1:
++            arr = arr.reshape(0, width) if arr.size == 0 else arr.reshape(-1, width)
++        padded, mask = _pad_token_set([arr], width)
++        out[name] = torch.tensor(padded)
++        out[name + "_mask"] = torch.tensor(mask)
++    return out
+diff --git a/python/unciv_train/model.py b/python/unciv_train/model.py
+index 36b02d192..e8434ee12 100644
+--- a/python/unciv_train/model.py
++++ b/python/unciv_train/model.py
+@@ -1,8 +1,13 @@
+-"""The policy net: a small shared-trunk MLP with per-head linear outputs.
++"""The policy net: a small shared-trunk MLP with per-head linear outputs + a value critic.
+ 
+-Input = concat(global, acting_civ) (fixed width from schema). Output = {tech_logits, policy_logits}.
+-Deliberately tiny — trains on CPU in seconds. `forward` returns a TUPLE so the ONNX export has two
+-named outputs (`tech_logits`, `policy_logits`).
++Input (blind variant) = concat(global, acting_civ) (fixed width from schema).
++Output = {tech_logits, policy_logits, value}. The value head is TRAINING-ONLY — `export_onnx`
++wraps the net to emit only (tech_logits, policy_logits), so the play-time ONNX contract is
++policy-only. Deliberately tiny — trains on CPU in seconds.
++
++`RichPolicyValueNet` (Stage B) consumes the FULL observation as a multi-tensor input: a
++permutation-invariant masked pool over the per-tile spatial token set and over each entity token
++type, concatenated with global+acting_civ → shared trunk → the same three heads.
+ """
+ from __future__ import annotations
+ 
+@@ -12,7 +17,18 @@ import torch.nn as nn
+ from .contract import Dims
+ 
+ 
++def _small_init_value_head(layer: nn.Linear) -> None:
++    """Initialize the value head near zero so V≈0 at init — game features are unnormalized
++    (gold, science, …), so a default-init linear head would otherwise emit huge values and the
++    bounded discounted-terminal return target couldn't be fit in a few epochs. v1-reinforce ignores
++    the value head, so this does not perturb the attributable baseline."""
++    nn.init.uniform_(layer.weight, -1e-3, 1e-3)
++    nn.init.zeros_(layer.bias)
++
++
+ class PolicyNet(nn.Module):
++    """Blind variant: trunk over concat(global, acting_civ) → {tech, policy, value}."""
++
+     def __init__(self, dims: Dims, hidden: int = 128):
+         super().__init__()
+         self.trunk = nn.Sequential(
+@@ -21,7 +37,77 @@ class PolicyNet(nn.Module):
+         )
+         self.tech_head = nn.Linear(hidden, dims.tech_w)
+         self.policy_head = nn.Linear(hidden, dims.policy_w)
++        self.value_head = nn.Linear(hidden, 1)  # training-only critic
++        _small_init_value_head(self.value_head)  # V≈0 at init (game features are unnormalized)
+ 
+     def forward(self, obs: torch.Tensor):
+         h = self.trunk(obs)
+-        return self.tech_head(h), self.policy_head(h)
++        # tanh-bound the value: the true value = expected discounted terminal reward ∈ [-1,1], so
++        # this is the correct range and it keeps V bounded despite unnormalized game features.
++        return self.tech_head(h), self.policy_head(h), torch.tanh(self.value_head(h))
++
++
++def masked_pool(tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
++    """Permutation-invariant masked mean+max pool over a [B, N, F] token set.
++
++    `mask` is [B, N] (1 = present, 0 = padding). NaN-guarded (council R3): mean divides by
++    clamp(count, min=1); max over an empty set → 0 (not −inf). An all-padding row → zero vector.
++    Returns [B, 2F] (mean ‖ max).
++    """
++    m = mask.unsqueeze(-1)                                  # [B, N, 1]
++    safe_count = mask.sum(dim=1, keepdim=True).clamp(min=1.0)  # [B, 1] avoid /0
++    mean = (tokens * m).sum(dim=1) / safe_count             # [B, F]; all-padding row → 0
++    masked = tokens.masked_fill(m == 0, float("-inf"))      # true -inf so empty set is catchable
++    mx = masked.max(dim=1).values                           # [B, F]; all-padding → -inf
++    mx = torch.where(torch.isfinite(mx), mx, torch.zeros_like(mx))  # empty set → 0 (NaN/inf guard)
++    return torch.cat([mean, mx], dim=1)                     # [B, 2F]
++
++
++class _TokenEncoder(nn.Module):
++    """Per-token MLP → masked mean+max pool. Input [B,N,in_dim] + mask [B,N] → [B, 2*out_dim]."""
++
++    def __init__(self, in_dim: int, out_dim: int):
++        super().__init__()
++        self.mlp = nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(),
++                                 nn.Linear(out_dim, out_dim), nn.ReLU())
++        self.out_w = 2 * out_dim
++
++    def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
++        return masked_pool(self.mlp(tokens), mask)
++
++
++class RichPolicyValueNet(nn.Module):
++    """Rich variant: masked-pool encoders over the spatial tile set + each entity token type,
++    concatenated with global+acting_civ → trunk → {tech, policy, value}.
++
++    `token_specs` maps an input tensor name → its per-token feature width, e.g.
++    {"spatial": 13, "own_units": 8, "opp_units": 8, "own_cities": 16, "opp_cities": 16,
++     "civ_tokens": 84}. `forward(inputs)` takes a dict of {name: tensor} plus {name+"_mask": mask}.
++    """
++
++    INPUT_GLOBAL = "global"
++    INPUT_ACTING = "acting_civ"
++
++    def __init__(self, dims: Dims, token_specs: dict[str, int], *, token_dim: int = 32,
++                 hidden: int = 256):
++        super().__init__()
++        self.token_names = list(token_specs.keys())
++        self.encoders = nn.ModuleDict(
++            {name: _TokenEncoder(width, token_dim) for name, width in token_specs.items()}
++        )
++        trunk_in = dims.global_w + dims.acting_w + sum(e.out_w for e in self.encoders.values())
++        self.trunk = nn.Sequential(
++            nn.Linear(trunk_in, hidden), nn.ReLU(),
++            nn.Linear(hidden, hidden), nn.ReLU(),
++        )
++        self.tech_head = nn.Linear(hidden, dims.tech_w)
++        self.policy_head = nn.Linear(hidden, dims.policy_w)
++        self.value_head = nn.Linear(hidden, 1)
++        _small_init_value_head(self.value_head)
++
++    def forward(self, inputs: dict[str, torch.Tensor]):
++        parts = [inputs[self.INPUT_GLOBAL], inputs[self.INPUT_ACTING]]
++        for name in self.token_names:
++            parts.append(self.encoders[name](inputs[name], inputs[name + "_mask"]))
++        h = self.trunk(torch.cat(parts, dim=1))
++        return self.tech_head(h), self.policy_head(h), torch.tanh(self.value_head(h))
+diff --git a/python/unciv_train/run_loop.py b/python/unciv_train/run_loop.py
+index 55a80ecc9..35454376b 100644
+--- a/python/unciv_train/run_loop.py
++++ b/python/unciv_train/run_loop.py
+@@ -48,9 +48,11 @@ def gradle_selfplay(args: list[str], timeout: float) -> str:
+     return out
+ 
+ 
+-def generate(model: str, out_dir: Path, n: int, max_turns: int, threads: int, seed: int, timeout: float) -> int:
++def generate(model: str, out_dir: Path, n: int, max_turns: int, threads: int, seed: int,
++             timeout: float, map_size: str = "Tiny") -> int:
+     out_dir.mkdir(parents=True, exist_ok=True)
+-    out = gradle_selfplay(["gen", model, str(out_dir), str(n), str(max_turns), str(threads), str(seed)], timeout)
++    out = gradle_selfplay(["gen", model, str(out_dir), str(n), str(max_turns), str(threads),
++                           str(seed), map_size], timeout)
+     m = GEN_RE.search(out)
+     if not m:
+         sys.stderr.write(out[-4000:])
+@@ -58,8 +60,10 @@ def generate(model: str, out_dir: Path, n: int, max_turns: int, threads: int, se
+     return int(m.group(1))
+ 
+ 
+-def evaluate(model: Path, m_games: int, max_turns: int, threads: int, seed: int, timeout: float) -> dict:
+-    out = gradle_selfplay(["eval", str(model), str(m_games), str(max_turns), str(threads), str(seed)], timeout)
++def evaluate(model: Path, m_games: int, max_turns: int, threads: int, seed: int,
++             timeout: float, map_size: str = "Tiny") -> dict:
++    out = gradle_selfplay(["eval", str(model), str(m_games), str(max_turns), str(threads),
++                           str(seed), map_size], timeout)
+     m = EVAL_RE.search(out)
+     if not m:
+         sys.stderr.write(out[-4000:])
+@@ -67,6 +71,29 @@ def evaluate(model: Path, m_games: int, max_turns: int, threads: int, seed: int,
+     return json.loads(m.group(1))
+ 
+ 
++def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, seed: int):
++    """Dispatch to the right trainer by variant. Returns (net, stats, exporter_callable)."""
++    from . import contract
++    if variant == "v1-reinforce":
++        net, stats = tr.train_reinforce(trajectories_or_steps, dims, epochs=args.epochs,
++                                        lr=args.lr, seed=seed, entropy_coef=args.entropy_coef)
++        return net, stats, "blind"
++    if variant == "blind-critic":
++        net, stats = tr.train_actor_critic_blind(
++            trajectories_or_steps, dims, epochs=args.epochs, lr=args.lr, seed=seed,
++            gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
++            entropy_coef=args.entropy_coef, clip_eps=args.clip_eps)
++        return net, stats, "blind"
++    if variant == "rich-critic":
++        token_specs = contract.token_specs_from_schema(schema_path)
++        net, stats = tr.train_actor_critic_rich(
++            trajectories_or_steps, dims, token_specs, epochs=args.epochs, lr=args.lr, seed=seed,
++            gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
++            entropy_coef=args.entropy_coef, clip_eps=args.clip_eps)
++        return net, stats, ("rich", token_specs)
++    raise ValueError(f"unknown variant {variant!r}")
++
++
+ def verdict(rows: list[dict]) -> str:
+     if not rows:
+         return "INCONCLUSIVE"
+@@ -79,25 +106,46 @@ def verdict(rows: list[dict]) -> str:
+     return "INCONCLUSIVE"
+ 
+ 
+-def plot(rows: list[dict], png: Path) -> None:
++CURVE_COLS = ["round", "games", "winrate", "pval", "n_steps", "loss", "value_loss",
++              "entropy", "mean_value", "grad_norm", "diverged", "ret_pos", "onnx_decisions"]
++
++
++def plot(rows: list[dict], png: Path, variant: str, map_size: str) -> None:
+     rounds = [r["round"] for r in rows]
+     wr = [r["winrate"] * 100 for r in rows]
+     plt.figure(figsize=(7, 4))
+     plt.axhline(50, color="gray", ls="--", lw=1, label="RandomPolicy baseline (50%)")
+     plt.axhline(60, color="green", ls=":", lw=1, label="target (60%)")
+-    plt.plot(rounds, wr, "-o", color="C0", label="OnnxPolicy win-rate")
++    plt.plot(rounds, wr, "-o", color="C0", label=f"{variant} win-rate")
+     plt.xlabel("round"); plt.ylabel("win-rate vs RandomPolicy (%)")
+-    plt.title("Self-play learning curve (Tiny GnK, learner vs RandomPolicy)")
++    plt.title(f"Self-play learning curve ({map_size} GnK · {variant} · vs RandomPolicy)")
+     plt.ylim(0, 100); plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+     plt.savefig(png, dpi=110); plt.close()
+ 
+ 
++def _read_existing_rows(curve_csv: Path) -> list[dict]:
++    if not curve_csv.is_file():
++        return []
++    rows = []
++    with open(curve_csv, newline="") as f:
++        for d in csv.DictReader(f):
++            try:
++                rows.append({"round": int(d["round"]), "games": int(d["games"]),
++                             "winrate": float(d["winrate"]), "pval": float(d["pval"])})
++            except (ValueError, KeyError):
++                continue
++    return rows
++
++
+ def main(argv=None) -> int:
+     ap = argparse.ArgumentParser(description="Self-play round loop → learning curve")
+-    ap.add_argument("--rounds", type=int, default=10)
++    ap.add_argument("--variant", choices=["v1-reinforce", "blind-critic", "rich-critic"],
++                    default="blind-critic", help="algorithm + representation (attributable axis)")
++    ap.add_argument("--map-size", default="Tiny", help="Tiny (comparability) or Medium (ceiling test)")
++    ap.add_argument("--rounds", type=int, default=12)
+     ap.add_argument("--gen-games", type=int, default=24)
+     ap.add_argument("--eval-games", type=int, default=100)
+-    ap.add_argument("--turn-cap", type=int, default=1000)  # high: games play to a real victory; score-leader is the rare fallback
++    ap.add_argument("--turn-cap", type=int, default=1000)
+     ap.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+     ap.add_argument("--gen-seed", type=int, default=1000)
+     ap.add_argument("--eval-seed", type=int, default=999000)
+@@ -105,51 +153,96 @@ def main(argv=None) -> int:
+     ap.add_argument("--keep-shards", type=int, default=2, help="retain only the last N rounds' shard dirs")
+     ap.add_argument("--epochs", type=int, default=8)
+     ap.add_argument("--lr", type=float, default=1e-3)
++    ap.add_argument("--gamma", type=float, default=0.99)
++    ap.add_argument("--lam", type=float, default=0.95)
++    ap.add_argument("--value-coef", type=float, default=0.5)
++    ap.add_argument("--entropy-coef", type=float, default=0.01)
++    ap.add_argument("--clip-eps", type=float, default=0.2,
++                    help="PPO clip epsilon (default 0.2; required because K epochs reuse fixed "
++                         "advantages — pass 0 for single-epoch plain A2C)")
++    ap.add_argument("--resume", action="store_true", help="skip rounds already in curve.csv")
+     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
+     args = ap.parse_args(argv)
+ 
++    import torch  # local import: keep CLI help fast
++
+     out = Path(args.out)
+     out.mkdir(parents=True, exist_ok=True)
+     curve_csv, curve_png = out / "curve.csv", out / "curve.png"
+-    rows: list[dict] = []
+-    model_path: Path | None = None  # None ⇒ round-0 RandomPolicy generation
++    metrics_jsonl = out / "metrics.jsonl"
+ 
+-    with open(curve_csv, "w", newline="") as f:
+-        csv.writer(f).writerow(["round", "games", "winrate", "pval", "n_steps", "loss", "ret_pos", "onnx_decisions"])
++    rows: list[dict] = []
++    start_round = 0
++    model_path: Path | None = None
++    if args.resume:
++        rows = _read_existing_rows(curve_csv)
++        start_round = len(rows)
++        if start_round > 0:
++            cand = out / f"policy_round_{start_round - 1}.onnx"
++            model_path = cand if cand.is_file() else None
++            print(f"[resume] continuing from round {start_round} ({len(rows)} rows in curve.csv)")
++    if start_round == 0:
++        with open(curve_csv, "w", newline="") as f:
++            csv.writer(f).writerow(CURVE_COLS)
+ 
+-    for r in range(args.rounds):
++    for r in range(start_round, args.rounds):
+         t0 = time.time()
+         round_dir = out / f"round_{r}"
+         gen_model = str(model_path) if model_path is not None else "random"
+         n_games = generate(gen_model, round_dir, args.gen_games, args.turn_cap, args.threads,
+-                           args.gen_seed + r * 1000, args.gradle_timeout)
++                           args.gen_seed + r * 1000, args.gradle_timeout, args.map_size)
+ 
+         schema = round_dir / "schema.json"
+         dims = contract.dims_from_schema(schema)
+         fp = contract.fingerprint_from_schema(schema)
+         ver = contract.schema_version_from_schema(schema)
+-        steps = ds.load_training_steps(glob.glob(str(round_dir / "*.bin")),
+-                                       expected_version=ver, expected_fingerprint=fp)
+-        net, stats = tr.train(steps, dims, epochs=args.epochs, lr=args.lr, seed=r)
++        shards = glob.glob(str(round_dir / "*.bin"))
++
++        if args.variant == "v1-reinforce":
++            data = ds.load_training_steps(shards, expected_version=ver, expected_fingerprint=fp)
++        else:
++            data = ds.load_trajectories(shards, expected_version=ver, expected_fingerprint=fp,
++                                        rich=(args.variant == "rich-critic"))
++        net, stats, mode = train_round(args.variant, data, dims, schema, args, seed=r)
++
++        # checkpoint (state_dict only; loaded with weights_only=True on resume — R7)
++        torch.save(net.state_dict(), out / f"ckpt_round_{r}.pt")
+ 
+         model_path = out / f"policy_round_{r}.onnx"
+-        ex.export(net, dims, model_path, schema_version=ver, ruleset_fingerprint=fp)
++        if mode == "blind":
++            ex.export(net, dims, model_path, schema_version=ver, ruleset_fingerprint=fp)
++        else:  # ("rich", token_specs)
++            _, token_specs = mode
++            from .features import build_rich_batch
++            sample = None
++            if data:
++                sample = {k: v[:1] for k, v in build_rich_batch(data[:1], dims, token_specs).items()}
++                sample = {k: (v.numpy() if hasattr(v, "numpy") else v) for k, v in sample.items()}
++            ex.export_rich(net, dims, token_specs, model_path, schema_version=ver,
++                           ruleset_fingerprint=fp, sample_inputs=sample)
+ 
+-        ev = evaluate(model_path, args.eval_games, args.turn_cap, args.threads, args.eval_seed, args.gradle_timeout)
++        ev = evaluate(model_path, args.eval_games, args.turn_cap, args.threads, args.eval_seed,
++                      args.gradle_timeout, args.map_size)
+         row = {"round": r, "games": ev["games"], "winrate": ev["winrate"], "pval": ev["pval"],
+-               "n_steps": stats["n"], "loss": stats["loss"], "ret_pos": stats.get("ret_pos", 0),
+-               "onnx_decisions": ev["onnx_decisions"]}
++               "n_steps": stats.get("n", 0), "loss": stats.get("loss", 0.0),
++               "value_loss": stats.get("value_loss", 0.0), "entropy": stats.get("entropy", 0.0),
++               "mean_value": stats.get("mean_value", 0.0), "grad_norm": stats.get("grad_norm", 0.0),
++               "diverged": int(bool(stats.get("diverged", False))),
++               "ret_pos": stats.get("ret_pos", 0), "onnx_decisions": ev["onnx_decisions"]}
+         rows.append(row)
+         with open(curve_csv, "a", newline="") as f:
+-            csv.writer(f).writerow([row["round"], row["games"], f"{row['winrate']:.4f}",
+-                                    f"{row['pval']:.4g}", row["n_steps"], f"{row['loss']:.4f}",
+-                                    row["ret_pos"], row["onnx_decisions"]])
+-        plot(rows, curve_png)
+-        print(f"[round {r}] gen_games={n_games} train_steps={stats['n']} "
++            csv.writer(f).writerow([row[c] if not isinstance(row[c], float) else f"{row[c]:.5g}"
++                                    for c in CURVE_COLS])
++        with open(metrics_jsonl, "a") as f:
++            f.write(json.dumps({**row, "variant": args.variant, "map_size": args.map_size,
++                                "mean_adv": stats.get("mean_adv", 0.0)}) + "\n")
++        plot(rows, curve_png, args.variant, args.map_size)
++        print(f"[{args.variant} r{r}] gen={n_games} steps={row['n_steps']} "
+               f"winrate={row['winrate']*100:.1f}% pval={row['pval']:.3g} "
+-              f"onnx_decisions={row['onnx_decisions']} ({time.time()-t0:.0f}s)", flush=True)
++              f"vloss={row['value_loss']:.3f} ent={row['entropy']:.2f} "
++              f"onnx_dec={row['onnx_decisions']} diverged={row['diverged']} "
++              f"({time.time()-t0:.0f}s)", flush=True)
+ 
+-        # shard retention: drop round dirs older than the keep window
+         if args.keep_shards >= 0:
+             old = out / f"round_{r - args.keep_shards}"
+             if old.is_dir():
+diff --git a/python/unciv_train/train.py b/python/unciv_train/train.py
+index 9a13349ed..be7eabf86 100644
+--- a/python/unciv_train/train.py
++++ b/python/unciv_train/train.py
+@@ -1,9 +1,18 @@
+-"""REINFORCE-with-baseline over the recorded learner steps.
++"""Trainers over recorded learner steps.
+ 
+-advantage = return − running-mean baseline. Per-head masked log-prob (illegal logits → −1e9, then
+-log-softmax), gathered at the chosen action; a head whose action is −1 (no decision that turn)
+-contributes zero — and critically is NEVER negative-indexed (the gather index is clamped and then
+-masked out). loss = −advantage · Σ_head logp. CPU is fine.
++Two algorithms, dispatched by `--variant` in run_loop:
++
++* `train_reinforce` — v1: REINFORCE with a running-mean baseline (advantage = return − mean).
++  Preserved unchanged for the attributable `v1-reinforce` baseline curve.
++* `train_actor_critic_blind` / `train_actor_critic_rich` — v2: a learned value critic with
++  Generalized Advantage Estimation. Reward is TERMINAL-ONLY ±1 (0 elsewhere); `compute_gae`
++  derives per-state advantages and value targets, V(terminal)=0. Advantages/returns are
++  recomputed each epoch from the CURRENT critic (no frozen importance ratio → no stale-ratio
++  instability → no PPO clip needed; an optional clip knob exists but is off by default). The
++  per-head masked-logp machinery + the −1/no-action handling are shared with v1 VERBATIM.
++
++The reward is the ONLY external signal; the critic is the only new credit mechanism (learned from
++the terminal outcome — not a shaped intermediate reward).
+ """
+ from __future__ import annotations
+ 
+@@ -12,7 +21,7 @@ import torch
+ import torch.nn.functional as F
+ 
+ from .contract import Dims
+-from .dataset import TrainStep
++from .dataset import TrainStep, TrainTrajectory
+ from .model import PolicyNet
+ 
+ 
+@@ -26,7 +35,39 @@ def _masked_logp(logits: torch.Tensor, actions: torch.Tensor, mask: torch.Tensor
+     return torch.where(acted, chosen, torch.zeros_like(chosen))
+ 
+ 
+-def train(
++def _entropy(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
++    neg = torch.where(mask > 0, logits, torch.full_like(logits, -1e9))
++    p = F.softmax(neg, dim=1)
++    logp = F.log_softmax(neg, dim=1)
++    return -(p * logp).sum(dim=1)
++
++
++def compute_gae(rewards, values, gamma: float = 0.99, lam: float = 0.95):
++    """Episodic GAE over ONE trajectory. reward terminal-only (0 except the last step);
++    V(terminal)=0 bootstrap. Returns (advantages, returns) as float32 arrays of the same length.
++
++      delta_t = r_t + gamma*V_{t+1} - V_t      (V_T := 0)
++      A_t     = delta_t + gamma*lam*A_{t+1}     (A_T := 0)
++      R_t     = A_t + V_t
++    """
++    rewards = np.asarray(rewards, dtype=np.float32)
++    values = np.asarray(values, dtype=np.float32)
++    n = len(rewards)
++    adv = np.zeros(n, dtype=np.float32)
++    gae = 0.0
++    for t in range(n - 1, -1, -1):
++        next_v = values[t + 1] if t + 1 < n else 0.0   # V(terminal) = 0
++        delta = rewards[t] + gamma * next_v - values[t]
++        gae = delta + gamma * lam * gae
++        adv[t] = gae
++    ret = adv + values
++    return adv, ret
++
++
++# --------------------------------------------------------------------------------------------------
++# v1: REINFORCE with running-mean baseline (preserved for the attributable baseline)
++# --------------------------------------------------------------------------------------------------
++def train_reinforce(
+     steps: list[TrainStep],
+     dims: Dims,
+     *,
+@@ -44,7 +85,7 @@ def train(
+     obs = torch.tensor(np.stack([s.obs for s in steps]))
+     rets = torch.tensor([s.ret for s in steps], dtype=torch.float32)
+     baseline = rets.mean()
+-    adv = rets - baseline                                  # undiscounted single terminal reward (D11)
++    adv = rets - baseline                                  # undiscounted single terminal reward
+     a_tech = torch.tensor([s.a_tech for s in steps])
+     a_policy = torch.tensor([s.a_policy for s in steps])
+     m_tech = torch.tensor(np.stack([s.mask_tech for s in steps]))
+@@ -53,7 +94,7 @@ def train(
+     last = 0.0
+     for _ in range(epochs):
+         opt.zero_grad()
+-        tl, pl = net(obs)
++        tl, pl, _ = net(obs)                               # value head ignored by REINFORCE
+         logp = _masked_logp(tl, a_tech, m_tech) + _masked_logp(pl, a_policy, m_policy)
+         loss = -(adv * logp).mean()
+         if entropy_coef > 0:
+@@ -63,11 +104,168 @@ def train(
+         opt.step()
+         last = loss.item()
+     return net, {"loss": last, "baseline": float(baseline), "n": len(steps),
++                 "value_loss": 0.0, "entropy": 0.0, "mean_adv": float(adv.mean()),
++                 "mean_value": 0.0, "grad_norm": 0.0,
+                  "ret_mean": float(rets.mean()), "ret_pos": int((rets > 0).sum())}
+ 
+ 
+-def _entropy(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+-    neg = torch.where(mask > 0, logits, torch.full_like(logits, -1e9))
+-    p = F.softmax(neg, dim=1)
+-    logp = F.log_softmax(neg, dim=1)
+-    return -(p * logp).sum(dim=1)
++# --------------------------------------------------------------------------------------------------
++# v2: actor-critic + GAE (shared optimizer core; blind & rich wrappers build the batch)
++# --------------------------------------------------------------------------------------------------
++def _optimize_actor_critic(
++    net,
++    forward_fn,
++    *,
++    a_tech: torch.Tensor,
++    a_policy: torch.Tensor,
++    m_tech: torch.Tensor,
++    m_policy: torch.Tensor,
++    rewards_np: np.ndarray,
++    traj_lens: list[int],
++    n_pos: int,
++    epochs: int,
++    lr: float,
++    gamma: float,
++    lam: float,
++    value_coef: float,
++    entropy_coef: float,
++    clip_eps: float | None,
++    norm_adv: bool,
++) -> tuple[object, dict]:
++    opt = torch.optim.Adam(net.parameters(), lr=lr)
++    n = int(a_tech.shape[0])
++    stats = {"n": n, "n_traj": len(traj_lens), "ret_pos": n_pos}
++
++    # --- Compute advantages + value targets ONCE per round from a V-snapshot (standard PPO/A2C).
++    # Recomputing each epoch makes the target chase V (degenerate value_loss); a fixed target ≈ the
++    # bounded discounted-terminal return at λ≈1, so the critic regresses toward a stable signal.
++    with torch.no_grad():
++        tl0, pl0, val0 = forward_fn()
++        val0 = val0.reshape(-1)
++        old_logp = (_masked_logp(tl0, a_tech, m_tech) + _masked_logp(pl0, a_policy, m_policy)).detach()
++    v_np = val0.cpu().numpy()
++    adv_np = np.zeros(n, dtype=np.float32)
++    ret_np = np.zeros(n, dtype=np.float32)
++    off = 0
++    for L in traj_lens:
++        a, r = compute_gae(rewards_np[off:off + L], v_np[off:off + L], gamma, lam)
++        adv_np[off:off + L] = a
++        ret_np[off:off + L] = r
++        off += L
++    adv = torch.tensor(adv_np)
++    ret = torch.tensor(ret_np)                              # fixed value target for the round
++    if norm_adv and adv.numel() > 1:                        # BATCH-level normalization (not per-traj)
++        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
++    adv = adv.detach()
++
++    for ep in range(epochs):
++        opt.zero_grad()
++        tl, pl, val = forward_fn()
++        val = val.reshape(-1)
++        logp = _masked_logp(tl, a_tech, m_tech) + _masked_logp(pl, a_policy, m_policy)
++        if clip_eps:                                        # PPO clip (default ON; 0/None ⇒ plain A2C)
++            logratio = (logp - old_logp).clamp(-20.0, 20.0)  # guard exp() overflow on big policy shifts
++            ratio = torch.exp(logratio)
++            surr = torch.min(ratio * adv, torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv)
++            policy_loss = -surr.mean()
++        else:                                               # plain A2C (single-epoch use)
++            policy_loss = -(adv * logp).mean()
++        value_loss = F.mse_loss(val, ret)
++        ent = (_entropy(tl, m_tech) + _entropy(pl, m_policy)).mean()
++        loss = policy_loss + value_coef * value_loss - entropy_coef * ent
++
++        if not torch.isfinite(loss):                        # divergence guard (R8)
++            stats["note"] = f"non-finite loss at epoch {ep} — aborting round"
++            stats["diverged"] = True
++            return net, stats
++
++        loss.backward()
++        gnorm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=10.0)
++        opt.step()
++        stats.update(loss=float(loss.item()), policy_loss=float(policy_loss.item()),
++                     value_loss=float(value_loss.item()), entropy=float(ent.item()),
++                     mean_adv=float(adv.mean().item()), mean_value=float(val.mean().item()),
++                     grad_norm=float(gnorm))
++    stats.setdefault("diverged", False)
++    return net, stats
++
++
++def _stack_traj(trajectories: list[TrainTrajectory]):
++    a_tech = torch.tensor(np.concatenate([t.a_tech for t in trajectories]))
++    a_policy = torch.tensor(np.concatenate([t.a_policy for t in trajectories]))
++    m_tech = torch.tensor(np.concatenate([t.mask_tech for t in trajectories]))
++    m_policy = torch.tensor(np.concatenate([t.mask_policy for t in trajectories]))
++    rewards_np = np.concatenate([t.rewards for t in trajectories]).astype(np.float32)
++    traj_lens = [int(len(t.rewards)) for t in trajectories]
++    n_pos = int(sum(1 for t in trajectories if t.rewards[-1] > 0))
++    return a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos
++
++
++def train_actor_critic_blind(
++    trajectories: list[TrainTrajectory],
++    dims: Dims,
++    *,
++    epochs: int = 8,
++    lr: float = 1e-3,
++    seed: int = 0,
++    gamma: float = 0.99,
++    lam: float = 0.95,
++    value_coef: float = 0.5,
++    entropy_coef: float = 0.01,
++    clip_eps: float | None = None,
++    norm_adv: bool = True,
++) -> tuple[PolicyNet, dict]:
++    torch.manual_seed(seed)
++    net = PolicyNet(dims)
++    if not trajectories:
++        return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}
++    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos = _stack_traj(trajectories)
++    obs = torch.tensor(np.concatenate([t.obs for t in trajectories]))
++
++    def forward_fn():
++        return net(obs)
++
++    return _optimize_actor_critic(
++        net, forward_fn, a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
++        rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
++        gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
++        clip_eps=clip_eps, norm_adv=norm_adv,
++    )
++
++
++def train_actor_critic_rich(
++    trajectories: list[TrainTrajectory],
++    dims: Dims,
++    token_specs: dict[str, int],
++    *,
++    epochs: int = 8,
++    lr: float = 1e-3,
++    seed: int = 0,
++    gamma: float = 0.99,
++    lam: float = 0.95,
++    value_coef: float = 0.5,
++    entropy_coef: float = 0.01,
++    clip_eps: float | None = None,
++    norm_adv: bool = True,
++) -> tuple[object, dict]:
++    """Rich variant. Trajectories carry `rich` dicts of padded per-step token tensors + masks
++    (assembled by features.build_rich_batch). The whole round is one padded batch."""
++    from .features import build_rich_batch
++    from .model import RichPolicyValueNet
++
++    torch.manual_seed(seed)
++    net = RichPolicyValueNet(dims, token_specs)
++    if not trajectories:
++        return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}
++    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos = _stack_traj(trajectories)
++    inputs = build_rich_batch(trajectories, dims, token_specs)  # dict[name -> tensor], padded
++
++    def forward_fn():
++        return net(inputs)
++
++    return _optimize_actor_critic(
++        net, forward_fn, a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
++        rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
++        gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
++        clip_eps=clip_eps, norm_adv=norm_adv,
++    )

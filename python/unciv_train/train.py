@@ -132,9 +132,11 @@ def _optimize_actor_critic(
     clip_eps: float | None,
     norm_adv: bool,
 ) -> tuple[object, dict]:
+    import copy
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     n = int(a_tech.shape[0])
     stats = {"n": n, "n_traj": len(traj_lens), "ret_pos": n_pos}
+    safe_state = copy.deepcopy(net.state_dict())  # restore on divergence (council 🔴: no NaN export)
 
     # --- Compute advantages + value targets ONCE per round from a V-snapshot (standard PPO/A2C).
     # Recomputing each epoch makes the target chase V (degenerate value_loss); a fixed target ≈ the
@@ -174,14 +176,16 @@ def _optimize_actor_critic(
         ent = (_entropy(tl, m_tech) + _entropy(pl, m_policy)).mean()
         loss = policy_loss + value_coef * value_loss - entropy_coef * ent
 
-        if not torch.isfinite(loss):                        # divergence guard (R8)
-            stats["note"] = f"non-finite loss at epoch {ep} — aborting round"
+        if not torch.isfinite(loss):                        # divergence guard (R8 + council 🔴)
+            net.load_state_dict(safe_state)                 # restore last finite weights — never export NaN
+            stats["note"] = f"non-finite loss at epoch {ep} — restored last-good weights"
             stats["diverged"] = True
             return net, stats
 
         loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=10.0)
         opt.step()
+        safe_state = copy.deepcopy(net.state_dict())        # checkpoint last-good (finite) weights
         stats.update(loss=float(loss.item()), policy_loss=float(policy_loss.item()),
                      value_loss=float(value_loss.item()), entropy=float(ent.item()),
                      mean_adv=float(adv.mean().item()), mean_value=float(val.mean().item()),

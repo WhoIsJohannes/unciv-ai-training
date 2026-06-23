@@ -1,0 +1,967 @@
+{
+  "assignments": {
+    "skeptic": "openai/gpt-5.5",
+    "architect": "google/gemini-3.1-pro-preview",
+    "practitioner": "anthropic/claude-opus-4.8",
+    "product_manager": "openai/gpt-5.5",
+    "qa_testing": "deepseek/deepseek-v4-pro",
+    "security_red_team": "anthropic/claude-opus-4.8",
+    "domain_fidelity": "google/gemini-3.1-pro-preview",
+    "ethics_responsible_ai": "deepseek/deepseek-v4-pro",
+    "cost_efficiency": "openai/gpt-5.5"
+  },
+  "findings": [
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Rich ONNX input inventory is not validated before inference",
+      "severity": "major",
+      "primary_lens": "skeptic",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "init / forwardRich / buildRichTensors",
+      "description": "A model only has to stamp `contract_version=2` to take the rich path, but the code never checks that the session actually expects the hardcoded tensor set. A v2 ONNX exported with a subset, renamed input, or stale `input_names` metadata will load successfully and then crash on the first decision when `session.run(inputs)` gets missing or extra feeds.",
+      "rationale": "This is the kind of avoidable late failure that makes debugging production sims miserable: the provenance gate says the model is valid, then the first game dies somewhere inside ORT. If we have metadata for input names, it should earn its keep or be removed.",
+      "suggested_addition": "In `init`, for rich models compare `session.inputNames` or `META_INPUT_NAMES` against the exact expected set (`global`, `acting_civ`, each token and mask) and fail fast with a clear error. Add one test exporting a malformed/subset rich model and asserting `OnnxPolicy` rejects it at construction.",
+      "supporting_roles": [
+        "qa_testing",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "observability",
+        "compatibility"
+      ],
+      "source_excerpts": [
+        "rich = mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_RICH",
+        "check(mContract == SampleSchema.OnnxContract.CONTRACT_VERSION || rich) { ... }",
+        "val inputs = buildRichTensors(env, obs)",
+        "session.run(inputs).use { res ->",
+        "const val META_INPUT_NAMES = \"input_names\"   // comma-joined ordered tensor names (v2)"
+      ],
+      "event_id": "73c1f85b-9e3f-44ee-b3ff-4c6cfe9bcad5"
+    },
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Map-size CLI silently trains Tiny on bad input",
+      "severity": "major",
+      "primary_lens": "skeptic",
+      "target_file": "desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt",
+      "target_section": "resolveMapSize",
+      "description": "`resolveMapSize` falls back to `Tiny` for any unknown string, including likely inputs like `medium` or a typo. The run then logs the user-provided `mapSizeName`, so an acceptance or training run can claim it ran `medium` while actually using Tiny.",
+      "rationale": "Silent fallback is worse than a crash here because it invalidates experiment results. This is configuration theater: if the value matters enough to be configurable, bad values must not be silently accepted.",
+      "suggested_addition": "Normalize case for the supported names and `error(\"unknown map size ...\")` for anything else. Add a tiny CLI/unit test that `medium` resolves to `Medium` and `Medum` fails.",
+      "supporting_roles": [
+        "qa_testing",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "data_integrity"
+      ],
+      "source_excerpts": [
+        "private fun resolveMapSize(name: String): MapSize = when (name) {",
+        "    \"Small\" -> MapSize.Small",
+        "    \"Medium\" -> MapSize.Medium",
+        "    \"Large\" -> MapSize.Large",
+        "    \"Huge\" -> MapSize.Huge",
+        "    else -> MapSize.Tiny",
+        "}",
+        "println(\"SELFPLAY_GEN_DONE games=${sim.steps.size} dir=$outDir model=$modelArg seed=$seed mapSize=$mapSizeName\")"
+      ],
+      "event_id": "7a78f711-25d9-4973-a9e1-a46e93330632"
+    },
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Rich tensor builder accepts malformed token widths until ORT explodes",
+      "severity": "minor",
+      "primary_lens": "skeptic",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "tokenTensors",
+      "description": "`tokenTensors` floors `values.size / width` and passes the original `values` buffer to a shape based on that floored count. If a block length is not divisible by width, or width is zero, tensor creation can fail with a low-level ORT shape/buffer error instead of a useful contract error.",
+      "rationale": "The code added a new multi-tensor boundary; this is exactly where cheap validation pays off. Without it, a bad schema/fixture/model mismatch becomes a native runtime exception with little context.",
+      "suggested_addition": "Add `require(width > 0)` and `require(values.size % width == 0)` before creating tensors, ideally including the token name in the message. Pass `name` into `tokenTensors` so the error says which block is malformed.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "observability"
+      ],
+      "source_excerpts": [
+        "private fun tokenTensors(env: OrtEnvironment, values: FloatArray, width: Int): Pair<OnnxTensor, OnnxTensor> {",
+        "    val count = if (width > 0) values.size / width else 0",
+        "    val n = maxOf(1, count)",
+        "    val data = if (count > 0) values else FloatArray(width)",
+        "    val tok = OnnxTensor.createTensor(env, FloatBuffer.wrap(data), longArrayOf(1, n.toLong(), width.toLong()))"
+      ],
+      "event_id": "04cd0bcb-d9b1-4415-8711-663ac1dc9964"
+    },
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Acceptance script reports DONE after failed variants",
+      "severity": "major",
+      "primary_lens": "skeptic",
+      "target_file": "python/run_acceptance.sh",
+      "target_section": "whole script",
+      "description": "The script explicitly continues after each failed training variant and after failed analysis, then always prints `DONE`. That can leave missing or stale curves in `$OUT_ROOT` while the final status still looks successful.",
+      "rationale": "For a shipped training/acceptance workflow, false success is a production bug. Future maintainers will trust the report directory and waste time debugging model quality when the run actually failed halfway through.",
+      "suggested_addition": "Track failures and exit non-zero at the end, or use `set -e` for the variant loops. At minimum, before `ANALYZE`, assert the expected `curve.csv` files exist and have the requested number of rounds.",
+      "supporting_roles": [
+        "practitioner",
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "observability",
+        "release_engineering"
+      ],
+      "source_excerpts": [
+        "set -uo pipefail",
+        "$PY -m unciv_train.run_loop --variant \"$V\" ... --resume || log \"TINY $V FAILED (continuing)\"",
+        "$PY -m unciv_train.run_loop --variant \"$V\" ... --resume || log \"MEDIUM $V FAILED (continuing)\"",
+        "$PY -m unciv_train.analyze --root \"$ROOT\" ... || log \"ANALYZE FAILED\"",
+        "log \"DONE\""
+      ],
+      "event_id": "e35f91d9-2149-4f32-92b4-57d792266bf4"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Native Memory Leak on Partial Tensor Construction",
+      "severity": "critical",
+      "primary_lens": "Architect",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "richTensorsFromArrays",
+      "description": "If an exception (e.g., OrtException) is thrown midway through the loop creating multi-tensor inputs, the `out` map is abandoned. The `finally` block in `forwardRich` only protects tensors if the map is successfully returned, causing already-created tensors to leak native memory.",
+      "rationale": "Native resources must be deterministically closed even when construction fails partially. Leaking ONNX tensors on the hot inference path will quickly OOM the JVM.",
+      "suggested_addition": "Wrap the body of `richTensorsFromArrays` in a `try/catch`. On catch, iterate `out.values` and call `.close()`, then rethrow.",
+      "supporting_roles": [
+        "security_red_team"
+      ],
+      "supporting_lenses": [
+        "Resource Management"
+      ],
+      "source_excerpts": [
+        "val out = LinkedHashMap<String, OnnxTensor>()",
+        "val (tok, mask) = tokenTensors(env, values, width)",
+        "out[name] = tok",
+        "return out"
+      ],
+      "event_id": "61742552-b8f0-45b0-a81d-0fe479f2b684"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Unimplemented Checkpoint Load (Dead Code / Missing Feature)",
+      "severity": "major",
+      "primary_lens": "Architect",
+      "target_file": "python/unciv_train/run_loop.py",
+      "target_section": "main",
+      "description": "The code saves `.pt` checkpoints and the comment explicitly claims they are \"loaded with weights_only=True on resume \u2014 R7\". However, the resume logic only locates the `.onnx` file for data generation; it never calls `torch.load()` to restore the network weights, meaning training always starts from scratch.",
+      "rationale": "A claimed security/resume feature (R7) is entirely missing from the implementation. Writing checkpoints that are never read is dead code and violates the stated architectural intent of resuming training state.",
+      "suggested_addition": "Add `net.load_state_dict(torch.load(..., weights_only=True))` in `train_round` when resuming, or remove the misleading comment and unused `.pt` saving if from-scratch is intended.",
+      "supporting_roles": [
+        "security_red_team"
+      ],
+      "supporting_lenses": [
+        "Traceability"
+      ],
+      "source_excerpts": [
+        "# checkpoint (state_dict only; loaded with weights_only=True on resume \u2014 R7)",
+        "torch.save(net.state_dict(), out / f\"ckpt_round_{r}.pt\")"
+      ],
+      "event_id": "09f32c01-e0be-4522-b34f-12eb4e9091db"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Missing Observation Block Causes JVM Crash",
+      "severity": "major",
+      "primary_lens": "Architect",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "buildRichTensors",
+      "description": "The code uses `obs.blocks.first { it.name == name }` to find the `perItem` width. If the observation completely omits a block (e.g., due to schema evolution or conditional emission), `first` throws a `NoSuchElementException`, crashing the thread.",
+      "rationale": "Integration boundaries must be defensive. Assuming a collection always contains a specific element creates a brittle contract that turns a missing feature into a hard crash.",
+      "suggested_addition": "Use `firstOrNull { it.name == name }?.perItem ?: 0` to safely handle missing blocks.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "Contract Quality"
+      ],
+      "source_excerpts": [
+        "else obs.blocks.first { it.name == name }.perItem"
+      ],
+      "event_id": "71ff012f-e34e-467a-b933-4c05d1b39d3e"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Silent Truncation of Observation Features",
+      "severity": "minor",
+      "primary_lens": "Architect",
+      "target_file": "python/unciv_train/features.py",
+      "target_section": "_pad_token_set",
+      "description": "The padding logic uses `w = min(width, int(a.shape[1]))` and slices `a[:, :w]`. If the JVM emits a block with more features per item than the Python contract expects, it silently truncates the data.",
+      "rationale": "Silent truncation hides contract mismatches. The model will train on misaligned or partial data without failing fast, making schema drift extremely difficult to debug.",
+      "suggested_addition": "Assert `a.shape[1] == width` or log a loud warning if they mismatch, rather than silently slicing.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "Observability"
+      ],
+      "source_excerpts": [
+        "w = min(width, int(a.shape[1]))",
+        "padded[i, :c, :w] = a[:, :w]"
+      ],
+      "event_id": "25e5d0ce-94c0-4bab-884a-b46cbea6cdf9"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Target Computation Uses Train-Mode Statistics",
+      "severity": "minor",
+      "primary_lens": "Architect",
+      "target_file": "python/unciv_train/train.py",
+      "target_section": "_optimize_actor_critic",
+      "description": "GAE targets are computed via `with torch.no_grad(): tl0, pl0, val0 = forward_fn()` while the network is in `train()` mode.",
+      "rationale": "While safe for the current `Linear`/`ReLU` architecture, this is architecturally fragile. If layers like Dropout or BatchNorm are added later, targets will be computed using noisy train-mode statistics, silently degrading the critic's signal.",
+      "suggested_addition": "Call `net.eval()` before computing the targets, and `net.train()` after.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "Implicit Architecture Commitments"
+      ],
+      "source_excerpts": [
+        "with torch.no_grad():",
+        "tl0, pl0, val0 = forward_fn()"
+      ],
+      "event_id": "f4daaea3-a76b-4350-93bb-163bc5335ad9"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "parityRunRich leaks ORT session on parse failure before session.run",
+      "severity": "major",
+      "primary_lens": "practitioner",
+      "target_file": "desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt",
+      "target_section": "parityRunRich:328-393",
+      "description": "The fixture parser (File(obsIn).readLines() loop, then richTensorsFromArrays) runs BEFORE the try/finally that closes the session. A malformed fixture line \u2014 wrong token count, non-numeric float, or a 'set' line whose count*width exceeds the available tokens \u2014 throws an uncaught exception after env.createSession() has opened the native session, leaking the OrtSession and OrtEnvironment handles. The blanket FloatArray(count*width){ t[it+4].toFloat() } also indexes out of bounds (or silently truncates) when the declared count/width disagrees with the actual token count.",
+      "rationale": "Practitioner cares because parity-run-rich is the JVM half of the AC4 anti-drift gate invoked from the test harness via gradle subprocess; a leaked native session on the CI box accumulates file handles / native memory across repeated runs, and an unguarded parse error produces a stack trace instead of a diagnosable 'fixture line N malformed' message at 3am.",
+      "suggested_addition": "Validate each 'set' line: require t.size == 4 + count*width and reject negative count/width with a 'parity-run-rich: malformed set line for <name>: expected N floats got M' error; move session.createSession AFTER the fixture is fully parsed, or wrap parse+run in a single try/finally that closes the session.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "security_red_team"
+      ],
+      "source_excerpts": [
+        "val v = FloatArray(count * width) { t[it + 4].toFloat() }",
+        "val session = env.createSession(File(model).absolutePath, OrtSession.SessionOptions())\n        val inputs = OnnxPolicy.richTensorsFromArrays(env, global, acting, tokens)"
+      ],
+      "event_id": "bf561ee6-d9e6-4bf1-81aa-1fdfc82744c8"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "buildRichTensors will throw NoSuchElementException when an entity block is absent from Observation",
+      "severity": "major",
+      "primary_lens": "practitioner",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "buildRichTensors:131-142",
+      "description": "buildRichTensors derives perItem via obs.blocks.first { it.name == name }. The scan notes VARIABLE entity blocks are present-only on disk and that an entity type with zero present items may not surface a block. If any of own_units/opp_units/own_cities/opp_cities/civ_tokens is missing from obs.blocks for a given turn, first{} throws NoSuchElementException at decision time on the live inference path \u2014 taking down the rich-critic self-play game rather than degrading to the heuristic fallback.",
+      "rationale": "Practitioner cares because this is the user-facing inference path during gen/eval: a single early-game observation with an empty entity type (common \u2014 opp_cities before contact) crashes the whole simulation thread, and the failure mode is an opaque NoSuchElementException with no block-name context.",
+      "suggested_addition": "Use obs.blocks.firstOrNull{ it.name == name }?.perItem ?: <fallback width> (or read width from a schema-derived spec like the Python token_specs_from_schema fallback table), and log the block name when a width can't be resolved.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "val width = if (name == \"spatial\") SampleSchema.NUM_SPATIAL_CHANNELS\n                            else obs.blocks.first { it.name == name }.perItem",
+        "Block kinds: FIXED \u2192 1D `(len,)`; VARIABLE \u2192 u16 count prefix then `(count, perItem)` \u2014 **present-only on disk, padding is the loader's job.**"
+      ],
+      "event_id": "1f591262-bcec-42a9-b41b-f6215bbcdb91"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "JVM masked-pool semantics not verified for ALL-empty entity sets (mask=[0]) vs Python masked_pool",
+      "severity": "major",
+      "primary_lens": "practitioner",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "tokenTensors:166-176",
+      "description": "tokenTensors emits N=1 zero-token + mask=[0] for an empty set, while Python build_rich_single pads the same empty set to maxN=1 with mask all-zero. The parity test fixture (test_jvm_python_rich_logits_match) only sets opp_units/opp_cities empty while own_units/own_cities are non-empty, so the JVM mask=[0] path is exercised. But the model's masked_pool divides by clamp(count,1) and converts -inf max to 0 \u2014 the agreement between JVM-fed [1,1,width] zero tensor + [1,1] zero mask and Python's identical construction is only validated transitively. There is no assertion pinning that a turn where EVERY entity set is empty (very early game) produces finite, matching logits on both sides.",
+      "rationale": "Practitioner cares because the NaN-guard is the council R3 fix and the early-game all-empty-entities state is exactly when it fires in production self-play; a sign or count mismatch here surfaces as silent logit drift (model picks differently) rather than a crash, which is the hardest class of bug to debug from a curve that just looks worse.",
+      "suggested_addition": "Add a parity fixture case where own_units, opp_units, own_cities, opp_cities, civ_tokens are ALL empty (only spatial populated) and assert atol=1e-4 \u2014 this pins the all-padding masked-pool path end-to-end.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "val n = maxOf(1, count)\n            val data = if (count > 0) values else FloatArray(width)\n            val mask = FloatArray(n) { if (it < count) 1f else 0f }",
+        "\"opp_units\": np.zeros((0, 2), np.float32),        # empty set \u2192 NaN-guard path"
+      ],
+      "event_id": "1c2d45fe-7be5-42d9-9f16-99836aaff7eb"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Provenance gate accepts v2 contract without validating the input-tensor inventory",
+      "severity": "major",
+      "primary_lens": "practitioner",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "init:51-66",
+      "description": "The v2 gate only checks mContract == CONTRACT_VERSION_RICH; it never reads META_INPUT_NAMES (which the exporter now stamps) to confirm the loaded model's actual input tensors match RICH_TOKEN_NAMES + masks + global/acting. A v2 model exported with a different token set (e.g. schema with extra/renamed entity blocks) passes the gate, then session.run(inputs) fails deep inside ORT with a cryptic 'invalid input name' rather than at the provenance boundary. decisions.md D10 explicitly called for the gate to 'validate v2 + the tensor inventory' \u2014 that validation was not implemented.",
+      "rationale": "Practitioner cares because the provenance gate is the design's committed defense against silently loading a mismatched perishable artifact; a gate that passes-then-crashes-mid-inference defeats the fast-fail intent and turns a clear 'wrong model' error into a runtime ORT exception during a long self-play run.",
+      "suggested_addition": "In the rich branch, read meta[META_INPUT_NAMES], split on ',', and check{} it equals the expected ordered list (global, acting_civ, then each RICH_TOKEN_NAME + _mask); fail at init with the diff if it doesn't.",
+      "supporting_roles": [],
+      "supporting_lenses": [
+        "security_red_team"
+      ],
+      "source_excerpts": [
+        "rich = mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_RICH\n        check(mContract == SampleSchema.OnnxContract.CONTRACT_VERSION || rich) {",
+        "const val META_INPUT_NAMES = \"input_names\"   // comma-joined ordered tensor names (v2)"
+      ],
+      "event_id": "e27479dc-ff2d-4968-b32b-b8add66926ed"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "analyze.py ceiling-eval model-path index is off-by-one and silently falls back",
+      "severity": "minor",
+      "primary_lens": "practitioner",
+      "target_file": "python/unciv_train/analyze.py",
+      "target_section": "main:120-138",
+      "description": "AC3's final ceiling eval builds the model path as policy_round_{len(medium['blind-critic'])-1}.onnx. This assumes round indices are contiguous 0..N-1 and that curve.csv row count equals the highest round number. With --resume after a partial/failed round (run_acceptance.sh uses --resume and continues past FAILED variants), the curve row count can diverge from the actual last-exported round number, so bm/rm point at a non-existent .onnx, the is_file() check fails, and the analysis silently degrades to 'ceiling eval skipped' \u2014 reporting AC3 as inconclusive when the models actually exist under a different index.",
+      "rationale": "Practitioner cares because this is the headline AC3 result reported to the user; a silent fallback to 'no comparison' after a long compute-bounded run wastes the budget and produces a misleading report rather than an explicit 'could not locate round-N model' signal.",
+      "suggested_addition": "Derive the round number from the curve's last row (rows[-1]['round']) rather than len(rows)-1, or glob policy_round_*.onnx and pick max; log the resolved path so a missing file is visibly diagnosable.",
+      "supporting_roles": [],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "bm = root / \"blind-critic-medium\" / f\"policy_round_{len(medium['blind-critic'])-1}.onnx\" if medium[\"blind-critic\"] else None",
+        "--out \"$ROOT/$V-tiny\" --resume || log \"TINY $V FAILED (continuing)\""
+      ],
+      "event_id": "167017c7-5877-41a4-b8e0-68fe81123bfb"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcome",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Unknown map-size CLI values silently run Tiny",
+      "severity": "major",
+      "primary_lens": "product_manager",
+      "target_file": "desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt",
+      "target_section": "resolveMapSize / gen / eval",
+      "description": "Passing a typo or lowercase value like `medium` falls back to `MapSize.Tiny`, while the completion log still prints the original `mapSizeName`. That can make the Medium ceiling experiment run on Tiny without anyone noticing, invalidating the AC3 outcome metric.",
+      "rationale": "This is exactly how a shipped acceptance metric becomes theatre: the report says Medium, the code may have evaluated Tiny. A user/operator loses trust in the rich-vs-blind result because the harness does not prove it measured the requested scenario.",
+      "suggested_addition": "Make unknown map sizes a hard error, or at minimum normalize case and log the resolved enum. Add a CLI test/smoke that `--map-size Medum` fails and `Medium` resolves to `MapSize.Medium`.",
+      "supporting_roles": [
+        "qa_testing",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "observability",
+        "test_integrity"
+      ],
+      "source_excerpts": [
+        "private fun resolveMapSize(name: String): MapSize = when (name) {",
+        "\"Small\" -> MapSize.Small",
+        "\"Medium\" -> MapSize.Medium",
+        "\"Large\" -> MapSize.Large",
+        "\"Huge\" -> MapSize.Huge",
+        "else -> MapSize.Tiny",
+        "println(\"SELFPLAY_GEN_DONE games=${sim.steps.size} dir=$outDir model=$modelArg seed=$seed mapSize=$mapSizeName\")"
+      ],
+      "event_id": "3551ceaa-55b3-4c0c-8de9-9441ef6709ee"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcome",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Rich ONNX contract is accepted without input-inventory validation",
+      "severity": "major",
+      "primary_lens": "product_manager",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "init / forwardRich",
+      "description": "The JVM now accepts contract v2 models but only checks schema, contract version, and ruleset fingerprint. If a v2 model is exported with a missing, renamed, or differently ordered tensor/mask, the failure moves to the first live decision as an ORT runtime error instead of failing fast at model load.",
+      "rationale": "The product outcome depends on long self-play/eval runs completing and producing attributable curves. A bad model artifact should be rejected immediately with a measurable reason, not crash after game startup or silently invalidate a run.",
+      "suggested_addition": "At `OnnxPolicy` init, validate `session.inputNames` or `META_INPUT_NAMES` against the expected v2 set: `global`, `acting_civ`, each `RICH_TOKEN_NAMES` entry, and each `<name>_mask`. Also validate output names/width metadata before play starts.",
+      "supporting_roles": [
+        "qa_testing",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "backward_compat",
+        "observability"
+      ],
+      "source_excerpts": [
+        "rich = mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_RICH",
+        "check(mContract == SampleSchema.OnnxContract.CONTRACT_VERSION || rich) {",
+        "\"OnnxPolicy: model contract_version=$mContract not in {...}\"",
+        "}",
+        "const val META_INPUT_NAMES = \"input_names\"   // comma-joined ordered tensor names (v2)",
+        "session.run(inputs).use { res ->"
+      ],
+      "event_id": "89b7432a-2ce2-4e0c-8745-29b3d78b0d8d"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcome",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Acceptance script continues after failed variant runs",
+      "severity": "major",
+      "primary_lens": "product_manager",
+      "target_file": "python/run_acceptance.sh",
+      "target_section": "variant loops / ANALYZE",
+      "description": "The acceptance driver logs failed Tiny or Medium runs and keeps going, then still invokes analysis and prints `DONE`. This can produce an acceptance report from missing or partial curves without making the failure status obvious to automation.",
+      "rationale": "The load-bearing outcome here is not that scripts ran; it is that all required curves exist and are comparable. Continuing after failed variants risks shipping a report that looks complete but did not measure the promised variants.",
+      "suggested_addition": "Track a failure flag and exit non-zero after analysis, or make failures fatal by default with an explicit `ALLOW_PARTIAL=1` escape. In `analyze.py`, fail unless all required curve files have the expected minimum rounds unless `--allow-incomplete` is passed.",
+      "supporting_roles": [
+        "qa_testing",
+        "cost_efficiency"
+      ],
+      "supporting_lenses": [
+        "test_integrity",
+        "observability"
+      ],
+      "source_excerpts": [
+        "$PY -m unciv_train.run_loop --variant \"$V\" --map-size Tiny --rounds \"$TINY_ROUNDS\" \\",
+        "    --out \"$ROOT/$V-tiny\" --resume || log \"TINY $V FAILED (continuing)\"",
+        "$PY -m unciv_train.run_loop --variant \"$V\" --map-size Medium --rounds \"$MED_ROUNDS\" \\",
+        "    --out \"$ROOT/$V-medium\" --resume || log \"MEDIUM $V FAILED (continuing)\"",
+        "$PY -m unciv_train.analyze --root \"$ROOT\" --ceiling-games 200 --turn-cap 250 --threads \"$TH\" \\",
+        "    || log \"ANALYZE FAILED\"",
+        "log \"DONE\""
+      ],
+      "event_id": "ed03ffe4-6b36-4363-838b-92f2dbe266ac"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcome",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Zero-step training rounds still export and evaluate a model",
+      "severity": "major",
+      "primary_lens": "product_manager",
+      "target_file": "python/unciv_train/run_loop.py",
+      "target_section": "main training loop / train_actor_critic_* empty-data path",
+      "description": "If generation produces no learner steps or trajectory loading filters everything out, the trainer returns a fresh untrained net with `n=0`; `run_loop` still exports it, evaluates it, and appends a curve row. That poisons the learning curve with a valid-looking data point that did not train on any data.",
+      "rationale": "The core user outcome is measured improvement over rounds. A round with zero training examples is not a weak round; it is a failed round, and treating it as a valid metric hides pipeline breakage.",
+      "suggested_addition": "After `train_round`, hard-fail the round when `stats.get(\"n\", 0) == 0` before export/eval, with a clear log including variant, round, shard count, and map size. Add a small unit/integration test that empty trajectories cause `run_loop` to abort rather than write `curve.csv` data.",
+      "supporting_roles": [
+        "qa_testing",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "observability",
+        "data_integrity"
+      ],
+      "source_excerpts": [
+        "if not trajectories:",
+        "    return net, {\"loss\": 0.0, \"n\": 0, \"note\": \"no steps\", \"ret_pos\": 0}",
+        "net, stats, mode = train_round(args.variant, data, dims, schema, args, seed=r)",
+        "model_path = out / f\"policy_round_{r}.onnx\"",
+        "ex.export(net, dims, model_path, schema_version=ver, ruleset_fingerprint=fp)",
+        "ev = evaluate(model_path, args.eval_games, args.turn_cap, args.threads, args.eval_seed,"
+      ],
+      "event_id": "fb9500e7-a974-4d16-ad33-e892a7eadff4"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcome",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Spatial width is hardcoded in rich dataset loader",
+      "severity": "minor",
+      "primary_lens": "product_manager",
+      "target_file": "python/unciv_train/dataset.py",
+      "target_section": "_rich_step_blocks",
+      "description": "The rich loader reshapes spatial data with a hardcoded width of 13 even though the contract and Kotlin side expose spatial channel width as schema/constant-driven. Any future schema/channel change will either crash training or train a model on a shape that no longer matches JVM inference.",
+      "rationale": "This is a backward-compat risk for the stored data contract. The product promise is that schema/provenance gates make experiments reproducible; a hidden hardcoded width undermines that by bypassing the schema as the source of truth.",
+      "suggested_addition": "Derive the spatial width from schema/token specs instead of hardcoding 13, or assert the loaded schema width is exactly 13 with a clear provenance error. Add a test fixture with a non-13 synthetic spatial width to prove the loader either adapts or fails fast.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "backward_compat",
+        "data_integrity"
+      ],
+      "source_excerpts": [
+        "spatial = np.asarray(blocks[\"spatial\"], dtype=np.float32).reshape(-1, 13)",
+        "_TOKEN_WIDTH_FALLBACK = {\"spatial\": 13, \"own_units\": 8, \"opp_units\": 8,",
+        "specs[\"spatial\"] = len(chans) if chans else _TOKEN_WIDTH_FALLBACK[\"spatial\"]",
+        "val width = if (name == \"spatial\") SampleSchema.NUM_SPATIAL_CHANNELS"
+      ],
+      "event_id": "d338cdd5-cea2-4260-b9ef-37f6df58aada"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Map-size CLI arg silently falls back to Tiny \u2014 risks corrupted experiment results",
+      "severity": "major",
+      "primary_lens": "qa_testing",
+      "target_file": "desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt",
+      "target_section": "resolveMapSize",
+      "description": "`SelfPlayRunner.resolveMapSize` maps any unrecognized string (e.g. 'medium') to `MapSize.Tiny` with no warning. Since `--map-size` is threaded through `gen`/`eval`, a typo or case mismatch causes eval to run on the wrong map, producing a win-rate that looks valid but is not representative of the intended Medium trial \u2014 breaking the AC3 ceiling test.",
+      "rationale": "The acceptance analysis depends on exact map sizes; a silent fallback makes the experiment untestable \u2014 I can't write a test that the eval actually ran on Medium if the CLI swallows the mistake.",
+      "suggested_addition": "Validate the map-size name early (e.g. in `SelfPlayRunner.main` or `resolveMapSize`) and fail with a clear error message listing valid sizes: 'Tiny, Small, Medium, Large, Huge'. Also replicate the check in `run_loop.py` before launching gradle.",
+      "supporting_roles": [],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "private fun resolveMapSize(name: String): MapSize = when (name) {\n    \"Small\" -> MapSize.Small\n    \"Medium\" -> MapSize.Medium\n    \"Large\" -> MapSize.Large\n    \"Huge\" -> MapSize.Huge\n    else -> MapSize.Tiny\n}"
+      ],
+      "event_id": "6907a515-825d-4c34-9081-1058da18c02f"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Untested `build_rich_batch` \u2014 padding logic bugs could silently corrupt training data",
+      "severity": "major",
+      "primary_lens": "qa_testing",
+      "target_file": "python/unciv_train/features.py",
+      "target_section": "build_rich_batch",
+      "description": "`features.build_rich_batch` assembles multi-tensor inputs from training trajectories, performing per-type padding and mask generation. It is exercised only through the live run loop \u2014 no unit test covers its output shapes, mask correctness, or edge cases (e.g. all-empty entity sets). A bug here would inject misaligned tensors into training, wasting the bounded compute budget on a model fed garbled inputs.",
+      "rationale": "Unverified batch assembly is a high-stakes gap: if the tensors don't match what the model expects, the training run is silently invalid, and the resulting curves are meaningless \u2014 impossible to diagnose without a baseline assertion on shape/mask agreement.",
+      "suggested_addition": "Add a parameterized unit test that creates synthetic `TrainTrajectory` objects with known per-entity counts (including an all-empty type), runs `build_rich_batch`, and asserts the output tensor shapes, mask sums, and that the padding for the empty type is a single zero-token with mask=0.",
+      "supporting_roles": [],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "def build_rich_batch(trajectories, dims: Dims, token_specs: dict[str, int]) -> dict:",
+        "    for name, width in token_specs.items():",
+        "        padded, mask = _pad_token_set([s[name] for s in steps], width)"
+      ],
+      "event_id": "2914b8aa-3eeb-4702-b349-9487bf905e64"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "`OnnxPolicy.forwardRich` may leak native OnnxTensor resources on partial construction failure",
+      "severity": "minor",
+      "primary_lens": "qa_testing",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "forwardRich / buildRichTensors",
+      "description": "`forwardRich` calls `buildRichTensors(env, obs)` outside the `try` block that closes the tensor map. If an `OnnxTensor` allocation fails partway through (e.g. OOM), the partially-filled map is never closed and the already-created tensors leak native memory. In a multi-hour evaluation run this could accumulate and degrade performance.",
+      "rationale": "Long-running self-play and evaluation must not silently leak resources; a native leak that only triggers under memory pressure is especially hard to reproduce. The test harness can't verify closing on exception paths easily, so this is a defensive-hardening need.",
+      "suggested_addition": "Move the `buildRichTensors` call inside the `try` block and close all entries in `inputs` even if `buildRichTensors` itself constructs some tensors before throwing. Alternatively, wrap tensor creation with a manual list of already-allocated tensors and close them on exception before propagating.",
+      "supporting_roles": [],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "private fun forwardRich(obs: Observation): Pair<FloatArray, FloatArray> {\n        val inputs = buildRichTensors(env, obs)\n        try {",
+        "session.run(inputs).use { res ->"
+      ],
+      "event_id": "f651dcf8-af77-4a88-b0db-01e0a6389860"
+    },
+    {
+      "role_id": "security_red_team",
+      "role_lens": "red-team",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "parityRunRich trusts attacker-controllable fixture file: no shape validation before ORT",
+      "severity": "major",
+      "primary_lens": "security_red_team",
+      "target_file": "desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt",
+      "target_section": "parityRunRich:336-360",
+      "description": "The parity fixture parser does `FloatArray(count * width) { t[it + 4].toFloat() }` from a whitespace-split line where count and width are attacker-supplied ints. A line claiming `own_units set 1000000 84 <few floats>` allocates a 84M-element array (OOM) before the IndexOutOfBoundsException on `t[it+4]`, and a negative count (`set -1 8`) makes `count*width` negative or wraps. The contract claims parity JSON is shape-validated before ORT (R7), but parityRunRich does no such validation \u2014 it directly toFloat()s and feeds tensors.",
+      "rationale": "A red-team lens flags any external-input parser that sizes allocations from the input without bounds. Even though the fixture is 'self-generated', it is a file on disk passed by CLI arg \u2014 a corrupted or hostile fixture (or a buggy Python dumper) crashes the JVM with an opaque OOM/AIOOBE instead of a clean 'malformed fixture' error, and the declared R7 hardening does not actually cover this path.",
+      "suggested_addition": "Before building the FloatArray, guard: `require(count >= 0 && width >= 0 && count.toLong()*width == (t.size-4).toLong()) { \"malformed set line: count*width != value count\" }`, and cap count/width to SampleCaps maxima.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "qa_testing"
+      ],
+      "source_excerpts": [
+        "\"set\" -> {\n                    val count = t[2].toInt(); val width = t[3].toInt()\n                    val v = FloatArray(count * width) { t[it + 4].toFloat() }\n                    tokens.add(Triple(name, v, width))\n                }",
+        "parity JSON is shape-validated before ORT"
+      ],
+      "event_id": "d7055247-5c1d-40ea-9356-b98bcb0b8575"
+    },
+    {
+      "role_id": "security_red_team",
+      "role_lens": "red-team",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Provenance gate no longer pins contract version \u2014 v1 model silently loaded on v2 token-spec mismatch",
+      "severity": "major",
+      "primary_lens": "security_red_team",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "init:52-66",
+      "description": "The gate was relaxed from `check(mContract == CONTRACT_VERSION)` to `accept v1 OR v2`, with `rich = mContract == CONTRACT_VERSION_RICH` selecting the build path. But the v2 path (forwardRich/buildRichTensors) derives token widths from the LIVE Observation's `perItem`, not from the model's stamped META_INPUT_NAMES/widths. A v2 model trained against a different token-spec layout than the current featurizer passes the gate (schema_version + fingerprint match) yet gets tensors of the wrong width fed silently \u2014 ORT either errors cryptically or, worse, broadcasts.",
+      "rationale": "The whole point of the provenance gate (criterion 6) is to refuse a model whose contract mismatches what the JVM will build. META_INPUT_NAMES is now stamped on export but never read back / cross-checked in the gate, so the v2 widening removed a guarantee the v1 gate gave (exact contract pin) without adding the compensating tensor-inventory check the plan promised (D10: 'validates v2 + the tensor inventory').",
+      "suggested_addition": "In init, when rich, read META_INPUT_NAMES and assert it equals the names buildRichTensors will produce (global, acting_civ, each RICH_TOKEN_NAME + _mask in order); fail closed with a regenerate message if it diverges.",
+      "supporting_roles": [
+        "architect",
+        "domain_fidelity"
+      ],
+      "supporting_lenses": [
+        "qa_testing"
+      ],
+      "source_excerpts": [
+        "rich = mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_RICH\n        check(mContract == SampleSchema.OnnxContract.CONTRACT_VERSION || rich) {",
+        "const val META_INPUT_NAMES = \"input_names\"   // comma-joined ordered tensor names (v2)"
+      ],
+      "event_id": "9e0d2a78-c646-428c-8861-85609566a63b"
+    },
+    {
+      "role_id": "security_red_team",
+      "role_lens": "red-team",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "buildRichTensors crashes on absent entity block \u2014 first{} throws NoSuchElementException at decision time",
+      "severity": "major",
+      "primary_lens": "security_red_team",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "buildRichTensors:137-145",
+      "description": "buildRichTensors does `obs.blocks.first { it.name == name }.perItem` for every RICH_TOKEN_NAME except spatial. If a future Observation omits an expected entity block (e.g. diplo_edges was dropped, or a block is conditionally absent on certain map states), `first{}` throws NoSuchElementException mid-game and the learner crashes. The Python side (`_rich_step_blocks`) defensively uses `blocks.get(name)` with a zeros fallback \u2014 the JVM side does not, so JVM and Python diverge on the missing-block path.",
+      "rationale": "A red-team / robustness lens cares about the hard-crash path during live inference: a single absent block kills the self-play run with an unhandled exception rather than degrading. The asymmetry with the Python defensive `.get()` also means parity tests (which feed complete fixtures) never exercise this divergence.",
+      "suggested_addition": "Mirror the Python fallback: `obs.blocks.firstOrNull { it.name == name }?.perItem ?: <fallback width>` and feed a zero/empty token set + mask=0 when the block is absent, so JVM matches `_rich_step_blocks`.",
+      "supporting_roles": [
+        "practitioner",
+        "qa_testing"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "val width = if (name == \"spatial\") SampleSchema.NUM_SPATIAL_CHANNELS\n                            else obs.blocks.first { it.name == name }.perItem",
+        "b = blocks.get(name)\n        arr = np.asarray(b, dtype=np.float32) if b is not None else np.zeros((0, 0), np.float32)"
+      ],
+      "event_id": "affae9cb-0346-4d1e-b7a8-0dae08f15999"
+    },
+    {
+      "role_id": "security_red_team",
+      "role_lens": "red-team",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "analyze.py ceiling eval picks the WRONG checkpoint via len(rows)-1 after --resume / failed rounds",
+      "severity": "minor",
+      "primary_lens": "security_red_team",
+      "target_file": "python/unciv_train/analyze.py",
+      "target_section": "main:120-124",
+      "description": "AC3's ceiling eval resolves the model as `policy_round_{len(medium['blind-critic'])-1}.onnx`. This assumes curve.csv rows are dense and contiguous from round 0. But run_acceptance.sh runs with `--resume` and `|| log FAILED (continuing)` \u2014 a variant that failed some rounds, or a curve.csv with a gap, makes len(rows)-1 point at a round whose .onnx doesn't exist (so the eval silently falls through to the 'models missing' branch) or, if the file happens to exist from a different run, evals a stale/wrong checkpoint and reports it as the published AC3 ceiling number.",
+      "rationale": "This is the headline scientific result (rich-vs-blind significance). Deriving the checkpoint from row COUNT rather than the actual max round in the CSV means a resumed/partially-failed run can publish a z-test against the wrong model with no warning \u2014 a silent correctness regression in the reported acceptance verdict.",
+      "suggested_addition": "Resolve the round from the data: `last_round = max(r['round'] for r in rows)` and build the path from that; assert the .onnx exists before evaluating (else log and skip rather than silently mis-evaluate).",
+      "supporting_roles": [
+        "qa_testing",
+        "domain_fidelity"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "bm = root / \"blind-critic-medium\" / f\"policy_round_{len(medium['blind-critic'])-1}.onnx\" if medium[\"blind-critic\"] else None",
+        "--out \"$ROOT/$V-medium\" --resume || log \"MEDIUM $V FAILED (continuing)\""
+      ],
+      "event_id": "2eb8c014-903d-42d7-a091-e258587b9ce5"
+    },
+    {
+      "role_id": "security_red_team",
+      "role_lens": "red-team",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Resume re-derives model_path from round index but never re-validates the checkpoint's provenance",
+      "severity": "minor",
+      "primary_lens": "security_red_team",
+      "target_file": "python/unciv_train/run_loop.py",
+      "target_section": "main:177-183",
+      "description": "On --resume, `model_path` is set to `policy_round_{start_round-1}.onnx` if the file exists, with no check that its stamped schema_version/ruleset_fingerprint match the CURRENT ruleset. If the ruleset content changed between the original run and the resume (or curve.csv was copied from another run), generation proceeds against a stale-provenance model. The JVM OnnxPolicy gate would catch a mismatch on the gen side, but the failure surfaces as an opaque gradle non-zero exit rather than a clear 'resume model provenance stale' message at the Python boundary.",
+      "rationale": "Resume is new surface that crosses a trust boundary (a file on disk from a prior run becomes this run's generator). A red-team lens wants the boundary re-validated, not assumed-consistent because the filename matches the pattern.",
+      "suggested_addition": "On resume, read the candidate .onnx metadata (contract/schema/fingerprint) and compare against the fresh fingerprint computed this round; if mismatched, refuse to resume from it with an explicit message rather than handing it to gradle gen.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "cand = out / f\"policy_round_{start_round - 1}.onnx\"\n            model_path = cand if cand.is_file() else None\n            print(f\"[resume] continuing from round {start_round} ({len(rows)} rows in curve.csv)\")"
+      ],
+      "event_id": "0de33bdc-1042-4e10-a79e-5025a5ac8097"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "NaN model poisoning on divergence",
+      "severity": "critical",
+      "primary_lens": "Domain Fidelity (RL/ML)",
+      "target_file": "python/unciv_train/run_loop.py",
+      "target_section": "main:195-209",
+      "description": "The training loop catches non-finite losses and flags `stats[\"diverged\"] = True`, but `run_loop.py` ignores this flag. It proceeds to save the corrupted network (which has NaN weights) to the checkpoint and exports it to ONNX, poisoning the self-play loop for all subsequent rounds.",
+      "rationale": "In RL self-play, a diverged model will generate garbage data or crash the inference engine, ruining the entire training run. The divergence guard must actually prevent the corrupted model from being saved.",
+      "suggested_addition": "Add `if stats.get(\"diverged\"): print(\"Diverged, skipping save\"); continue` (or reload the previous round's checkpoint) before `torch.save` and `ex.export`.",
+      "supporting_roles": [
+        "security_red_team"
+      ],
+      "supporting_lenses": [
+        "Observability"
+      ],
+      "source_excerpts": [
+        "net, stats, mode = train_round(args.variant, data, dims, schema, args, seed=r)",
+        "torch.save(net.state_dict(), out / f\"ckpt_round_{r}.pt\")",
+        "if mode == \"blind\":\n            ex.export(net, dims, model_path, schema_version=ver, ruleset_fingerprint=fp)"
+      ],
+      "event_id": "e50942c7-b67f-452f-bf31-ded60f6e42a0"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "GAE bootstraps V=0 for truncated games",
+      "severity": "major",
+      "primary_lens": "Domain Fidelity (RL/ML)",
+      "target_file": "python/unciv_train/train.py",
+      "target_section": "compute_gae:45-56",
+      "description": "`compute_gae` hardcodes `next_v = 0.0` for the final step of every trajectory. If a game hits the turn cap (`max_turns`), it is truncated without a terminal step, meaning the final state is not a true game-over. Forcing `V=0` incorrectly trains the critic that reaching the turn cap is a guaranteed draw/loss.",
+      "rationale": "Bootstrapping truncated episodes with 0 is a classic RL bug that creates a massive downward bias in the value function for states near the time limit, degrading policy performance in long games.",
+      "suggested_addition": "Pass a `truncated` flag to `compute_gae` (derived from whether `terminal` was found in `load_trajectories`). If truncated, bootstrap from the critic's own prediction for the last state (`next_v = values[-1]`) instead of `0.0`.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "for t in range(n - 1, -1, -1):\n        next_v = values[t + 1] if t + 1 < n else 0.0   # V(terminal) = 0",
+        "delta = rewards[t] + gamma * next_v - values[t]"
+      ],
+      "event_id": "278ff32c-5c58-4664-9adb-11e60d20652a"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Native memory leak in richTensorsFromArrays on exception",
+      "severity": "major",
+      "primary_lens": "Domain Fidelity (RL/ML)",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "richTensorsFromArrays:148-158",
+      "description": "`richTensorsFromArrays` creates multiple `OnnxTensor` instances in a loop and adds them to a map. If `OnnxTensor.createTensor` throws an exception (e.g., due to shape mismatch or OOM) halfway through the loop, the function exits abruptly and the tensors already added to the map are never closed.",
+      "rationale": "`OnnxTensor` wraps native memory. Leaking them during the high-frequency self-play inference loop will quickly cause a native OutOfMemory error, crashing the Java process.",
+      "suggested_addition": "Wrap the tensor creation loop in a `try { ... } catch (e: Exception) { out.values.forEach { it.close() }; throw e }` block to ensure cleanup on failure.",
+      "supporting_roles": [
+        "architect"
+      ],
+      "supporting_lenses": [
+        "Backward-compat risks"
+      ],
+      "source_excerpts": [
+        "for ((name, values, width) in tokens) {",
+        "val (tok, mask) = tokenTensors(env, values, width)",
+        "out[name] = tok",
+        "out[name + SampleSchema.OnnxContract.MASK_SUFFIX] = mask"
+      ],
+      "event_id": "6ebee95a-6e28-415c-ba67-b2ef0d454376"
+    },
+    {
+      "role_id": "ethics_responsible_ai",
+      "role_lens": "ml-failure-mode",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Missing runtime check for multi-tensor input names can cause silent model mismatch",
+      "severity": "major",
+      "primary_lens": "responsible_ai_ml_failure_modes",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "buildRichTensors, richTensorsFromArrays:136-150",
+      "description": "The contract v2 meta includes `input_names` (a comma-separated ordered list of expected tensor names), but `OnnxPolicy` never reads it. If the Python exporter changes the naming order (or adds/removes tokens) and the JVM bridge isn't updated in lockstep, the `session.run` call will receive a map whose keys don't match the ONNX graph inputs. onnxruntime-java may silently ignore missing keys or throw an opaque exception, producing no logits (or garbled inference) without a clear signal. This could lead to the AI making decisions from uninitialized data (if the session returns empty results) or crashing mid-game.",
+      "rationale": "When a model-data contract breaks, the best outcome is a loud failure that stops the run early; the worst is silent garbage data driving policy choices. A responsible AI system should guard against silent contract drift.",
+      "suggested_addition": "In `OnnxPolicy.init`, after reading `rich`, parse `meta[META_INPUT_NAMES]` into a set. In `forwardRich`, after building `inputs`, assert that `inputs.keys == expectedNames` before calling `session.run`. If mismatched, throw a descriptive error and log the discrepancy.",
+      "supporting_roles": [],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "const val META_INPUT_NAMES = \"input_names\"   // comma-joined ordered tensor names (v2)",
+        "val inputs = buildRichTensors(env, obs)",
+        "// \u2026 no validation of input tensor names against model metadata"
+      ],
+      "event_id": "439895ae-824e-4209-ab27-2aca4384e7af"
+    },
+    {
+      "role_id": "ethics_responsible_ai",
+      "role_lens": "ml-failure-mode",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Hardcoded block name lookup in `buildRichTensors` will crash if Featurizer schema changes",
+      "severity": "major",
+      "primary_lens": "responsible_ai_ml_failure_modes",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "buildRichTensors:136-150 (esp. `obs.blocks.first { it.name == name }`)",
+      "description": "The function uses `obs.blocks.first { it.name == name }` for each token type (spatial, own_units, etc.). If the `Featurizer` changes its block names (e.g., due to a schema update or refactor) while the bridge remains static, `first` throws `NoSuchElementException`. Because `forwardRich` is called inside `chooseIndex`, this exception propagates uncaught, crashing the AI decision loop. The fallback `chooseIndex` returns -1 for heads not modeled, but does not catch runtime errors. This turns a simple naming change into a hard game crash during self-play, disrupting training and potentially corrupting shard files.",
+      "rationale": "Any crash during inference is a failure mode that can cascade: incomplete shards, wasted compute, and unreliable training outcomes. The contract should be resilient to minor drift, or at least fail with a clear diagnostic.",
+      "suggested_addition": "Replace `first` with `find` and throw a custom `OnnxContractException` that logs the expected name and the available blocks. This preserves the early-stop but gives a human-readable cause. Also consider reading block names from the ONNX metadata to make the lookup dynamic.",
+      "supporting_roles": [],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "val width = if (name == \"spatial\") SampleSchema.NUM_SPATIAL_CHANNELS\n            else obs.blocks.first { it.name == name }.perItem",
+        "No try/catch around `forwardRich` in `logitsFor` or `chooseIndex`"
+      ],
+      "event_id": "446cbd7f-af22-4246-bef3-e4e03c9170cc"
+    },
+    {
+      "role_id": "ethics_responsible_ai",
+      "role_lens": "ml-failure-mode",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Silent default to Tiny map on unknown map-size string can skew acceptance results",
+      "severity": "minor",
+      "primary_lens": "responsible_ai_ml_failure_modes",
+      "target_file": "desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt",
+      "target_section": "resolveMapSize:114-120, gen/eval commands:151,183",
+      "description": "The `resolveMapSize` function returns `MapSize.Tiny` for any unrecognised string. If a user accidentally types `\"Medum\"` (typo) or an unsupported size, the training and evaluation will silently proceed on a Tiny map instead of the intended Medium map. This could produce misleading acceptance curves (e.g., a \u2018Medium\u2019 run that is actually Tiny) and corrupt the scientific comparison, wasting the bounded compute budget fixed in D13.",
+      "rationale": "Silent data misconfiguration violates the observability principle and can cause undetected bias in the reported results. While the impact is confined to research correctness, the compute budget is finite and the acceptance criteria are hard-gated.",
+      "suggested_addition": "In `resolveMapSize`, for unknown names, log a warning to stderr and then either error out or default to Tiny with an explicit log statement (the fallback is acceptable, but it must be noisy). The run_loop should check that the emitted `mapSize` in the gen/eval output matches the requested one.",
+      "supporting_roles": [],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "private fun resolveMapSize(name: String): MapSize = when (name) {\n    \"Small\" -> MapSize.Small\n    \"Medium\" -> MapSize.Medium\n    \"Large\" -> MapSize.Large\n    \"Huge\" -> MapSize.Huge\n    else -> MapSize.Tiny\n}",
+        "println(\"SELFPLAY_GEN_DONE \u2026 mapSize=$mapSizeName\")"
+      ],
+      "event_id": "2926b3fd-33af-4ea2-9181-4a3c91fc5c95"
+    },
+    {
+      "role_id": "cost_efficiency",
+      "role_lens": "compute-cost",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Rich training materializes the whole Medium round as one dense batch",
+      "severity": "major",
+      "primary_lens": "compute-cost",
+      "target_file": "python/unciv_train/features.py",
+      "target_section": "build_rich_batch:33-47 and train_actor_critic_rich",
+      "description": "The rich path flattens every step from every trajectory into one padded tensor batch, then trains the whole batch for multiple epochs. On Medium, memory scales with games \u00d7 turns \u00d7 nTiles \u00d7 token width; a bounded-looking run can still spill to swap or OOM once spatial activations are included.",
+      "rationale": "This is the kind of architecture that makes cloud bills surprising: the cost driver is not game count alone, it is dense tensor size after padding plus repeated full-batch autograd. Without a guard or size metric, operators cannot know the cost per round before launching a long acceptance run.",
+      "suggested_addition": "Before building the rich batch, compute/log estimated tensor elements and MB by token set, and fail fast or reduce games when above a threshold. Add a synthetic Medium-sized test/smoke that asserts the estimate is emitted and that oversized batches are rejected rather than OOMing.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "observability",
+        "reliability"
+      ],
+      "source_excerpts": [
+        "steps = [blk for t in trajectories for blk in (t.rich or [])]",
+        "padded = np.zeros((b, maxn, width), dtype=np.float32)",
+        "inputs = build_rich_batch(trajectories, dims, token_specs)  # dict[name -> tensor], padded"
+      ],
+      "event_id": "710c83e2-e310-4678-bfe1-02c3ed287ed1"
+    },
+    {
+      "role_id": "cost_efficiency",
+      "role_lens": "compute-cost",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Acceptance script keeps spending after variant failures",
+      "severity": "major",
+      "primary_lens": "compute-cost",
+      "target_file": "python/run_acceptance.sh",
+      "target_section": "variant loops:20-34",
+      "description": "The acceptance driver logs a failed Tiny or Medium training run and continues to the remaining expensive variants and final analysis. A bad JAVA_HOME, broken Gradle invocation, or model export bug can therefore burn the rest of the configured compute budget while producing a partial report.",
+      "rationale": "For long self-play jobs, fail-open scripts are a direct cost risk: one early misconfiguration should not fan out into hours of wasted generation/evaluation. The current behavior also makes cost-per-valid-curve hard to interpret.",
+      "suggested_addition": "Default to fail-fast (`set -e` or explicit exit on failure) and add an opt-in `ALLOW_PARTIAL=1` mode for exploratory runs. Add a cheap preflight for Python env, Java/Gradle, and one tiny gen/eval smoke before launching all variants.",
+      "supporting_roles": [
+        "qa_testing",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "operations",
+        "observability"
+      ],
+      "source_excerpts": [
+        "set -uo pipefail",
+        "$PY -m unciv_train.run_loop --variant \"$V\" ... --resume || log \"TINY $V FAILED (continuing)\"",
+        "$PY -m unciv_train.run_loop --variant \"$V\" ... --resume || log \"MEDIUM $V FAILED (continuing)\"",
+        "$PY -m unciv_train.analyze --root \"$ROOT\" ... || log \"ANALYZE FAILED\""
+      ],
+      "event_id": "038aa2ae-6d56-40bd-ae6f-6b453e7e1c9d"
+    },
+    {
+      "role_id": "cost_efficiency",
+      "role_lens": "compute-cost",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Unknown map size silently falls back to Tiny",
+      "severity": "minor",
+      "primary_lens": "compute-cost",
+      "target_file": "desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt",
+      "target_section": "resolveMapSize",
+      "description": "A typo such as `medium`, `Med`, or `HUGE` silently runs Tiny instead of the requested map size. The runner then prints the original string, not the resolved enum, so an expensive acceptance run can complete on the wrong workload without an obvious failure.",
+      "rationale": "This undermines cost-per-result tracking: operators may pay for a full training run and only later discover the Medium ceiling test was never actually executed. Silent fallback is especially risky in shell-driven batch runs.",
+      "suggested_addition": "Make unknown map sizes a hard error with the accepted values in the message, or at least log both requested and resolved map size. Add a CLI test that `medium`/unknown does not silently resolve to Tiny.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "observability"
+      ],
+      "source_excerpts": [
+        "/** Resolve a map-size NAME (CLI arg) to its predefined [MapSize]; unknown \u21d2 Tiny. */",
+        "private fun resolveMapSize(name: String): MapSize = when (name) {",
+        "else -> MapSize.Tiny",
+        "println(\"SELFPLAY_GEN_DONE games=${sim.steps.size} dir=$outDir model=$modelArg seed=$seed mapSize=$mapSizeName\")"
+      ],
+      "event_id": "626b77db-c9c5-457d-9c2a-1a50b2d80879"
+    },
+    {
+      "role_id": "cost_efficiency",
+      "role_lens": "compute-cost",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "v2 model input inventory is not fail-fast validated",
+      "severity": "minor",
+      "primary_lens": "compute-cost",
+      "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+      "target_section": "init and forwardRich",
+      "description": "The init gate accepts contract v2 but does not validate `META_INPUT_NAMES` or the session input names against the tensors `forwardRich` will build. A renamed/missing/extra input can be discovered only at the first rich inference inside gen/eval, after the simulation has started.",
+      "rationale": "Failing late wastes self-play startup time and makes bad artifacts more expensive to diagnose. Since the diff adds `META_INPUT_NAMES`, not checking it loses a cheap fail-fast guard that would prevent invalid runs from consuming compute.",
+      "suggested_addition": "In `init`, when `rich` is true, parse `META_INPUT_NAMES` and compare it with the expected v2 tensor set and/or `session.inputNames`; throw a clear error before any simulation starts. Add one test/export fixture with a missing token input to assert early rejection.",
+      "supporting_roles": [
+        "practitioner",
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "reliability",
+        "observability"
+      ],
+      "source_excerpts": [
+        "const val META_INPUT_NAMES = \"input_names\"   // comma-joined ordered tensor names (v2)",
+        "rich = mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_RICH",
+        "check(mContract == SampleSchema.OnnxContract.CONTRACT_VERSION || rich)",
+        "val inputs = buildRichTensors(env, obs)",
+        "session.run(inputs).use { res ->"
+      ],
+      "event_id": "414ec601-bd9c-462f-b9c2-c43b8b5d26f5"
+    }
+  ]
+}
