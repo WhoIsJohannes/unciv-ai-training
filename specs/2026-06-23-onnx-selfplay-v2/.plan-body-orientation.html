@@ -1,8 +1,0 @@
-<p><strong>The ask:</strong> upgrade the proven v1 self-play loop (blind 199-dim MLP + REINFORCE) into
-(a) a model that consumes the FULL emitted observation (map tiles + units + cities + opponents) and
-(b) an actor-critic trainer with a <em>learned value critic</em> (GAE) for per-state credit — reusing all v1
-infrastructure, with reward staying terminal-only ±1.</p>
-<p><strong>How this answers it:</strong> two attributable ablation curves on a shared harness — <code>blind-critic</code>
-(same blind input, REINFORCE→A2C+GAE) isolates the convergence question; <code>rich-critic</code> (same algorithm,
-blind→full multi-tensor observation) isolates the representation question. The critic learns from the terminal
-outcome only; no shaped intermediate reward is ever introduced.</p>

@@ -1,9 +1,0 @@
-<p><em>Illustrative mock values — not measured; sanity-check against the design above.</em> One rich-critic learner decision → trained credit:</p>
-<ol>
-<li><strong>JVM decision (Medium, nTiles≈1261):</strong> Featurizer→Observation; OnnxPolicy builds tensors <code>spatial[1,1261,13]+mask</code>, <code>own_units[1,7,8]+mask</code>, …, <code>global[1,26]</code>, <code>acting_civ[1,173]</code>; <code>session.run(map)</code> → <code>tech_logits[1,80]</code>, <code>policy_logits[1,70]</code>. <em>Contract: v2 named tensors.</em></li>
-<li><strong>Mask + sample:</strong> <code>MaskedChoice.choose(tech_logits, legalMask, eval, rng)</code> → tech idx 12; illegal → −1e9; seeded RNG ⇒ replayable.</li>
-<li><strong>Emit:</strong> step written with <code>actions=[12,4,-1,-1]</code>, reward 0. <em>Contract: shard schema v2.</em></li>
-<li><strong>Game ends turn 137 (win):</strong> terminal step reward <code>+1.0</code> (only there). <em>Terminal-only ±1.</em></li>
-<li><strong>Python train:</strong> ordered 137-step trajectory (rewards 0 except +1 last); V≈[0.1…0.9]; GAE(0.99,0.95) → A(step12)≈+0.4 (early state credited); <code>policy_loss=−A·logp</code>, <code>value_loss=MSE(V,R)</code>.</li>
-<li><strong>Export + eval:</strong> value head dropped → policy-only v2 ONNX; 200 Medium games vs RandomPolicy → win-rate + binomial p → curve.csv; rich vs blind (AC3).</li>
-</ol>
