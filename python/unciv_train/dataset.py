@@ -32,6 +32,28 @@ class TrainStep:
     ret: float             # return-to-go = the civ's terminal reward
 
 
+# Per-type entity/spatial token blocks consumed by the rich variant (perItem widths come from the
+# generated schema; spatial is FIXED nTiles*13 and reshaped to [nTiles, 13]).
+RICH_TOKEN_BLOCKS = ("spatial", "own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens")
+
+
+@dataclass
+class TrainTrajectory:
+    """One game's ordered learner-step sequence (GAE needs the temporal sequence).
+
+    ALL non-terminal learner steps are kept in emission order — no-action steps are NOT dropped
+    (dropping them would break GAE's temporal contiguity and risk losing the reward-bearing step).
+    The terminal ±1 is placed at the last step's reward slot; reward is 0 everywhere else.
+    """
+    obs: np.ndarray          # [T, input_w] blind concat(global, acting_civ), float32
+    a_tech: np.ndarray       # [T] int (−1 = head did not act)
+    a_policy: np.ndarray     # [T] int
+    mask_tech: np.ndarray    # [T, tech_w] float32
+    mask_policy: np.ndarray  # [T, policy_w] float32
+    rewards: np.ndarray      # [T] float32 — 0 except the terminal ±1 at the last step
+    rich: list | None = None  # per-step dict{name -> np.ndarray} for the rich variant (else None)
+
+
 def _learner_slot(header: dict, learner_civ_id: str) -> int | None:
     for entry in header.get("majorCivSlots", []):
         if entry.get("civId") == learner_civ_id:
@@ -78,4 +100,66 @@ def load_training_steps(
                 mask_policy=s.blocks["mask_policy"].astype(np.float32),
                 ret=ret,
             ))
+    return out
+
+
+def _rich_step_blocks(blocks: dict) -> dict:
+    """Extract the per-step rich token blocks. spatial (FIXED nTiles*13) → [nTiles, 13];
+    entity blocks (VARIABLE) are already [count, perItem]; an absent/empty block → [0, perItem]."""
+    out = {
+        "global": np.asarray(blocks["global"], dtype=np.float32),
+        "acting_civ": np.asarray(blocks["acting_civ"], dtype=np.float32),
+    }
+    spatial = np.asarray(blocks["spatial"], dtype=np.float32).reshape(-1, 13)
+    out["spatial"] = spatial
+    for name in ("own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"):
+        b = blocks.get(name)
+        arr = np.asarray(b, dtype=np.float32) if b is not None else np.zeros((0, 0), np.float32)
+        if arr.ndim == 1:                      # empty VARIABLE block decoded as 1D
+            arr = arr.reshape(0, arr.shape[0] if arr.size else 0)
+        out[name] = arr
+    return out
+
+
+def load_trajectories(
+    paths,
+    learner_civ_id: str = LEARNER_CIV_ID,
+    *,
+    expected_version: int,
+    expected_fingerprint: str,
+    rich: bool = False,
+) -> list[TrainTrajectory]:
+    """Ordered per-game learner-step trajectories for actor-critic + GAE. Same provenance gates as
+    `load_training_steps`. `rich=True` also attaches per-step token blocks for the rich variant.
+    """
+    out: list[TrainTrajectory] = []
+    for p in sorted(str(x) for x in paths):
+        shard = reader.load(p)
+        prov = shard.provenance
+        if prov.schema_version != expected_version:
+            raise ProvenanceError(f"{p}: schema_version {prov.schema_version} != {expected_version}")
+        if prov.ruleset_fingerprint != expected_fingerprint:
+            raise ProvenanceError(
+                f"{p}: ruleset_fingerprint {prov.ruleset_fingerprint!r} != {expected_fingerprint!r} "
+                "(shard was generated against different ruleset content — regenerate)"
+            )
+        slot = _learner_slot(shard.header, learner_civ_id)
+        if slot is None:
+            continue
+        # ALL non-terminal learner steps in emission (chronological) order — keep no-action steps.
+        steps = [s for s in shard.steps if s.civ_slot == slot and not s.is_terminal]
+        terminal = next((s for s in shard.steps if s.civ_slot == slot and s.is_terminal), None)
+        term_r = float(terminal.reward) if terminal is not None else 0.0
+        if not steps:
+            continue
+        t = len(steps)
+        obs = np.stack([np.concatenate([s.blocks["global"], s.blocks["acting_civ"]]) for s in steps]).astype(np.float32)
+        a_tech = np.array([int(s.blocks["actions"][0]) for s in steps], dtype=np.int64)
+        a_policy = np.array([int(s.blocks["actions"][1]) for s in steps], dtype=np.int64)
+        mask_tech = np.stack([s.blocks["mask_tech"] for s in steps]).astype(np.float32)
+        mask_policy = np.stack([s.blocks["mask_policy"] for s in steps]).astype(np.float32)
+        rewards = np.zeros(t, dtype=np.float32)
+        rewards[-1] = term_r                              # terminal-only ±1
+        rich_blocks = [_rich_step_blocks(s.blocks) for s in steps] if rich else None
+        out.append(TrainTrajectory(obs, a_tech, a_policy, mask_tech, mask_policy, rewards, rich_blocks))
     return out

@@ -1,0 +1,2 @@
+{"ts":"2026-06-23","phase":1,"step":3,"header":"Worktree setup","question":"How to handle v1 uncommitted state + worktree","options":["Snapshot v1 work in-place","Snapshot v1 fresh v2 worktree","Work in-place don't commit v1"],"chosen":"put everything on main, work off it clean","source":"user"}
+{"ts":"2026-06-23","phase":1,"step":3,"header":"Training scope","question":"Execution scope for producing curves","options":["Build + short real run","Build + full run to acceptance","Build + smoke-test only"],"chosen":"Build + full run to acceptance","source":"user"}

@@ -69,6 +69,8 @@ object SelfPlayRunner {
             "eval" -> { bootstrap(); eval(args) }
             "parity-dump" -> { bootstrap(); parityDump(args) }
             "parity-run" -> parityRun(args)   // ORT only — no engine bootstrap needed
+            "parity-dump-rich" -> { bootstrap(); parityDumpRich(args) }
+            "parity-run-rich" -> parityRunRich(args)   // ORT only — multi-tensor v2 contract
             "trace" -> { bootstrap(); trace(args) }
             else -> error("unknown mode '$mode'")
         }
@@ -108,8 +110,17 @@ object SelfPlayRunner {
         players.last().setNationTransient(ruleset)
     }
 
-    private fun mapParameters(seed: Long = 0): MapParameters = MapParameters().apply {
-        mapSize = MapSize.Tiny
+    /** Resolve a map-size NAME (CLI arg) to its predefined [MapSize]; unknown ⇒ Tiny. */
+    private fun resolveMapSize(name: String): MapSize = when (name) {
+        "Small" -> MapSize.Small
+        "Medium" -> MapSize.Medium
+        "Large" -> MapSize.Large
+        "Huge" -> MapSize.Huge
+        else -> MapSize.Tiny
+    }
+
+    private fun mapParameters(seed: Long = 0, mapSizeName: String = "Tiny"): MapParameters = MapParameters().apply {
+        mapSize = resolveMapSize(mapSizeName)
         noRuins = true
         noNaturalWonders = true
         legendaryStart = true
@@ -121,8 +132,8 @@ object SelfPlayRunner {
 
     /** Template game info Simulation re-starts each iteration from (with per-iteration seeds). */
     @ExperimentalTime
-    private fun buildBaseGameInfo(ruleset: Ruleset): GameInfo {
-        val gsi = GameSetupInfo(gameParameters(ruleset), mapParameters())
+    private fun buildBaseGameInfo(ruleset: Ruleset, mapSizeName: String = "Tiny"): GameInfo {
+        val gsi = GameSetupInfo(gameParameters(ruleset), mapParameters(0, mapSizeName))
         val newGame = GameStarter.startNewGame(gsi)
         newGame.gameParameters.victoryTypes = ArrayList(newGame.ruleset.victories.keys)
         UncivGame.Current.gameInfo = newGame
@@ -137,6 +148,7 @@ object SelfPlayRunner {
         val maxTurns = args.getOrNull(4)?.toIntOrNull() ?: 325
         val threads = args.getOrNull(5)?.toIntOrNull() ?: 1
         val seed = args.getOrNull(6)?.toLongOrNull() ?: 1L
+        val mapSizeName = args.getOrNull(7) ?: "Tiny"
 
         val ruleset = setupRuleset()
         val fingerprint = RulesetFingerprint.compute(ruleset)
@@ -149,7 +161,7 @@ object SelfPlayRunner {
             else OnnxPolicy(modelArg, vocab, config, DataPlaneHooks.defaultRngFor(), eval = false, SampleSchema.VERSION, fingerprint)
         val policy = RoutingPolicy(LEARNER, learner, RandomPolicy(DataPlaneHooks.defaultRngFor()))
 
-        val base = buildBaseGameInfo(ruleset)
+        val base = buildBaseGameInfo(ruleset, mapSizeName)
         val perThread = (nGames + threads - 1) / threads
         val sim = Simulation(
             base, simulationsPerThread = perThread, threadsNumber = threads, maxTurns = maxTurns,
@@ -158,7 +170,7 @@ object SelfPlayRunner {
         )
         sim.start()
         (learner as? OnnxPolicy)?.close()
-        println("SELFPLAY_GEN_DONE games=${sim.steps.size} dir=$outDir model=$modelArg seed=$seed")
+        println("SELFPLAY_GEN_DONE games=${sim.steps.size} dir=$outDir model=$modelArg seed=$seed mapSize=$mapSizeName")
     }
 
     @ExperimentalTime
@@ -168,6 +180,7 @@ object SelfPlayRunner {
         val maxTurns = args.getOrNull(3)?.toIntOrNull() ?: 325
         val threads = args.getOrNull(4)?.toIntOrNull() ?: 1
         val seed = args.getOrNull(5)?.toLongOrNull() ?: 999_000L
+        val mapSizeName = args.getOrNull(6) ?: "Tiny"
 
         val ruleset = setupRuleset()
         val fingerprint = RulesetFingerprint.compute(ruleset)
@@ -178,7 +191,7 @@ object SelfPlayRunner {
         val onnx = OnnxPolicy(modelArg, vocab, config, DataPlaneHooks.defaultRngFor(), eval = true, SampleSchema.VERSION, fingerprint)
         val policy = RoutingPolicy(LEARNER, onnx, RandomPolicy(DataPlaneHooks.defaultRngFor()))
 
-        val base = buildBaseGameInfo(ruleset)
+        val base = buildBaseGameInfo(ruleset, mapSizeName)
         val perThread = (mGames + threads - 1) / threads
         val sim = Simulation(
             base, simulationsPerThread = perThread, threadsNumber = threads, maxTurns = maxTurns,
@@ -299,5 +312,82 @@ object SelfPlayRunner {
             session.close()
         }
         println("PARITY_RUN -> $logitsOut")
+    }
+
+    // --- Rich (contract v2) multi-tensor parity ---------------------------------------------------
+    // Fixture text format (shared with the Python test, one block per line):
+    //   "<name> vec <floats...>"                      — global, acting_civ
+    //   "<name> set <count> <width> <floats...>"       — spatial + entity token sets (flat row-major)
+
+    @ExperimentalTime
+    private fun parityDumpRich(args: Array<String>) {
+        val seed = args.getOrNull(1)?.toLongOrNull() ?: 4242L
+        val obsOut = args.getOrNull(2) ?: "parity-obs-rich.txt"
+        val mapSizeName = args.getOrNull(3) ?: "Tiny"
+        val ruleset = setupRuleset()
+        val vocab = Vocab(ruleset)
+        val config = SampleConfig(enabled = false, caps = SampleCaps.DEFAULT)
+        val gsi = GameSetupInfo(gameParameters(ruleset), mapParameters(seed, mapSizeName))
+        val game = GameStarter.startNewGame(gsi)
+        UncivGame.Current.gameInfo = game
+        val learner = game.civilizations.first { it.civID == LEARNER }
+        val obs = Featurizer(game, vocab, config).observe(learner)
+        val sb = StringBuilder()
+        sb.appendLine("global vec " + obs.block("global").joinToString(" "))
+        sb.appendLine("acting_civ vec " + obs.block("acting_civ").joinToString(" "))
+        for (name in SampleSchema.OnnxContract.RICH_TOKEN_NAMES) {
+            val width = if (name == "spatial") SampleSchema.NUM_SPATIAL_CHANNELS
+                        else obs.blocks.first { it.name == name }.perItem
+            val vals = obs.block(name)
+            val count = if (width > 0) vals.size / width else 0
+            sb.appendLine("$name set $count $width " + vals.joinToString(" "))
+        }
+        File(obsOut).writeText(sb.toString())
+        println("PARITY_DUMP_RICH seed=$seed mapSize=$mapSizeName -> $obsOut")
+    }
+
+    private fun parityRunRich(args: Array<String>) {
+        val model = args.getOrNull(1) ?: error("parity-run-rich: model path required")
+        val obsIn = args.getOrNull(2) ?: error("parity-run-rich: obs file required")
+        val logitsOut = args.getOrNull(3) ?: "parity-jvm-logits-rich.json"
+
+        var global = FloatArray(0)
+        var acting = FloatArray(0)
+        val tokens = ArrayList<Triple<String, FloatArray, Int>>()
+        for (raw in File(obsIn).readLines()) {
+            val line = raw.trim()
+            if (line.isEmpty()) continue
+            val t = line.split(Regex("\\s+"))
+            val name = t[0]
+            when (t[1]) {
+                "vec" -> {
+                    val v = FloatArray(t.size - 2) { t[it + 2].toFloat() }
+                    if (name == "global") global = v else if (name == "acting_civ") acting = v
+                }
+                "set" -> {
+                    val count = t[2].toInt(); val width = t[3].toInt()
+                    val v = FloatArray(count * width) { t[it + 4].toFloat() }
+                    tokens.add(Triple(name, v, width))
+                }
+            }
+        }
+        val env = OrtEnvironment.getEnvironment()
+        val session = env.createSession(File(model).absolutePath, OrtSession.SessionOptions())
+        val inputs = OnnxPolicy.richTensorsFromArrays(env, global, acting, tokens)
+        try {
+            session.run(inputs).use { res ->
+                @Suppress("UNCHECKED_CAST")
+                val tech = (res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor).value as Array<FloatArray>
+                @Suppress("UNCHECKED_CAST")
+                val policy = (res.get(SampleSchema.OnnxContract.OUTPUT_POLICY).get() as OnnxTensor).value as Array<FloatArray>
+                File(logitsOut).writeText(
+                    "{\"tech\":[${tech[0].joinToString(",")}],\"policy\":[${policy[0].joinToString(",")}]}"
+                )
+            }
+        } finally {
+            for (tt in inputs.values) try { tt.close() } catch (_: Exception) {}
+            session.close()
+        }
+        println("PARITY_RUN_RICH -> $logitsOut")
     }
 }

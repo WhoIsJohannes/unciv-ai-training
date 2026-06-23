@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "schema_version": "1",
+  "mode": "BUILD",
+  "size": "L",
+  "base": "master",
+  "pr_target": "master",
+  "counts": {"edited": 8, "created": 2, "deleted": 0},
+  "blast_radius": "Python trainer + ONNX contract v2 + JVM inference bridge; v1 baseline path preserved",
+  "test_status": "RED-first",
+  "council": "intake 42 findings / plan 41 findings — all critical+major folded",
+  "change_archetypes": ["decisions", "interface", "schema", "delta"],
+  "review_focus": [
+    {"item": "GAE over ordered trajectories: do NOT drop no-action steps; reward terminal-only; batch-level adv norm", "why": "per-trajectory norm or dropped steps silently corrupt the credit signal", "confidence": "high", "anchor": "pr-substance"},
+    {"item": "Spatial encoder = masked tile-set pool, no positional feature (grid-CNN rejected)", "why": "2D coords not recoverable without forbidden new emitted data", "confidence": "high", "anchor": "pr-substance"},
+    {"item": "Contract v1→2 multi-tensor lockstep (contract.py ↔ SampleSchema) + parity atol=1e-4", "why": "cross-language drift is the top correctness risk over the new contract", "confidence": "high", "anchor": "pr-systemfit"},
+    {"item": "Acceptance = experiment executed + reported, not a p<0.05 ship gate", "why": "an ML outcome must not block shipping; report honestly within budget", "confidence": "high", "anchor": "pr-substance"}
+  ],
+  "system_fit": {
+    "new": ["python/unciv_train/features.py", "python/tests/test_gae.py"],
+    "touched": ["python/unciv_train/model.py", "python/unciv_train/train.py", "python/unciv_train/dataset.py", "python/unciv_train/contract.py", "python/unciv_train/export_onnx.py", "python/unciv_train/run_loop.py", "desktop/.../OnnxPolicy.kt", "desktop/.../SelfPlayRunner.kt", "core/.../dataplane/SampleSchema.kt"],
+    "untouched_relied_on": ["Featurizer.kt", "Observation.kt", "TrajectoryEmitter.kt", "ShardFormat.kt", "reader.py", "LegalActionMasks.kt", "MaskedChoice.kt", "RulesetFingerprint.kt", "RandomPolicy"],
+    "consumers": ["OnnxPolicy (loads exported policy-only ONNX)", "run_loop (shells gradle selfPlay)"],
+    "edges": [
+      {"from": "run_loop", "to": "gradle selfPlay gen/eval", "label": "shells"},
+      {"from": "dataset", "to": "train.compute_gae", "label": "trajectories"},
+      {"from": "train", "to": "export_onnx", "label": "policy-only"},
+      {"from": "export_onnx", "to": "OnnxPolicy", "label": "v2 ONNX"},
+      {"from": "Featurizer", "to": "OnnxPolicy", "label": "Observation blocks"}
+    ]
+  },
+  "top_decisions": [
+    {"decision": "Spatial = masked tile-set pool, no positional feature", "rejected": "grid-CNN (needs forbidden tile positions)", "confidence": "high"},
+    {"decision": "A2C+GAE over ordered trajectories, reward terminal-only, batch-level adv norm", "rejected": "REINFORCE reward-broadcast (breaks GAE) / per-trajectory norm (kills signal)", "confidence": "high"},
+    {"decision": "Plain A2C+GAE single-epoch default for the curves", "rejected": "PPO-clip default (conflates critic vs PPO)", "confidence": "high"},
+    {"decision": "Value head training-only; play ONNX policy-only", "rejected": "exporting value (breaks bridge contract)", "confidence": "high"},
+    {"decision": "Acceptance = experiment run + reported honestly", "rejected": "p<0.05 as a ship gate", "confidence": "high"}
+  ],
+  "risks": [
+    {"n": 1, "text": "Full-run wall-clock blows up (Medium games long)", "ls": "M×H", "mitigation": "hard budget + per-round checkpoint/resume; smoke-measure first; STOP at ceiling, report honestly"},
+    {"n": 2, "text": "Multi-tensor parity drift JVM↔Python", "ls": "M×H", "mitigation": "extended parity test atol=1e-4 (anti-drift gate); u8→f32 both sides"},
+    {"n": 3, "text": "Token-pool spatial may not beat blind on Medium (no 2D locality)", "ls": "M×M", "mitigation": "honest AC3 reporting permitted; rich still sees entities/terrain blind never gets"},
+    {"n": 4, "text": "GAE/value instability or NaN on empty entity sets", "ls": "L×M", "mitigation": "masked-pool NaN guard, batch adv-norm, divergence abort, grad-norm logging"}
+  ],
+  "human_actions": [],
+  "rollback": "v1-reinforce variant + contract v1 path untouched; revert worktree branch to restore v1-only",
+  "change_inventory": [
+    {"path": "python/unciv_train/train.py", "change": "edit", "why": "REINFORCE → A2C+GAE; compute_gae", "group": "trainer", "heart": true},
+    {"path": "python/unciv_train/model.py", "change": "edit", "why": "value head + rich net", "group": "trainer"},
+    {"path": "python/unciv_train/dataset.py", "change": "edit", "why": "ordered trajectories, terminal-only reward", "group": "trainer"},
+    {"path": "python/unciv_train/features.py", "change": "new", "why": "multi-tensor assembly", "group": "trainer"},
+    {"path": "python/unciv_train/contract.py", "change": "edit", "why": "CONTRACT_VERSION 2, multi-tensor names", "group": "contract"},
+    {"path": "python/unciv_train/export_onnx.py", "change": "edit", "why": "multi-tensor export, drop value", "group": "contract"},
+    {"path": "python/unciv_train/run_loop.py", "change": "edit", "why": "variants, resume, map-size, metrics", "group": "driver"},
+    {"path": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt", "change": "edit", "why": "multi-tensor input build", "group": "bridge", "heart": true},
+    {"path": "desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt", "change": "edit", "why": "map-size CLI + multi-tensor parity", "group": "bridge"},
+    {"path": "core/src/com/unciv/logic/simulation/dataplane/SampleSchema.kt", "change": "edit", "why": "OnnxContract v2", "group": "contract"},
+    {"path": "python/tests/test_gae.py", "change": "new", "why": "RED-first GAE + value-head + export contract", "group": "test"}
+  ],
+  "verification": [
+    "pytest python/tests/test_gae.py — GAE math + value head + value-dropped-at-export",
+    "pytest python/tests/test_parity.py — JVM↔Python multi-tensor logits within atol=1e-4",
+    "pytest python/tests/test_determinism.py — same seed → byte-identical shards",
+    "gradle test OnnxPolicyLegalityTest — choice always legal or -1",
+    "grep -n reward python/unciv_train/{train,dataset}.py — no intermediate reward term",
+    "curve.csv x3 variants + overlaid plot — attributable curves; last-K stddev + Medium two-proportion p"
+  ],
+  "out_of_scope": ["self-play/league opponent (v3)", "new action heads (construction/unit targeting)", "new engine-emitted data", "distributed training / transformer", "reward shaping"],
+  "open_questions": ["compute budget magnitude (D13) — concrete numbers proposed; user may dial at this gate"],
+  "compact": false
+}

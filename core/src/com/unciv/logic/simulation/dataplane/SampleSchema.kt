@@ -34,12 +34,22 @@ object SampleSchema {
      * per-entity heads keep the heuristic/RandomPolicy fallback.
      */
     object OnnxContract {
+        /** Contract v1 = blind single-tensor input ("obs"); v1-reinforce + blind-critic models. */
         const val CONTRACT_VERSION = 1
-        /** Net input tensor: concat(observation block "global", block "acting_civ"), float32. */
+        /** Contract v2 = rich MULTI-TENSOR input (global, acting_civ, per-type token sets + masks);
+         *  rich-critic models. OnnxPolicy reads META_CONTRACT_VERSION and selects the build path,
+         *  so v1 and v2 models coexist (the provenance gate accepts either). */
+        const val CONTRACT_VERSION_RICH = 2
+        /** Net input tensor (v1): concat(observation block "global", block "acting_civ"), float32. */
         const val INPUT_NAME = "obs"
+        // v2 named multi-tensor inputs. Each token set pairs with a "<name>_mask" presence mask.
+        const val INPUT_GLOBAL = "global"
+        const val INPUT_ACTING = "acting_civ"
+        val RICH_TOKEN_NAMES = listOf("spatial", "own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens")
+        const val MASK_SUFFIX = "_mask"
         const val OUTPUT_TECH = "tech_logits"
         const val OUTPUT_POLICY = "policy_logits"
-        /** The civ-level heads the net controls in v1, in `actions`-block order. */
+        /** The civ-level heads the net controls, in `actions`-block order. */
         val MODELED_HEADS = listOf("tech", "policy")
         // ONNX metadata_props keys (provenance gate — read on the JVM via session.getMetadata()).
         const val META_SCHEMA_VERSION = "schema_version"
@@ -48,6 +58,7 @@ object SampleSchema {
         const val META_INPUT_WIDTH = "input_width"
         const val META_TECH_WIDTH = "tech_width"
         const val META_POLICY_WIDTH = "policy_width"
+        const val META_INPUT_NAMES = "input_names"   // comma-joined ordered tensor names (v2)
     }
 
     // numpy-style little-endian dtype tags recorded in the header (cross-checked by the reader).

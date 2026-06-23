@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "roles": [
+    {"id": "skeptic", "display_name": "Skeptic", "lens": "yagni", "persona_file": "council/roles/skeptic.txt", "model": "openai/gpt-5.5"},
+    {"id": "architect", "display_name": "Architect", "lens": "structure", "persona_file": "council/roles/architect.txt", "model": "google/gemini-3.1-pro-preview"},
+    {"id": "practitioner", "display_name": "Practitioner", "lens": "production-readiness", "persona_file": "council/roles/practitioner.txt", "model": "anthropic/claude-opus-4.8"},
+    {"id": "product_manager", "display_name": "Product Manager", "lens": "outcome", "persona_file": "council/roles/product_manager.txt", "model": "openai/gpt-5.5"},
+    {"id": "qa_testing", "display_name": "QA / Test", "lens": "testability", "persona_file": "council/roles/qa_testing.txt", "model": "deepseek/deepseek-v4-pro"},
+    {"id": "security_red_team", "display_name": "Security Red Team", "lens": "red-team", "persona_file": "council/roles/security_red_team.txt", "model": "anthropic/claude-opus-4.8"},
+    {"id": "domain_fidelity", "display_name": "Domain Fidelity (RL/ML)", "lens": "domain", "persona_file": "council/roles/domain_fidelity.txt", "model": "google/gemini-3.1-pro-preview"},
+    {"id": "ethics_responsible_ai", "display_name": "Responsible AI", "lens": "ml-failure-mode", "persona_file": "council/roles/ethics_responsible_ai.txt", "model": "deepseek/deepseek-v4-pro"},
+    {"id": "cost_efficiency", "display_name": "Cost / Compute", "lens": "compute-cost", "persona_file": "council/roles/cost_efficiency.txt", "model": "openai/gpt-5.5"}
+  ]
+}

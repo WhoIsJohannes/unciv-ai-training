@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-jE+yTHdCUhW8LHfIJj4Z9HG+RahbFqx3bDYZVH7N1hU='; img-src data:">
+<title>Plan review — v2: rich representation + value critic (onnx-selfplay-v2)</title>
+<style>
+:root{--bg:#f5f6f8;--panel:#fff;--panel2:#f1f3f6;--ink:#1a1f27;--muted:#5b626e;--line:#e2e6ec;
+--accent:#1c5fd6;--mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+--h:#cf222e;--m:#8a5a00;--l:#1f7a37;--new:#1f883d;--edit:#9a6700;--del:#cf222e;--human:#1c5fd6;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:980px;margin:0 auto;padding:20px 20px 80px}
+.wrap.compact{padding:14px 16px 60px}
+.compact .panel{padding:10px 12px;margin:0 0 9px}
+.mono{font-family:var(--mono)}
+code{font-family:var(--mono);font-size:12.5px;background:var(--panel2);padding:1px 4px;border-radius:3px}
+.skip{position:absolute;left:-999px;top:0;background:var(--accent);color:#fff;padding:8px 12px;border-radius:0 0 6px 0;z-index:10}
+.skip:focus{left:0}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:14px 16px;margin:0 0 14px}
+h1{font:600 19px var(--mono);margin:0 0 2px}
+h2{font:700 12px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 8px}
+.lead{color:var(--muted);font-size:13px;margin:0 0 12px}
+.kv{color:var(--muted);font-size:12.5px}
+.strip{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:0 0 14px;padding:8px 10px;background:var(--panel);border:1px solid var(--line);border-radius:7px}
+.pill{font:600 11px var(--mono);padding:2px 9px;border-radius:4px;border:1px solid var(--line);color:var(--muted)}
+.pill.ok{color:var(--l);border-color:#bfe2c8}.pill.warn{color:var(--m);border-color:#ead9a6}
+table{width:100%;border-collapse:collapse;font-size:13px}
+caption{text-align:left;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;padding:0 0 6px}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+details{border:1px solid var(--line);border-radius:7px;margin:0 0 9px;padding:0 14px;background:var(--panel)}
+summary{cursor:pointer;padding:10px 0;font-weight:600;color:var(--muted)}summary::marker{color:var(--accent)}
+details[open] summary{color:var(--ink)}details[open]{padding-bottom:12px}
+pre{white-space:pre-wrap;word-break:break-word;font-size:12px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:10px;overflow-x:auto}
+.figure{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:10px;overflow-x:auto;margin:8px 0 0}
+figcaption.diag-cap{color:var(--muted);font-size:11.5px;margin-top:6px;text-align:center}
+.diag-note{color:var(--del);font-weight:600;font-size:13px;margin:6px 2px}
+.toolbar{display:flex;justify-content:flex-end;margin:10px 0 8px}
+button.btn{font:600 11px var(--mono);background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:6px 11px;cursor:pointer;color:var(--accent)}
+.pr-nonce-p{border:1.5px solid var(--accent)}
+.pr-nonce{font:700 22px var(--mono);color:var(--accent);user-select:all;background:var(--panel2);border:1px dashed var(--accent);border-radius:5px;padding:9px 15px;display:inline-block}
+.mc{display:inline-block;font:700 10px var(--mono);padding:1px 6px;border-radius:3px}
+.mc.H{color:var(--h)}.mc.M{color:var(--m)}.mc.L{color:var(--l)}
+.b-new{color:var(--new)}.b-edit{color:var(--edit)}
+.substance{border:1.5px solid var(--accent)}
+.substance>h2{color:var(--accent)}
+.scrutinize{border-left:3px solid var(--m);background:#fffaf0}
+.pr-banner{border:1.5px solid var(--del);background:#fdeff0}
+.pr-banner h2{color:var(--del)}
+.banner .fix{color:var(--ink);font-size:12.5px;margin:2px 0 0}
+.ha{border-left:3px solid var(--human)}
+.heart{display:inline-block;font:700 9px var(--mono);color:var(--del);border:1px solid var(--del);border-radius:3px;padding:0 4px;margin-left:6px}
+.grp{font:700 11px var(--mono);color:var(--ink);margin:10px 0 2px}
+.focuslbl{font-weight:700;color:var(--m)}
+.audit .h{color:var(--muted);font-size:11.5px}
+</style></head><body><main class="wrap">
+<a class="skip" href="#pr-substance">skip to what you're reviewing</a><h1>v2: rich representation + value critic (onnx-selfplay-v2)</h1><p class="lead">This is an AI's plan for a code change. Read <strong>what it will build</strong> (top), check <strong>what it flags</strong>, then scroll to the bottom and paste the approval code to start the build.</p><div class="strip" aria-label="plan status"><span class="pill">BUILD</span><span class="pill">size L</span><span class="pill">base master</span><span class="pill">8 edited · 2 created</span><span class="pill ok">council plan: 41 findings, all critical+major folded</span><span class="pill warn">test RED (tests planned)</span></div>
+<section id="pr-orient" class="panel"><h2>What's changing &amp; why</h2><p><strong>The ask:</strong> upgrade the proven v1 self-play loop (blind 199-dim MLP + REINFORCE) into
+(a) a model that consumes the FULL emitted observation (map tiles + units + cities + opponents) and
+(b) an actor-critic trainer with a <em>learned value critic</em> (GAE) for per-state credit — reusing all v1
+infrastructure, with reward staying terminal-only ±1.</p>
+<p><strong>How this answers it:</strong> two attributable ablation curves on a shared harness — <code>blind-critic</code>
+(same blind input, REINFORCE→A2C+GAE) isolates the convergence question; <code>rich-critic</code> (same algorithm,
+blind→full multi-tensor observation) isolates the representation question. The critic learns from the terminal
+outcome only; no shaped intermediate reward is ever introduced.</p>
+</section>
+<section id="pr-substance" class="panel substance"><h2>★ What you&#x27;re reviewing — the decisions + the interfaces + the data contract + the behavior change</h2><h3>Locked decisions (the design IS the deliverable)</h3>
+<dl>
+<dt>Spatial encoder = permutation-invariant masked tile-set pool (NOT grid-CNN)</dt>
+<dd>Per-tile (col,row) is NOT recoverable from shard data (zeroBasedIndex is insertion order; positions not emitted; maps hexagonal) and &quot;no new emitted data&quot; is a hard non-goal. Rejected: grid-CNN. No positional feature (insertion-order ≠ 2D position). Confidence: high.</dd>
+<dt>Actor-critic + GAE over ordered trajectories, reward terminal-only</dt>
+<dd>δ_t=r_t+γV(s_{t+1})−V(s_t), V(terminal)=0; A_t=Σ(γλ)^l δ_{t+l}; R_t=A_t+V(s_t); γ=0.99,λ=0.95. Dataset keeps ALL ordered non-terminal learner steps (no-action steps retained for value/GAE; policy-grad masked to acting heads). Rejected: v1 reward-broadcast (breaks GAE). Confidence: high.</dd>
+<dt>Default plain A2C+GAE single-epoch for the attributable curves</dt>
+<dd>PPO-clip would conflate &quot;critic&quot; with &quot;PPO&quot; in the isolated comparison. PPO (ε=0.2,K=4) is an optional non-default knob. Confidence: high.</dd>
+<dt>Value head is training-only; play ONNX is policy-only</dt>
+<dd>export drops the value head; negative test asserts no <code>value</code> output. Confidence: high.</dd>
+<dt>Acceptance = run the experiment correctly + report honestly</dt>
+<dd>p&lt;0.05 is the hypothesis under test, not a ship gate (brief AC3 permits &quot;state plainly if not&quot;). Bounded by a hard compute budget + checkpoint/resume. Confidence: high.</dd>
+</dl>
+
+<h3>Key interfaces (new / changed public surfaces)</h3>
+<pre><code>model.PolicyNet.forward(obs) -&gt; (tech_logits, policy_logits, value)   # value head added (training-only)
+train.compute_gae(rewards: np[T], values: np[T], gamma, lam) -&gt; (adv[T], ret[T])   # episodic, V(terminal)=0
+run_loop  --variant {v1-reinforce, blind-critic, rich-critic}  --resume  --map-size {Tiny,Medium}
+export_onnx.export(net, dims, out, *, schema_version, ruleset_fingerprint)   # drops value; v2 = multi-tensor
+OnnxPolicy: session.run(Map&lt;name,OnnxTensor&gt;)  # spatial,own_units,...,masks,global,acting_civ (was single &quot;obs&quot;)
+SelfPlayRunner gen|eval ... &lt;mapSize&gt;   ;   parity-dump/parity-run emit/read multi-tensor JSON</code></pre>
+
+<h3>ONNX contract v2 — input tensor inventory (schema change)</h3>
+<table>
+<caption>Named multi-tensor input with dynamic axes (CONTRACT_VERSION 1 → 2); outputs unchanged.</caption>
+<thead><tr><th scope="col">tensor</th><th scope="col">dtype</th><th scope="col">shape (dynamic axes)</th><th scope="col">notes</th></tr></thead>
+<tbody>
+<tr><td>global</td><td>f32</td><td>[B, 26]</td><td>unchanged block</td></tr>
+<tr><td>acting_civ</td><td>f32</td><td>[B, 173]</td><td>unchanged block</td></tr>
+<tr><td>spatial</td><td>f32</td><td>[B, nTiles, 13]</td><td>u8→f32; nTiles dynamic; + padding mask [B,nTiles]</td></tr>
+<tr><td>own_units / opp_units</td><td>f32</td><td>[B, n, 8] + mask [B,n]</td><td>present-only; padded; n dynamic</td></tr>
+<tr><td>own_cities / opp_cities</td><td>f32</td><td>[B, n, 16] + mask [B,n]</td><td>present-only; padded</td></tr>
+<tr><td>civ_tokens</td><td>f32</td><td>[B, n, 84] + mask [B,n]</td><td>present-only; padded</td></tr>
+<tr><td>tech_logits / policy_logits (out)</td><td>f32</td><td>[B, 80] / [B, 70]</td><td>UNCHANGED outputs; value NOT exported</td></tr>
+</tbody>
+</table>
+
+<h3>Behavioral delta (ordered)</h3>
+<ol>
+<li>Add value head → forward returns 3-tuple (Stage A, blind input, contract v1 unchanged).</li>
+<li>dataset: ordered trajectories, reward terminal-only (no broadcast); train: REINFORCE → A2C+GAE (batch-level adv norm; NaN-guarded; divergence abort).</li>
+<li>run_loop: <code>--variant</code> + checkpoint/resume + richer metrics; produce v1-reinforce + blind-critic Tiny curves.</li>
+<li>Stage B: features.py + rich net; contract→v2 multi-tensor (Python+Kotlin lockstep); OnnxPolicy multi-tensor build; parity dump/run multi-tensor.</li>
+<li>Stage C: map-size CLI; Medium train+eval; rich vs blind two-proportion test.</li>
+</ol>
+</section>
+<section id="pr-scrutinize" class="panel scrutinize"><h2>⚠ What to scrutinize</h2><ul><li><a href="#pr-substance">GAE over ordered trajectories: do NOT drop no-action steps; reward terminal-only; batch-level adv norm</a> — per-trajectory norm or dropped steps silently corrupt the credit signal <span class="kv">(confidence: high)</span></li><li><a href="#pr-substance">Spatial encoder = masked tile-set pool, no positional feature (grid-CNN rejected)</a> — 2D coords not recoverable without forbidden new emitted data <span class="kv">(confidence: high)</span></li><li><a href="#pr-systemfit">Contract v1→2 multi-tensor lockstep (contract.py ↔ SampleSchema) + parity atol=1e-4</a> — cross-language drift is the top correctness risk over the new contract <span class="kv">(confidence: high)</span></li><li><a href="#pr-substance">Acceptance = experiment executed + reported, not a p&lt;0.05 ship gate</a> — an ML outcome must not block shipping; report honestly within budget <span class="kv">(confidence: high)</span></li></ul></section>
+<section id="pr-risks" class="panel"><h2>Risks</h2><table><caption>risks</caption><tr><th scope="col">#</th><th scope="col">risk</th><th scope="col">L×S</th><th scope="col">mitigation</th></tr><tr><td>1</td><td>Full-run wall-clock blows up (Medium games long)</td><td>M×H</td><td>hard budget + per-round checkpoint/resume; smoke-measure first; STOP at ceiling, report honestly</td></tr><tr><td>2</td><td>Multi-tensor parity drift JVM↔Python</td><td>M×H</td><td>extended parity test atol=1e-4 (anti-drift gate); u8→f32 both sides</td></tr><tr><td>3</td><td>Token-pool spatial may not beat blind on Medium (no 2D locality)</td><td>M×M</td><td>honest AC3 reporting permitted; rich still sees entities/terrain blind never gets</td></tr><tr><td>4</td><td>GAE/value instability or NaN on empty entity sets</td><td>L×M</td><td>masked-pool NaN guard, batch adv-norm, divergence abort, grad-norm logging</td></tr></table></section>
+<section id="pr-top-decisions" class="panel"><h2>Top decisions</h2><table><caption>decision · rejected alternative · confidence</caption><tr><th scope="col">decision</th><th scope="col">rejected alternative</th><th scope="col">confidence</th></tr><tr><td>Spatial = masked tile-set pool, no positional feature</td><td>grid-CNN (needs forbidden tile positions)</td><td>high</td></tr><tr><td>A2C+GAE over ordered trajectories, reward terminal-only, batch-level adv norm</td><td>REINFORCE reward-broadcast (breaks GAE) / per-trajectory norm (kills signal)</td><td>high</td></tr><tr><td>Plain A2C+GAE single-epoch default for the curves</td><td>PPO-clip default (conflates critic vs PPO)</td><td>high</td></tr><tr><td>Value head training-only; play ONNX policy-only</td><td>exporting value (breaks bridge contract)</td><td>high</td></tr><tr><td>Acceptance = experiment run + reported honestly</td><td>p&lt;0.05 as a ship gate</td><td>high</td></tr></table></section>
+<section id="pr-systemfit" class="panel"><h2>★ How it fits the system</h2><p><strong>New:</strong> <code>python/unciv_train/features.py</code> (multi-tensor assembly), <code>python/tests/test_gae.py</code>.
+<strong>Touched:</strong> <code>model.py</code> (value head + rich net), <code>train.py</code> (A2C+GAE), <code>dataset.py</code> (trajectories),
+<code>contract.py</code>/<code>export_onnx.py</code> (v2), <code>run_loop.py</code> (variants/resume/map-size),
+<code>OnnxPolicy.kt</code> + <code>SelfPlayRunner.kt</code> + <code>SampleSchema.kt</code> (multi-tensor bridge + map-size + parity).</p>
+<p><strong>Untouched but relied on:</strong> <code>Featurizer.kt</code>/<code>Observation.kt</code> (already emit every block this consumes),
+<code>TrajectoryEmitter</code>/<code>ShardFormat</code>/<code>reader.py</code> (shard format + provenance), <code>LegalActionMasks</code>/<code>MaskedChoice</code>
+(legality + seeded sampling), <code>RulesetFingerprint</code>, <code>RandomPolicy</code> opponent.</p>
+<p><strong>Calls in:</strong> run_loop shells <code>./gradlew selfPlay gen|eval</code> (JVM) and trains in Python.
+<strong>Calls out:</strong> exported policy-only ONNX is loaded by OnnxPolicy at play time (provenance-gated).
+<strong>Stays isolated:</strong> v1-reinforce variant runs the exact v1 contract-v1 path — the contract bump only affects rich-critic.</p>
+<table><caption>components touched and how they relate</caption><tr><th scope="col">component</th><th scope="col">kind</th><th scope="col">relationship</th></tr><tr><td class="mono">python/unciv_train/features.py</td><td>new</td><td>new</td></tr><tr><td class="mono">python/tests/test_gae.py</td><td>new</td><td>new</td></tr><tr><td class="mono">python/unciv_train/model.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">python/unciv_train/train.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">python/unciv_train/dataset.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">python/unciv_train/contract.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">python/unciv_train/export_onnx.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">python/unciv_train/run_loop.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">desktop/.../OnnxPolicy.kt</td><td>touched</td><td>touched</td></tr><tr><td class="mono">desktop/.../SelfPlayRunner.kt</td><td>touched</td><td>touched</td></tr><tr><td class="mono">core/.../dataplane/SampleSchema.kt</td><td>touched</td><td>touched</td></tr><tr><td class="mono">Featurizer.kt</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">Observation.kt</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">TrajectoryEmitter.kt</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">ShardFormat.kt</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">reader.py</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">LegalActionMasks.kt</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">MaskedChoice.kt</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">RulesetFingerprint.kt</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">RandomPolicy</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">OnnxPolicy (loads exported policy-only ONNX)</td><td>consumers</td><td>consumer / reader</td></tr><tr><td class="mono">run_loop (shells gradle selfPlay)</td><td>consumers</td><td>consumer / reader</td></tr></table><figure class="figure"><svg viewBox="0 0 706 637" width="100%" role="img" aria-label="dependency and data-flow diagram" aria-describedby="pr-diag-desc"><title>dependency and data-flow diagram</title><desc id="pr-diag-desc">Nodes: python/unciv_train/features.py (new), python/tests/test_gae.py (new), python/unciv_train/model.py (edit), python/unciv_train/train.py (edit), python/unciv_train/dataset.py (edit), python/unciv_train/contract.py (edit), python/unciv_train/export_onnx.py (edit), python/unciv_train/run_loop.py (edit), desktop/.../OnnxPolicy.kt (edit), desktop/.../SelfPlayRunner.kt (edit), core/.../dataplane/SampleSchema.kt (edit), Featurizer.kt (ctx), Observation.kt (ctx), TrajectoryEmitter.kt (ctx), ShardFormat.kt (ctx), reader.py (ctx), LegalActionMasks.kt (ctx), MaskedChoice.kt (ctx), RulesetFingerprint.kt (ctx), RandomPolicy (ctx), OnnxPolicy (loads exported policy-only ONNX) (ctx), run_loop (shells gradle selfPlay) (ctx). Edges: run_loop→gradle selfPlay gen/eval: shells; dataset→train.compute_gae: trajectories; train→export_onnx: policy-only; export_onnx→OnnxPolicy: v2 ONNX; Featurizer→OnnxPolicy: Observation blocks.</desc><defs><marker id="pr-arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#69707d"/></marker></defs><rect class="node" x="16" y="16" width="180" height="48" rx="5" fill="#eaf6ee" stroke="#1f883d"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="37">python/unciv_train/fea</tspan><tspan x="28" dy="15">tures.py</tspan></text><rect class="node" x="246" y="16" width="180" height="48" rx="5" fill="#eaf6ee" stroke="#1f883d"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="37">python/tests/test_gae.</tspan><tspan x="258" dy="15">py</tspan></text><rect class="node" x="476" y="16" width="180" height="48" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="37">python/unciv_train/mod</tspan><tspan x="488" dy="15">el.py</tspan></text><rect class="node" x="16" y="92" width="180" height="48" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="113">python/unciv_train/tra</tspan><tspan x="28" dy="15">in.py</tspan></text><rect class="node" x="246" y="92" width="180" height="48" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="113">python/unciv_train/dat</tspan><tspan x="258" dy="15">aset.py</tspan></text><rect class="node" x="476" y="92" width="180" height="48" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="113">python/unciv_train/con</tspan><tspan x="488" dy="15">tract.py</tspan></text><rect class="node" x="16" y="168" width="180" height="48" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="189">python/unciv_train/exp</tspan><tspan x="28" dy="15">ort_onnx.py</tspan></text><rect class="node" x="246" y="168" width="180" height="48" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="189">python/unciv_train/run</tspan><tspan x="258" dy="15">_loop.py</tspan></text><rect class="node" x="476" y="168" width="180" height="48" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="189">desktop/.../OnnxPolicy</tspan><tspan x="488" dy="15">.kt</tspan></text><rect class="node" x="16" y="244" width="180" height="48" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="265">desktop/.../SelfPlayRu</tspan><tspan x="28" dy="15">nner.kt</tspan></text><rect class="node" x="246" y="244" width="180" height="48" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="265">core/.../dataplane/Sam</tspan><tspan x="258" dy="15">pleSchema.kt</tspan></text><rect class="node" x="476" y="244" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="271">Featurizer.kt</tspan></text><rect class="node" x="16" y="320" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="347">Observation.kt</tspan></text><rect class="node" x="246" y="320" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="347">TrajectoryEmitter.kt</tspan></text><rect class="node" x="476" y="320" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="347">ShardFormat.kt</tspan></text><rect class="node" x="16" y="394" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="421">reader.py</tspan></text><rect class="node" x="246" y="394" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="421">LegalActionMasks.kt</tspan></text><rect class="node" x="476" y="394" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="421">MaskedChoice.kt</tspan></text><rect class="node" x="16" y="468" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="495">RulesetFingerprint.kt</tspan></text><rect class="node" x="246" y="468" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="495">RandomPolicy</tspan></text><rect class="node" x="476" y="468" width="180" height="63" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="489">OnnxPolicy (loads</tspan><tspan x="488" dy="15">exported policy-only</tspan><tspan x="488" dy="15">ONNX)</tspan></text><rect class="node" x="16" y="559" width="180" height="48" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="580">run_loop (shells</tspan><tspan x="28" dy="15">gradle selfPlay)</tspan></text><g class="legend"><rect x="16" y="618" width="11" height="11" rx="2" fill="#eaf6ee" stroke="#1f883d"/><text x="32" y="627" font-size="10" font-family="monospace" fill="#69707d">new</text><rect x="68" y="618" width="11" height="11" rx="2" fill="#fdf6e3" stroke="#9a6700"/><text x="84" y="627" font-size="10" font-family="monospace" fill="#69707d">edit</text><rect x="126" y="618" width="11" height="11" rx="2" fill="#ffffff" stroke="#9aa3b0"/><text x="142" y="627" font-size="10" font-family="monospace" fill="#69707d">context</text></g></svg><figcaption class="diag-cap">system-fit — what the change connects to</figcaption></figure></section>
+<section id="pr-walkthrough" class="panel"><h2>Worked walkthrough</h2><p><em>Illustrative mock values — not measured; sanity-check against the design above.</em> One rich-critic learner decision → trained credit:</p>
+<ol>
+<li><strong>JVM decision (Medium, nTiles≈1261):</strong> Featurizer→Observation; OnnxPolicy builds tensors <code>spatial[1,1261,13]+mask</code>, <code>own_units[1,7,8]+mask</code>, …, <code>global[1,26]</code>, <code>acting_civ[1,173]</code>; <code>session.run(map)</code> → <code>tech_logits[1,80]</code>, <code>policy_logits[1,70]</code>. <em>Contract: v2 named tensors.</em></li>
+<li><strong>Mask + sample:</strong> <code>MaskedChoice.choose(tech_logits, legalMask, eval, rng)</code> → tech idx 12; illegal → −1e9; seeded RNG ⇒ replayable.</li>
+<li><strong>Emit:</strong> step written with <code>actions=[12,4,-1,-1]</code>, reward 0. <em>Contract: shard schema v2.</em></li>
+<li><strong>Game ends turn 137 (win):</strong> terminal step reward <code>+1.0</code> (only there). <em>Terminal-only ±1.</em></li>
+<li><strong>Python train:</strong> ordered 137-step trajectory (rewards 0 except +1 last); V≈[0.1…0.9]; GAE(0.99,0.95) → A(step12)≈+0.4 (early state credited); <code>policy_loss=−A·logp</code>, <code>value_loss=MSE(V,R)</code>.</li>
+<li><strong>Export + eval:</strong> value head dropped → policy-only v2 ONNX; 200 Medium games vs RandomPolicy → win-rate + binomial p → curve.csv; rich vs blind (AC3).</li>
+</ol>
+</section>
+<details id="pr-change-map"><summary>Change map — 11 item(s), grouped by concern</summary><div class="grp">trainer</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">python/unciv_train/train.py<span class="heart">heart of the change</span></td><td>edit</td><td>REINFORCE → A2C+GAE; compute_gae</td></tr><tr><td class="mono">python/unciv_train/model.py</td><td>edit</td><td>value head + rich net</td></tr><tr><td class="mono">python/unciv_train/dataset.py</td><td>edit</td><td>ordered trajectories, terminal-only reward</td></tr><tr><td class="mono">python/unciv_train/features.py</td><td>new</td><td>multi-tensor assembly</td></tr></table><div class="grp">contract</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">python/unciv_train/contract.py</td><td>edit</td><td>CONTRACT_VERSION 2, multi-tensor names</td></tr><tr><td class="mono">python/unciv_train/export_onnx.py</td><td>edit</td><td>multi-tensor export, drop value</td></tr><tr><td class="mono">core/src/com/unciv/logic/simulation/dataplane/SampleSchema.kt</td><td>edit</td><td>OnnxContract v2</td></tr></table><div class="grp">driver</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">python/unciv_train/run_loop.py</td><td>edit</td><td>variants, resume, map-size, metrics</td></tr></table><div class="grp">bridge</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">desktop/src/com/unciv/app/desktop/OnnxPolicy.kt<span class="heart">heart of the change</span></td><td>edit</td><td>multi-tensor input build</td></tr><tr><td class="mono">desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt</td><td>edit</td><td>map-size CLI + multi-tensor parity</td></tr></table><div class="grp">test</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">python/tests/test_gae.py</td><td>new</td><td>RED-first GAE + value-head + export contract</td></tr></table></details>
+<section id="pr-operational" class="panel ha"><h2>Human actions required</h2><p class="kv">None — no post-merge human action required.</p></section><details><summary>Verification · rollback · out-of-scope</summary><h2>Verification</h2><ul><li>pytest python/tests/test_gae.py — GAE math + value head + value-dropped-at-export</li><li>pytest python/tests/test_parity.py — JVM↔Python multi-tensor logits within atol=1e-4</li><li>pytest python/tests/test_determinism.py — same seed → byte-identical shards</li><li>gradle test OnnxPolicyLegalityTest — choice always legal or -1</li><li>grep -n reward python/unciv_train/{train,dataset}.py — no intermediate reward term</li><li>curve.csv x3 variants + overlaid plot — attributable curves; last-K stddev + Medium two-proportion p</li></ul><h2>Rollback</h2><p>v1-reinforce variant + contract v1 path untouched; revert worktree branch to restore v1-only</p><h2>Explicitly not changing</h2><ul><li>self-play/league opponent (v3)</li><li>new action heads (construction/unit targeting)</li><li>new engine-emitted data</li><li>distributed training / transformer</li><li>reward shaping</li></ul><h2>Open questions</h2><ul><li>compute budget magnitude (D13) — concrete numbers proposed; user may dial at this gate</li></ul></details>
+<section id="pr-audit" class="panel audit"><h2>Audit &amp; sources</h2><p class="kv">The substance above is an LLM-authored summary — the source of truth is plan.md / decisions.md. The content hash lets a developer confirm the verbatim copy below matches what was approved.</p><table><tr><th scope="col">source</th><th scope="col">path</th><th scope="col">content hash</th></tr><tr><td><a href="plan.md">plan.md</a></td><td class="mono">specs/2026-06-23-onnx-selfplay-v2/plan.md</td><td class="mono h">3c543649864ac4b8</td></tr><tr><td><a href="decisions.md">decisions.md</a></td><td class="mono">specs/2026-06-23-onnx-selfplay-v2/decisions.md</td><td class="mono h">98f4258e9b86d1d4</td></tr><tr><td><a href=".plan-meta.json">.plan-meta.json</a></td><td class="mono">specs/2026-06-23-onnx-selfplay-v2/.plan-meta.json</td><td class="mono h">6cfe894a141442ff</td></tr></table></section>
+<div class="toolbar"><button class="btn" id="pr-expand" type="button" aria-expanded="false">expand all</button></div>
+<details><summary>Verbatim source — plan.md + decisions.md</summary><h2>plan.md</h2><pre># Plan — v2: rich representation + value critic (onnx-selfplay-v2)
+
+## The two questions this answers
+1. **Will it converge?** A learned value critic (actor-critic + GAE) should give per-state credit and **reduce late-round win-rate variance** vs v1 REINFORCE — banked as an isolated `blind-critic` curve on the SAME blind input (so only the algorithm changes).
+2. **Does seeing the board help?** A model that consumes the FULL observation (map tiles + units + cities + opponents) should reach a **higher win-rate where position matters** (Medium map) — banked as `rich-critic` vs `blind-critic`.
+
+Reward stays **terminal-only ±1** end-to-end; the critic is the only new credit mechanism (learned from the terminal outcome, not a shaped proxy).
+
+## Non-goals (unchanged from brief)
+No reward shaping; no self-play/league opponent (RandomPolicy stays); no new action heads (tech+policy only); no new engine-emitted data; no distributed training / giant transformer.
+
+## Delivery in three stages (each independently verifiable)
+
+### Stage A — Value critic on the blind input (python-only; banks the convergence curve)
+Reuses the v1 blind 199-dim input and the EXISTING ONNX contract v1, so the JVM bridge is untouched in this stage.
+
+1. **`model.py`**: add `value_head: Linear(hidden→1)`; `forward(obs) → (tech_logits, policy_logits, value)`. (Blind trunk unchanged otherwise.)
+2. **`dataset.py`**: add a trajectory loader returning **ordered per-game learner-step sequences** (`TrainTrajectory`: ALL non-terminal learner steps in turn order — do NOT drop no-action steps as v1 did; that would break GAE&#x27;s temporal sequence and risk dropping the reward-bearing step — R1). reward 0 except the terminal ±1 at the final transition. Keep `TrainStep` fields per step; **drop the v1 return-broadcast** (GAE computes returns). Provenance gates unchanged.
+3. **`train.py`**: replace REINFORCE with **actor-critic + GAE**:
+   - per trajectory compute δ_t = r_t + γV(s_{t+1}) − V(s_t) (V(terminal)=0), advantage A_t = Σ_l (γλ)^l δ_{t+l}, return R_t = A_t + V(s_t). γ=0.99, λ=0.95. (`compute_gae(rewards, values, γ, λ)` — pinned by `test_gae.py`.)
+   - **batch-level** advantage standardization (all steps from all trajectories pooled, so winning+losing games coexist — NEVER per-trajectory, which would zero the signal — R2); `policy_loss = −(A.detach()·(logp_tech+logp_policy))`; `value_loss = MSE(V,R)`; `entropy` bonus; `total = policy + c_v·value − c_ent·entropy` (c_v=0.5, c_ent=0.01).
+   - **Default = plain A2C+GAE, single inner epoch, NO PPO clip** for the attributable curves (so the isolated variable stays clean — R4). PPO-clip (ε=0.2, K=4, ratio = exp(new_logp − old_logp.detach())) is an OPTIONAL non-default knob. Value/critic learns at every step; policy gradient is masked to acting heads (logp=0 elsewhere). Reuse `_masked_logp` + −1/no-action handling VERBATIM.
+   - **divergence guard:** abort a round on non-finite loss (NaN/Inf), log the signal, resume from last good checkpoint (R8).
+   - emit per-round metrics: policy_loss, value_loss, entropy, mean_adv, mean_value, grad_norm.
+4. **`contract.py` / `export_onnx.py`**: value head is **training-only** — export drops it; exported ONNX stays policy-only contract v1 (`obs`→`tech_logits`,`policy_logits`). **Negative test**: exported model has no `value` output.
+5. **`run_loop.py`**: add `--variant {v1-reinforce, blind-critic, rich-critic}` (selects algo+model+contract), per-round `.pt` checkpoint + `--resume`, and a metrics column set. `v1-reinforce` preserves the exact v1 path for the attributable baseline.
+6. **Produce curves**: `v1-reinforce` + `blind-critic` on Tiny, overlaid `curve.png` + per-variant `curve.csv`. Convergence stat: last-K=4 win-rate stddev (blind-critic &lt; v1-reinforce).
+
+### Stage B — Rich representation (map + entities; the contract grows)
+7. **`features.py` (new)** + `dataset.py`: assemble the full per-step multi-tensor input from `Step.blocks`:
+   - `spatial` nTiles×13 → **per-tile token set** (the 13 channels only — NO positional feature; zeroBasedIndex is insertion order not 2D position, including it risks spurious-order overfit — R6) + a padding mask (first nTiles valid, padding beyond batch-max nTiles invalid); padded to batch-max nTiles.
+   - entity blocks (own_units, opp_units, own_cities, opp_cities, civ_tokens, diplo_edges) → per-type padded token sets + presence masks (present-only on disk → padded to batch-max).
+8. **`model.py`**: `RichPolicyValueNet` — per-tile token MLP → masked mean+max pool; per-entity-type token MLP → masked mean+max pool; concat with global+acting_civ → trunk MLP → {tech, policy, value}. Modest (hidden≈256). **Masked-pool NaN guard:** mean = sum/clamp(count,min=1); max over an empty set → 0; an entity type with 0 present → zero vector (R3, unit-tested).
+9. **Contract v2** (`contract.py` + Kotlin `SampleSchema.OnnxContract`, lockstep): named multi-tensor inputs + presence/validity masks, dynamic axes (batch / nTiles / entity counts). `CONTRACT_VERSION`→2. `export_onnx` exports the multi-tensor policy-only model (value dropped).
+10. **`OnnxPolicy.kt`**: build the SAME multi-tensor input from the live `Observation` (reuse `block(name)` + VARIABLE counts; feed u8 spatial as f32), `session.run(Map&lt;name,OnnxTensor&gt;)`, read logits, mask + sample (seeded `MaskedChoice` unchanged). Heads not modeled → −1 (heuristic fallback unchanged). Provenance gate validates contract v2 + tensor inventory.
+11. **`SelfPlayRunner.kt` parity-dump/parity-run**: dump/run the multi-tensor obs (JSON of named arrays) instead of the single 199-vector.
+
+### Stage C — Eval
+12. **Map-size CLI param** (`SelfPlayRunner.mapParameters(seed, mapSize)`), threaded through `gen`/`eval`. Keep Tiny win-rate-vs-RandomPolicy + binomial harness (comparability). Add **Medium** training+eval for `blind-critic` vs `rich-critic`; two-proportion z-test sized for p&lt;0.05 (~200 eval games).
+
+## File change inventory
+- **Edit (python):** `model.py`, `train.py`, `dataset.py`, `contract.py`, `export_onnx.py`, `run_loop.py`; **new** `features.py`.
+- **Edit (kotlin):** `desktop/.../OnnxPolicy.kt`, `desktop/.../SelfPlayRunner.kt` (map-size arg + parity dump/run), `core/.../dataplane/SampleSchema.kt` (OnnxContract v2).
+- **Tests:** `python/tests/test_parity.py` (multi-tensor), new `test_gae.py` (GAE math + terminal-only-reward + no-value-output export), keep `test_determinism.py`/`test_train_dataset.py`; Kotlin `OnnxPolicyLegalityTest` stays green.
+- **No-touch:** Featurizer/Observation/emitter/shard format/masks/RulesetFingerprint/reader provenance/RandomPolicy.
+
+## Operational
+- **Budget (D13, HARD):** Tiny: 3 variants × 12 rounds × (24 gen + 100 eval). Medium: 2 variants × bounded rounds + ~200-game eval. Smoke-measure per-round wall-clock, set a ceiling, STOP at budget (report honestly even if borderline).
+- **Checkpoint/resume + observability (D14):** per-round `.pt` + resumable loop; richer metrics file.
+- **Env (D16):** create python venv + `pip install -e ./python` before training.
+
+## Acceptance (operationalized — see decisions.md D12 + R5)
+**Definition of done = the experiment is executed correctly and reported honestly** (the scientific results — convergence stddev, Medium ceiling p-value — are reported as-is, including &quot;not significant&quot;; p&lt;0.05 is the hypothesis under test, NOT a ship-blocking gate — R5; the brief&#x27;s AC3 explicitly permits this).
+AC1 attributable curves (shared harness/opponent/seeds, only named axis differs; both critic variants use plain A2C+GAE so the axis is clean) · AC2 report last-K=4 win-rate stddev AND mean late win-rate for blind-critic vs v1-reinforce (steadier is meaningful only with the level — R9) · AC3 rich vs blind on Medium, two-proportion test + p-value reported (significant or stated plainly) · AC4 multi-tensor parity atol=1e-4 · AC5 determinism+provenance+contract bump · AC6 legality green · AC7 terminal-only reward (grep/assert).
+
+## Security hardening (council 🟡 — R7)
+Checkpoint load = `torch.load(weights_only=True)` (no arbitrary-code path); every JVM `OnnxTensor` closed via try/finally over the tensor map (no native leak across many decisions); parity JSON shape-validated before ORT; mask tensors included in ONNX `dynamic_axes`. Self-generated local data, but cheap guards.
+
+## Walkthrough
+One learner decision → trained credit, traced with illustrative mock shapes (sanity-check against the design above; not measured):
+
+1. **JVM decision (rich-critic play):** `Featurizer.observe(civ)` builds `Observation` on a Medium map (nTiles≈1261). `OnnxPolicy` reads blocks → tensors: `spatial`[1,1261,14], `own_units`[1,7,8]+mask[1,7], `opp_units`[1,3,8]+mask, `own_cities`[1,2,16], …, `global`[1,26], `acting_civ`[1,173]. `session.run(map)` → `tech_logits`[1,80], `policy_logits`[1,70]. Contract: v2 named tensors.
+2. **Mask+sample:** `MaskedChoice.choose(tech_logits, legalTechMask, eval, rng)` → e.g. tech index 12 (Bronze Working); illegal indices were −1e9. Seeded RNG ⇒ replayable.
+3. **Emit step:** `TrajectoryEmitter` writes the step (blocks + `actions=[12, 4, -1, -1]`, reward 0) to the shard. Contract: shard schema v2.
+4. **Game ends:** learner wins on turn 137 → terminal step reward `+1.0` (only there). Contract: terminal-only ±1.
+5. **Python train:** `dataset.load_trajectories` returns the ordered 137-step learner sequence (rewards all 0 except +1 at end). `train`: V predicts e.g. [0.1,0.12,…,0.9]; δ_t, GAE(0.99,0.95) → advantages e.g. A_12-step ≈ +0.4 (this early Bronze-Working state credited toward the eventual win); `policy_loss = −A·logp`, `value_loss = MSE(V,R)`.
+6. **Export+eval:** value head dropped → policy-only v2 ONNX; eval 200 Medium games vs RandomPolicy → win-rate + binomial p; appended to `curve.csv`; compared rich vs blind (AC3).
+
+## Risks
+| # | Risk | L×S | Mitigation |
+|---|---|---|---|
+| 1 | Full-run wall-clock blows up (Medium games long) | M×H | Hard budget + per-round checkpoint/resume; smoke-measure first; STOP at ceiling, report honestly |
+| 2 | Token-pool spatial doesn&#x27;t beat blind on Medium (no 2D locality) | M×M | Honest AC3 reporting allowed; rich still sees entities/terrain blind never gets; positional scalar added |
+| 3 | Multi-tensor parity drift JVM↔Python | M×H | Extended parity test (atol=1e-4) is the anti-drift gate; feed u8→f32 consistently both sides |
+| 4 | GAE/value instability (bootstrap) | L×M | Advantage normalization, c_v=0.5, optional PPO clip when epochs&gt;1, entropy bonus, grad-norm logging |
+| 5 | Contract bump breaks v1 path / baseline | L×H | v1-reinforce variant preserves the exact v1 contract-v1 path; bump only affects rich-critic |
+</pre><h2>decisions.md</h2><pre># Decisions — onnx-selfplay-v2
+
+## Setup / scope (user-answered Phase 1)
+- **D1 — Worktree:** v1 was uncommitted WIP; per user, committed v1 (`8e0e4ba0a`), fast-forwarded `master`, branched `onnx-selfplay-v2` worktree off it. Clean committed base.
+- **D2 — Training scope:** &quot;Build + full run to acceptance.&quot; BOUNDED with a hard compute budget + stopping rule + per-round checkpoint/resume (council 🔴/🟡 on unbounded runs). Measured per-round wall-clock will be surfaced before the long run; budget adjustable at the Step 11 gate.
+
+## Council intake roster rationale
+Reused v1&#x27;s intake roster (identical RL/ML self-play domain): Core 6 + `domain_fidelity` (RL/ML correctness), `ethics_responsible_ai` (ML failure-mode / value-bootstrap instability), `cost_efficiency` (full-run compute). 9 roles, within L&#x27;s ≤14. No user-facing/auth/PII surface ⇒ no end_user/data-privacy roles beyond core security_red_team.
+
+## Architecture decisions
+
+- **D3 — Spatial encoder = per-tile-token + positional feature + masked pooling (NOT grid-CNN).**
+  Rationale: deep scan confirms per-tile (col,row) is NOT recoverable from shard data (`zeroBasedIndex` is tile-insertion order, positions not emitted, maps hexagonal); a grid-CNN would require emitting tile positions — forbidden by the &quot;no new engine-emitted data&quot; non-goal — or fragile generator-order replay. Council 🔴 (&quot;2D grid reconstruction impossible&quot;) + 🟡 (&quot;prefer simple pooling&quot;) concur, and the task explicitly sanctions this fallback. Each tile → token of its 13 channels + a cheap positional scalar (normalized zeroBasedIndex); masked mean+max pool over present (explored) tiles.
+  **Consequence (honest, vs AC3 ceiling):** 2D conv locality is sacrificed. The rich model still sees the full board as a *set* of tiles (terrain/resource/units/owner) + all entity tokens that the blind 199-dim never gets; the ceiling test asks &quot;does seeing the map+entities help,&quot; which token-pool delivers. AC3 permits reporting the curves and &quot;stating plainly if not.&quot;
+
+- **D4 — Entity encoder = per-type token MLP → masked mean+max pool, concatenated.**
+  Types: own_units(8), opp_units(8), own_cities(16), opp_cities(16), civ_tokens(84), diplo_edges. Each type: shared small MLP per token → masked pool (padded entities excluded). Permutation-invariant (Deep Sets); attention is a deferred upgrade (start simple — council 🟡 + research).
+
+- **D5 — Trunk + heads.** Concat[ global(26), acting_civ(173), spatial_pool, per-type entity pools ] → 2-layer MLP (hidden≈256) → shared trunk → heads {tech_logits(80), policy_logits(70), value(1)}. Modest sizes (CPU-trainable). Blind variant skips the spatial+entity pools (input = global+acting_civ only) but keeps the value head.
+
+- **D6 — Actor-critic + GAE.** γ=0.99, λ=0.95. **Dataset restructured** to emit ordered per-game learner-step trajectories with reward = 0 except terminal ±1 placed at the last learner step (NO v1-style broadcast — the 🔴 incompatibility). GAE computed per-trajectory: δ_t = r_t + γV(s_{t+1}) − V(s_t), V(terminal)=0 bootstrap; advantage = Σ(γλ)^l δ_{t+l}; return target = advantage + V(s_t). Reward stays terminal-only ±1 (AC7) — the critic is the only new credit mechanism, learned from terminal outcome.
+
+- **D7 — Loss.** `policy = −(adv.detach() · Σ_head masked_logp)`; `value = MSE(V(s), return)`; `total = policy + c_v·value − c_ent·entropy`. Defaults c_v=0.5, c_ent=0.01. **PPO clip:** when inner epochs &gt; 1, clipping is REQUIRED (council 🟡 + research — stale-ratio blowup otherwise); default = PPO-clip ε=0.2, K=4 epochs; single-epoch A2C also supported (no clip). Reuse v1 `_masked_logp` (illegal→−1e9, gather chosen, 0 where action&lt;0) and the −1/no-action handling VERBATIM.
+
+- **D8 — Variant scheme `--variant {v1-reinforce, blind-critic, rich-critic}`** selects (algorithm, model, contract):
+  - `v1-reinforce`: exact preserved v1 path (REINFORCE + mean baseline, blind MLP, contract v1) — the attributable baseline. NOT broken by Stage A.
+  - `blind-critic`: A2C+GAE on the blind 199-dim input (contract v1, value head dropped at export → JVM bridge UNCHANGED).
+  - `rich-critic`: A2C+GAE on the multi-tensor rich input (contract v2).
+
+- **D9 — Value head is training-only.** `export_onnx` drops it; exported play-model is policy-only (`tech_logits`,`policy_logits`). Negative test asserts the exported ONNX has NO value output (council 🟡 &quot;provably dropped&quot;).
+
+- **D10 — Contract v2 = named multi-tensor input** (global, acting_civ, spatial + its valid-mask, own_units/opp_units/own_cities/opp_cities/civ_tokens/diplo_edges each with a presence mask) with dynamic axes (batch, nTiles, entity counts). `CONTRACT_VERSION`→2 in lockstep on `contract.py` + `SampleSchema.OnnxContract`. Provenance gate keeps META_SCHEMA_VERSION/META_CONTRACT_VERSION/META_RULESET_FINGERPRINT and validates v2 + the tensor inventory (council 🟡 &quot;gate coverage&quot;). Hard break vs v1 .onnx is expected (perishable artifacts). u8 spatial fed as f32 on the JVM.
+
+- **D11 — Map-size CLI param** threaded `gen`/`eval` → `mapParameters(seed, mapSize)`. Tiny kept for comparability (AC1/AC2); Medium added for the ceiling test (AC3). nTiles dynamic ⇒ Medium shards work unchanged.
+
+## Operationalized acceptance (council 🔴 &quot;cited not operationalized&quot;)
+- **D12a — Attribution protocol (AC1):** v1-reinforce, blind-critic, rich-critic run through the SAME harness, SAME opponent (RandomPolicy), SAME eval seeds + game counts + map; ONLY the named axis (algorithm / representation) differs. curve.csv per variant + overlaid plot.
+- **D12b — Convergence (AC2):** ≥12 Tiny rounds per variant; metric = stddev of eval win-rate over the last K=4 rounds. PASS = blind-critic last-K stddev &lt; v1-reinforce last-K stddev (report both; &quot;measurably steadier&quot;). Also report mean late win-rate.
+- **D12c — Ceiling (AC3):** blind-critic vs rich-critic trained AND evaluated on Medium; two-proportion z-test (and per-variant binomial vs 0.5) on a fixed eval-game count sized for p&lt;0.05 power (≈200 games). PASS = rich win-rate &gt; blind at p&lt;0.05; else report curves + state plainly.
+- **D12d — Parity (AC4):** `test_parity.py` extended to the full multi-tensor input; JVM-built tensors + logits match Python ORT within atol=1e-4.
+- **D12e — Determinism/provenance (AC5):** same seed → byte-identical shards (existing test); contract version bumped; fingerprint stamped + gated.
+- **D12f — Legality (AC6):** `OnnxPolicyLegalityTest` green; zero illegal-action exceptions across the runs.
+- **D12g — Terminal-only reward (AC7):** grep/assert no hand-authored intermediate reward term; reward placed only at terminal step in dataset + emitter unchanged.
+
+## Operational hardening (council 🔴/🟡)
+- **D13 — Compute budget + stopping rule (HARD):** per-variant Tiny = 12 rounds × (24 gen + 100 eval) games; Medium ceiling = 2 critic variants × bounded rounds + ~200-game eval. Smoke-measure per-round wall-clock first; set a wall-clock ceiling; STOP at budget even if a criterion is borderline (report honestly). Surfaced for approval at Step 11.
+- **D14 — Checkpoint/resume + observability:** per-round `.pt` checkpoint + resumable `run_loop`; per-round metrics (policy_loss, value_loss, entropy, mean_adv, mean_value, ret_pos, grad_norm) appended to curve.csv / a metrics file.
+- **D15 — Dual-use (security_red_team 🟡):** research artifact; opponent is RandomPolicy; learner sees only fairness-gated observations (leakage tests already green); Tiny/Medium maps. Negligible real-world dual-use; documented, not a blocker.
+- **D16 — Env setup prerequisite:** no python venv present; create one + `pip install -e ./python` before any training (Phase 3 first step).
+
+## Open for user at Step 11 gate
+- Compute budget (D13) magnitude — concrete numbers proposed; user may dial rounds/games at approval.
+
+## Plan council resolutions (Step 11) — folded into the plan
+- **R1 (🔴 no-action filtering breaks GAE / drops reward):** dataset emits the FULL ordered sequence of non-terminal learner steps (do NOT drop both-heads=−1 steps as v1 did). Value + GAE run over every step; policy loss is masked to acting heads (logp=0 where a head didn&#x27;t act — v1 machinery). Terminal ±1 placed at the final transition (bootstrap V(terminal)=0). Amends D6.
+- **R2 (🔴 per-trajectory adv-norm destroys signal):** advantage standardization is BATCH-level (all steps from all trajectories pooled, so winning and losing games coexist) — never per-trajectory. Flag-controlled; default on. Amends D7.
+- **R3 (🔴 NaN masked pooling on empty sets):** masked mean = sum / clamp(count, min=1); masked max over an empty set → 0 (not −inf). Entity type with 0 present → zero vector. Covered by a unit test. Amends D4.
+- **R4 (🔴 PPO conflates critic vs PPO in isolated curves):** the attributable curves use **plain A2C+GAE, single inner epoch, NO PPO clip** so v1-reinforce→blind-critic isolates ONLY the credit mechanism and blind-critic→rich-critic isolates ONLY the representation. PPO-clip (ε=0.2, K=4) is an OPTIONAL non-default knob, not used for headline curves. Amends D7/D8.
+- **R5 (🔴 p&lt;0.05 vs bounded budget):** ACCEPTANCE = execute the operationalized experiment correctly + report results honestly (curves, last-K stddev, Medium two-proportion test with its p-value, &quot;states plainly if not significant&quot;). The p&lt;0.05 is the hypothesis under test, NOT a ship-blocking gate (brief AC3 itself permits this). Amends D12c.
+- **R6 (🟡 positional feature spurious):** DROP the zeroBasedIndex positional scalar — it is insertion order, not 2D position; including it risks overfitting to ordering. Spatial encoder = pure permutation-invariant masked pool over the multiset of per-tile 13-channel vectors. Amends D3.
+- **R7 (🟡 security hardening):** checkpoint load uses `torch.load(weights_only=True)`; every JVM `OnnxTensor` is closed (try/finally over the tensor map); parity JSON is shape-validated before ORT; mask tensors included in `dynamic_axes`. 
+- **R8 (🟡 divergence detection):** abort a round on non-finite loss (NaN/Inf) with a logged signal; resume from last good checkpoint. gradle gen/eval already has `--gradle-timeout`.
+- **R9 (🟡 AC2 stable-but-bad):** report BOTH last-K stddev AND mean late win-rate; &quot;steadier&quot; is only meaningful alongside the level (a stable 50% is not a win).
+- **R10 (🟡 padding/cost):** pad to batch-max (not global cap) per batch; entity counts already capped by SampleCaps; Medium high-N eval is FINAL-gated (run once at the end), not per-round.
+- **R11 (🟡 Stage B big-bang):** Stage B validated incrementally behind the parity test (spatial pool, then entity pools) but shipped together; parity atol=1e-4 is the correctness guard.
+</pre></details>
+<section class="panel pr-nonce-p" aria-label="approval code"><h2>Approval code</h2><p>You reached the bottom. Paste this code back in the terminal to approve:</p><p><span class="pr-nonce" id="pr-nonce">amber-quartz-8109</span> <button class="btn" id="pr-copy" type="button" aria-label="copy approval code">copy</button></p><p class="kv">request changes &rarr; reply <code>revise: &lt;what&gt;</code> &middot; stop &rarr; reply <code>abort</code></p></section>
+</main>
+<script>document.addEventListener('DOMContentLoaded',function(){var b=document.getElementById('pr-expand');if(b){b.addEventListener('click',function(){var open=b.getAttribute('aria-expanded')!=='true';document.querySelectorAll('details').forEach(function(d){d.open=open;});b.setAttribute('aria-expanded',open);b.textContent=open?'collapse all':'expand all';});}var c=document.getElementById('pr-copy');if(c){c.addEventListener('click',function(){var n=document.getElementById('pr-nonce');if(n&&navigator.clipboard){navigator.clipboard.writeText(n.textContent.trim());}});}});</script>
+</body></html>

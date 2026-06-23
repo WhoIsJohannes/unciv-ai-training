@@ -1,0 +1,14 @@
+{"step": 0, "phase": 1, "event": "start", "ts": "2026-06-23T15:08:45Z"}
+{"step": 3, "phase": 1, "event": "end", "ts": "2026-06-23T15:17:30Z"}
+{"step": 5, "phase": 2, "event": "start", "ts": "2026-06-23T15:18:43Z"}
+{"step": 7, "phase": 2, "event": "start", "ts": "2026-06-23T15:18:43Z"}
+{"step": 4, "phase": 2, "event": "start", "ts": "2026-06-23T15:18:43Z"}
+{"step": 4, "phase": 2, "event": "end", "ts": "2026-06-23T15:21:20Z"}
+{"event": "consolidation", "round": 1, "mode": "python", "raw_in": 42, "consolidated_out": 42, "ts": "2026-06-23T15:21:54Z"}
+{"step": 5, "phase": 2, "event": "end", "ts": "2026-06-23T15:24:57Z"}
+{"step": 7, "phase": 2, "event": "end", "ts": "2026-06-23T15:24:57Z"}
+{"step": 6, "phase": 2, "event": "skip", "ts": "2026-06-23T15:28:06Z"}
+{"step": 8, "phase": 2, "event": "start", "ts": "2026-06-23T15:28:06Z"}
+{"step": 11, "phase": 2, "event": "start", "ts": "2026-06-23T15:28:15Z"}
+{"event": "consolidation", "round": 1, "mode": "python", "raw_in": 41, "consolidated_out": 41, "ts": "2026-06-23T15:30:42Z"}
+{"step": 11, "phase": 2, "event": "end", "ts": "2026-06-23T15:37:16Z"}

@@ -1,0 +1,1061 @@
+{
+  "assignments": {
+    "skeptic": "openai/gpt-5.5",
+    "architect": "google/gemini-3.1-pro-preview",
+    "practitioner": "anthropic/claude-opus-4.8",
+    "product_manager": "openai/gpt-5.5",
+    "qa_testing": "deepseek/deepseek-v4-pro",
+    "security_red_team": "anthropic/claude-opus-4.8",
+    "domain_fidelity": "google/gemini-3.1-pro-preview",
+    "ethics_responsible_ai": "deepseek/deepseek-v4-pro",
+    "cost_efficiency": "openai/gpt-5.5"
+  },
+  "findings": [
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Default PPO makes the blind-critic curve no longer isolated",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Stage A \u2014 Value critic on the blind input",
+      "description": "Stage A says the blind-critic curve isolates the value critic/GAE change, but then makes PPO clipping with K=4 the default path. That means the comparison is no longer 'REINFORCE vs learned critic'; it is 'REINFORCE vs critic + GAE + PPO-style multi-epoch updates'.",
+      "rationale": "This is classic accidental scope creep: PPO is a second algorithm, with its own failure modes and tuning knobs. If convergence improves or regresses, future maintainers will not know which change caused it.",
+      "suggested_addition": "Change Stage A default to single-epoch A2C/GAE only: `K=1, no PPO clip` for the banked `blind-critic` curve. Keep PPO clipping behind an explicit experimental flag, documented as out-of-band unless A2C is unstable. Acceptance AC2 should be measured on the non-PPO path.",
+      "supporting_roles": [
+        "qa_testing",
+        "practitioner",
+        "domain_fidelity"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "Will it converge? A learned value critic (actor-critic + GAE) should give per-state credit...",
+        "optional **PPO clip** (\u03b5=0.2) with K inner epochs (K=4 default; ratio = exp(new_logp \u2212 old_logp.detach()))"
+      ],
+      "event_id": "4a1948b8-59ef-4b47-89a4-eb4450b98ab0"
+    },
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Do not make ML significance a build acceptance gate",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Acceptance",
+      "description": "AC3 requires rich to beat blind on Medium at p<0.05, but the brief also admits the rich model may not beat blind and says to report honestly. Those two statements pull in opposite directions: one treats an empirical research outcome as a pass/fail build gate, the other treats it as a measured result.",
+      "rationale": "A feature implementation should not turn into an open-ended hyperparameter chase because the experiment did not produce the desired p-value. That is how small ML features become forever projects.",
+      "suggested_addition": "Split acceptance into implementation gates and experiment outcomes. Example: `Implementation acceptance: rich and blind variants train/eval under the fixed budget, produce comparable curves, pass parity/provenance/determinism/legality tests, and report the Medium z-test result. Research success criterion: rich > blind at p<0.05; failure to meet it is reported, not treated as incomplete implementation unless caused by a code defect.`",
+      "supporting_roles": [
+        "cost_efficiency",
+        "qa_testing",
+        "product_manager"
+      ],
+      "supporting_lenses": [
+        "business",
+        "technical"
+      ],
+      "source_excerpts": [
+        "AC3 rich>blind on Medium at p<0.05 (or stated)",
+        "Token-pool spatial doesn't beat blind on Medium... Honest AC3 reporting allowed"
+      ],
+      "event_id": "3a1adc3d-de56-4330-9ff4-c67b0df036d8"
+    },
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Stage B adds too many rich inputs in one jump",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Stage B \u2014 Rich representation",
+      "description": "Stage B rolls spatial tiles, units, cities, civ tokens, diplo edges, masks, model pooling, Kotlin tensor assembly, contract v2, and parity format changes into one stage. If parity breaks or the model fails to improve, there is no small step to debug or rollback.",
+      "rationale": "This is a lot of abstraction and tensor plumbing before proving the smallest useful rich representation works. Future developers will inherit a wide contract surface even if half the tensors did not matter.",
+      "suggested_addition": "Add a minimal Stage B1 before the full rich contract: implement `global`, `acting_civ`, `spatial`, `own_units`, `opp_units`, `own_cities`, and `opp_cities` only. Defer `civ_tokens` and `diplo_edges` to Stage B2 unless B1 trains, exports, and passes parity. If the task requires the final model to consume every block, say that explicitly, but still implement the contract in two reviewable slices.",
+      "supporting_roles": [
+        "practitioner",
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "entity blocks (own_units, opp_units, own_cities, opp_cities, civ_tokens, diplo_edges) \u2192 per-type padded token sets + presence masks",
+        "Contract v2... named multi-tensor inputs + presence/validity masks, dynamic axes"
+      ],
+      "event_id": "3d107542-4244-43f5-b4e0-5881436cd1c9"
+    },
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "The normalized tile index is fake positional information",
+      "severity": "minor",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Stage B \u2014 Rich representation",
+      "description": "The plan adds a normalized index positional feature even though the scan says `zeroBasedIndex` is insertion order, not spatial position. Calling it positional invites future developers to believe the model has location awareness it does not actually have.",
+      "rationale": "A cheap feature is not free if it encodes a misleading concept. This is the kind of clever-looking detail that survives for years because nobody remembers it was only a fallback hack.",
+      "suggested_addition": "Either drop the normalized tile index feature, or rename/document it as `tile_order_id` with this caveat: `This is a stable per-map ordering hint, not a coordinate or locality feature; the model must not rely on it as spatial position.` Do not describe it as positional unless real coordinates are emitted.",
+      "supporting_roles": [
+        "domain_fidelity",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "per-tile token set (13 channels + normalized index positional feature)",
+        "Tile.zeroBasedIndex = tile-insertion order... NOT a row-major function of position"
+      ],
+      "event_id": "62b0d774-4e7e-4641-bd2e-5cb08a2008c4"
+    },
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Variant support risks becoming a mini framework",
+      "severity": "minor",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Stage A \u2014 Value critic on the blind input",
+      "description": "`--variant {v1-reinforce, blind-critic, rich-critic}` is necessary for attribution, but the brief does not constrain how simple this dispatch must stay. This is a prime spot for a strategy/factory/config abstraction that will have exactly three cases and be painful to maintain.",
+      "rationale": "The design needs variants, not a variant framework. Keep the branching boring and local so a maintainer can see exactly which model, loader, trainer, and contract each variant uses.",
+      "suggested_addition": "Add an implementation constraint: `Variant dispatch stays as an explicit small table or if/elif block in run_loop.py; no strategy interfaces, plugin registry, or generic VariantManager. Each variant maps directly to model constructor, dataset loader, train function, and export contract.`",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "add `--variant {v1-reinforce, blind-critic, rich-critic}` (selects algo+model+contract)",
+        "`v1-reinforce` preserves the exact v1 path for the attributable baseline"
+      ],
+      "event_id": "220a6271-a901-4563-a8d1-cd730319c621"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Terminal step filtering drops the only reward signal",
+      "severity": "critical",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Stage A \u2014 Value critic on the blind input",
+      "description": "If a game ends on the opponent's turn, the learner's terminal step will have no legal actions (`[-1, -1]`). If `dataset.py` filters out actionless steps (as v1 did to avoid empty training), it will drop the terminal step. Because v2 relies entirely on terminal rewards, dropping this step results in a 0-reward trajectory.",
+      "rationale": "A data pipeline that silently drops the only credit assignment signal will cause the value critic to learn a constant 0, completely breaking the GAE bootstrap and rendering the model unable to learn.",
+      "suggested_addition": "Update `dataset.py` to explicitly retain terminal steps even if `actions == [-1, -1]`. The policy loss will naturally ignore it via `_masked_logp`, but the value head must see it to learn the terminal reward.",
+      "supporting_roles": [
+        "practitioner",
+        "domain_fidelity"
+      ],
+      "supporting_lenses": [
+        "data_model"
+      ],
+      "source_excerpts": [
+        "reward 0 except terminal \u00b11 at the last step",
+        "Reuse _masked_logp + \u22121/no-action handling VERBATIM"
+      ],
+      "event_id": "fa202516-70ce-420f-a48d-61e2f3b3a8b5"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Contradiction in preserving the v1-reinforce baseline",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Stage A \u2014 Value critic on the blind input",
+      "description": "The brief instructs to 'replace REINFORCE' in `train.py` and 'drop the v1 return-broadcast' in `dataset.py`, but simultaneously claims the `v1-reinforce` variant will 'preserve the exact v1 path'. These are mutually exclusive.",
+      "rationale": "You cannot delete the baseline's code and still run the baseline. The architecture must explicitly support both paths simultaneously to satisfy the attribution acceptance criteria.",
+      "suggested_addition": "Clarify that `train.py` and `dataset.py` must branch their logic (or maintain separate functions) based on the `--variant` flag, keeping the v1 REINFORCE trainer and broadcast loader intact for the baseline.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "architecture"
+      ],
+      "source_excerpts": [
+        "replace REINFORCE with actor-critic + GAE",
+        "drop the v1 return-broadcast",
+        "v1-reinforce preserves the exact v1 path for the attributable baseline"
+      ],
+      "event_id": "f005e7d9-e569-4736-a953-69bcc3505411"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Kotlin OnnxTensor native memory leak multiplier",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Stage B \u2014 Rich representation",
+      "description": "Moving from 1 input tensor to ~10 named tensors per inference step means creating 10x more `OnnxTensor` objects. In the JVM ONNX Runtime, these hold native memory and must be explicitly closed.",
+      "rationale": "Without strict resource management, a 10x increase in unclosed native pointers will guarantee an OutOfMemory crash during the long-running Medium map self-play evaluation.",
+      "suggested_addition": "Mandate that `OnnxPolicy.kt` must safely close all created `OnnxTensor` instances (e.g., using a `use` block or explicit `finally` cleanup) immediately after `session.run`.",
+      "supporting_roles": [
+        "practitioner",
+        "cost_efficiency"
+      ],
+      "supporting_lenses": [
+        "integration_surface"
+      ],
+      "source_excerpts": [
+        "session.run(Map<name,OnnxTensor>)"
+      ],
+      "event_id": "d2aabda3-431f-4739-9928-5fc152840916"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Dynamic axes missing for mask tensors in ONNX export",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Stage B \u2014 Rich representation",
+      "description": "The contract specifies dynamic axes for entity counts, and adds presence/validity masks. If the masks are not also explicitly given dynamic axes in `export_onnx.py`, the export will bake in fixed mask lengths.",
+      "rationale": "A mismatch between dynamic entity tensors and fixed-size mask tensors will cause runtime shape errors in the ONNX bridge when entity counts vary.",
+      "suggested_addition": "Ensure `export_onnx.py` registers dynamic axes for ALL mask tensors, perfectly matching the dynamic axes of their corresponding entity tensors.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "contract_quality"
+      ],
+      "source_excerpts": [
+        "named multi-tensor inputs + presence/validity masks, dynamic axes (batch / nTiles / entity counts)"
+      ],
+      "event_id": "cccb3f35-17b2-43d2-894d-edc3e8643f76"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Positional feature scaling breaks across map sizes",
+      "severity": "minor",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Stage B \u2014 Rich representation",
+      "description": "Using a 'normalized index' for the spatial positional feature will break if normalized by the map's specific `nTiles`. A tile at index 150 would have a different feature value on Tiny vs Medium, destroying learned spatial semantics.",
+      "rationale": "For a model to generalize or evaluate fairly across map sizes, its input features must have a consistent domain and meaning regardless of the map's total size.",
+      "suggested_addition": "Specify that the `zeroBasedIndex` must be normalized by a fixed global constant (e.g., the absolute maximum possible tiles, like 2000) or use a standard sinusoidal embedding, rather than dividing by the current map's `nTiles`.",
+      "supporting_roles": [
+        "domain_fidelity"
+      ],
+      "supporting_lenses": [
+        "data_model"
+      ],
+      "source_excerpts": [
+        "normalized index positional feature"
+      ],
+      "event_id": "2cc0db31-320a-427b-9e49-8f57d7f43bc9"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "No timeout or failure handling on gradle gen/eval subprocess calls",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Operational",
+      "description": "run_loop drives long-running gradle `selfPlay gen/eval` subprocesses, but the brief never states what happens when a gradle invocation hangs, OOMs (jvmArgs -Xmx8G on a 1261-tile Medium map), or returns a partial/corrupt shard. v1 has `--gradle-timeout 1800` but the brief never says whether a timeout aborts the round, retries, or resumes from checkpoint.",
+      "rationale": "A single hung or OOM-killed gradle child mid-round, with no committed behavior, silently strands a multi-hour run \u2014 the exact 3am page where an on-call engineer has no runbook for whether to kill, resume, or restart from zero.",
+      "suggested_addition": "Add to Operational: 'Each gradle gen/eval call has a hard timeout (`--gradle-timeout`); on timeout or non-zero exit, the round is marked failed, the partial shard is discarded (CRC-validated before load), and the loop resumes from the last `.pt` checkpoint rather than re-running completed rounds. Medium-map -Xmx is raised/measured in the smoke run; an OOM is treated as a budget-stop, not a silent crash.'",
+      "supporting_roles": [
+        "cost_efficiency",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "business"
+      ],
+      "source_excerpts": [
+        "gradle selfPlay gen <model|random> <dir> <n> <maxTurns> <threads> <seed>",
+        "Hard budget + per-round checkpoint/resume; smoke-measure first; STOP at ceiling, report honestly"
+      ],
+      "event_id": "fd1775e2-24ca-4681-8e5d-b3b524070d24"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Checkpoint/resume correctness under partial-round failure is unspecified",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Operational",
+      "description": "D14 promises 'per-round .pt checkpoint + resumable loop' but the brief never defines the resume contract: is a checkpoint written atomically (tmp+rename) or can a crash mid-write leave a torn .pt? Does resume re-run a half-completed round's gen+eval, or trust an incomplete curve.csv row? What happens to shards on disk from the failed round (`--keep-shards 2` drops old ones)?",
+      "rationale": "An un-atomic checkpoint or an ambiguous resume boundary means a crash near the budget ceiling corrupts the only artifact that justifies hours of compute \u2014 and resume-from-corruption is the worst kind of silent data loss in a long unattended run.",
+      "suggested_addition": "Specify the resume contract: checkpoints written atomically (write `.pt.tmp` then rename); curve.csv rows appended only after a round fully completes (gen+train+export+eval); on resume, the loop reads `last_completed_round` from a state file and re-runs any round whose curve.csv row is absent; shards for an incomplete round are regenerated, not reused. State the RPO: at most one round of lost work.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "business"
+      ],
+      "source_excerpts": [
+        "Checkpoint/resume + observability (D14): per-round .pt + resumable loop; richer metrics file.",
+        "per-round .pt checkpoint + --resume"
+      ],
+      "event_id": "ef8700fb-e695-4f1f-abdc-102f16dd90a6"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "No divergence/instability detection or stopping signal during training",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Risks",
+      "description": "Risk #4 (GAE/value instability) is mitigated only by config knobs (advantage norm, c_v, clip, grad-norm logging) \u2014 there is no committed runtime guard that detects when the run has actually diverged (NaN loss, exploding grad_norm, value_loss blowup) and stops or alerts. The metrics are emitted but nothing acts on them.",
+      "rationale": "Logging grad_norm is observability, not a control loop; an unattended multi-hour run that silently NaNs at round 3 burns the entire compute budget producing garbage curves, and the operator finds out only at the budget ceiling.",
+      "suggested_addition": "Add an in-loop guard: if loss/value_loss is NaN/Inf or grad_norm exceeds a configured ceiling for N consecutive rounds, the loop aborts the run with a clear `DIVERGED` status and a pointer to the last healthy checkpoint, rather than continuing to consume budget. Make grad-norm clipping (not just logging) explicit if it isn't already.",
+      "supporting_roles": [
+        "domain_fidelity"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "GAE/value instability (bootstrap) | L\u00d7M | Advantage normalization, c_v=0.5, optional PPO clip when epochs>1, entropy bonus, grad-norm logging",
+        "emit per-round metrics: policy_loss, value_loss, entropy, mean_adv, mean_value, grad_norm"
+      ],
+      "event_id": "75d84cf0-b00b-45cd-8a48-552ccf872fb0"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Budget 'ceiling' has no concrete wall-clock number or enforcement mechanism",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Operational",
+      "description": "D13 is labeled HARD but the wall-clock ceiling is 'set a ceiling' / 'smoke-measure first' \u2014 no number is committed, and there's no stated mechanism that enforces the STOP (does the loop self-terminate at a wall-clock budget, or does it rely on a human watching?). Game counts are fixed but the dominant cost (Medium game length \u00d7 rounds) is left as 'bounded rounds'.",
+      "rationale": "A budget you can't measure against and a STOP nobody enforces is not a budget \u2014 it's how an 'overnight' run becomes a three-day run that pages someone to kill it, with the cost only discovered after the fact.",
+      "suggested_addition": "Commit a concrete wall-clock ceiling derived from the smoke measurement (e.g. 'STOP if cumulative wall-clock exceeds X hours OR Medium per-round exceeds Y minutes') and state that the loop checks elapsed time at each round boundary and self-terminates with a `BUDGET_STOP` status \u2014 not relying on a human watching. State who is notified and how when it stops.",
+      "supporting_roles": [
+        "cost_efficiency",
+        "product_manager"
+      ],
+      "supporting_lenses": [
+        "business"
+      ],
+      "source_excerpts": [
+        "Budget (D13, HARD): Tiny: 3 variants \u00d7 12 rounds \u00d7 (24 gen + 100 eval). Medium: 2 variants \u00d7 bounded rounds + ~200-game eval.",
+        "STOP at budget (report honestly even if borderline)"
+      ],
+      "event_id": "5798c0d6-3e51-4775-b706-7e77a15bdfeb"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Contract v1\u2192v2 hard break has no rollback story for in-flight artifacts",
+      "severity": "minor",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Risks",
+      "description": "Risk #5 says the v1-reinforce variant preserves the v1 path, but the brief never describes what happens operationally when a v2 .onnx is loaded against a v1-stamped runtime (or vice versa) mid-experiment, beyond 'provenance gate refuses'. There's no statement that a gate refusal fails loudly with an actionable message rather than a cryptic ORT error, and no note on regenerating perishable v1 artifacts if the v2 work needs to be reverted.",
+      "rationale": "The contract bump is the one place a deploy/rollback can silently mismatch model and runtime; the difference between a clear 'CONTRACT_VERSION 1 != 2, regenerate the model' message and an opaque tensor-shape exception is the difference between a 2-minute fix and a debugging session.",
+      "suggested_addition": "State that the provenance gate's refusal emits a structured, actionable error (expected vs actual schema_version / contract_version / fingerprint and 'regenerate the model for this contract'), and add a one-line rollback note: reverting to v1 requires regenerating the policy-only v1 .onnx (artifacts are perishable, not version-coexistent), and the v1-reinforce variant remains runnable from the preserved path for that purpose.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "Contract bump breaks v1 path / baseline | L\u00d7H | v1-reinforce variant preserves the exact v1 contract-v1 path; bump only affects rich-critic",
+        "Hard break vs v1 .onnx is expected (perishable artifacts)."
+      ],
+      "event_id": "04016dbe-4f02-4d13-a82a-e62ebe4b9105"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcome",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "AC3 does not isolate representation as the causal variable",
+      "severity": "critical",
+      "primary_lens": "business",
+      "target_file": "plan.md",
+      "target_section": "Stage B \u2014 Rich representation / Acceptance",
+      "description": "The brief claims `rich-critic` vs `blind-critic` answers whether seeing the board helps, but Stage B changes representation, contract, encoder architecture, and model capacity (`hidden\u2248256`) while Stage A says the blind trunk is unchanged. That means a win-rate lift cannot be attributed cleanly to richer observation.",
+      "rationale": "The core product promise is an attributable ablation curve. If the ablation is confounded, the team may ship a larger bridge/model and still not know whether board visibility created the outcome.",
+      "suggested_addition": "Add an attribution control: `For AC3, blind-critic and rich-critic must use the same optimizer, train/eval game counts, seeds, PPO settings, and a parameter-budget control. Either widen the blind critic to a comparable trunk size or add a capacity-matched blind-rich-control variant. AC3 is reported as representation lift only if rich beats the capacity-matched blind control; otherwise label the result as non-attributable.`",
+      "supporting_roles": [
+        "skeptic",
+        "domain_fidelity",
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "technical",
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "A model that consumes the FULL observation (map tiles + units + cities + opponents) should reach a higher win-rate where position matters (Medium map) \u2014 banked as `rich-critic` vs `blind-critic`.",
+        "`RichPolicyValueNet` \u2014 per-tile token MLP \u2192 masked mean+max pool; per-entity-type token MLP \u2192 masked mean+max pool; concat with global+acting_civ \u2192 trunk MLP \u2192 {tech, policy, value}. Modest (hidden\u2248256)."
+      ],
+      "event_id": "ca9f84d3-430c-49e8-ad33-e91627df8ed3"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcome",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "AC2 can pass with a stable but bad learner",
+      "severity": "major",
+      "primary_lens": "business",
+      "target_file": "plan.md",
+      "target_section": "Acceptance / Operationalized acceptance",
+      "description": "The convergence acceptance metric is only `blind-critic last-K=4 stddev < v1-reinforce`. A model with a flat low win-rate can pass because low variance is not the same as convergence or improved behavior.",
+      "rationale": "This measures curve smoothness, not whether the learner became meaningfully better. It risks declaring the value critic successful even if it merely stabilizes failure.",
+      "suggested_addition": "Strengthen AC2 to require both stability and non-regression: `PASS = blind-critic last-K=4 win-rate stddev < v1-reinforce AND blind-critic last-K mean win-rate >= v1-reinforce last-K mean win-rate - 2 percentage points. Also report rounds-to-first sustained threshold, e.g. win-rate >=60% for 3 of 4 rounds, if either variant reaches it.`",
+      "supporting_roles": [
+        "skeptic",
+        "domain_fidelity",
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "Convergence stat: last-K=4 win-rate stddev (blind-critic < v1-reinforce).",
+        "AC2 blind-critic last-K=4 stddev < v1-reinforce"
+      ],
+      "event_id": "8de069f7-2877-4a38-8cb9-cdb9ed71e5fc"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcome",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Acceptance conflicts with the hard compute budget",
+      "severity": "critical",
+      "primary_lens": "business",
+      "target_file": "plan.md",
+      "target_section": "Operational / Acceptance",
+      "description": "The brief says to run to acceptance, but also says to stop at a hard budget and report honestly even if borderline. It does not define whether a failed AC2/AC3 due to budget is a failed feature, an accepted research result, or a retry requiring more budget.",
+      "rationale": "This is a stakeholder contract problem. Engineering needs to know whether they are building a production capability with pass/fail gates or running an experiment whose valid output may be 'no lift observed within budget.'",
+      "suggested_addition": "Add an explicit launch decision rule: `This feature is accepted if implementation gates AC4-AC7 pass and the run produces attributable curves within the approved budget. AC2/AC3 are outcome hypotheses: if they fail within budget, the deliverable is accepted as an honest negative/neutral experimental result only if the confidence intervals, seeds, game counts, and logs are complete. Requesting additional training budget requires a separate approval.` Also specify the wall-clock ceiling and exact Medium round count before Phase 3 starts.",
+      "supporting_roles": [
+        "cost_efficiency",
+        "skeptic",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "Training scope: \"Build + full run to acceptance.\"",
+        "Smoke-measure per-round wall-clock, set a ceiling, STOP at budget (report honestly even if borderline)."
+      ],
+      "event_id": "359777a6-0a1f-48af-859d-e5f8992e0fe4"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcome",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Medium-vs-RandomPolicy assumes position matters without proving it",
+      "severity": "major",
+      "primary_lens": "business",
+      "target_file": "plan.md",
+      "target_section": "The two questions this answers / Stage C \u2014 Eval",
+      "description": "The brief assumes Medium maps against RandomPolicy are the right environment to test whether board visibility matters. If RandomPolicy is too weak, too noisy, or blind features already dominate, the rich model may show no lift for reasons unrelated to representation value.",
+      "rationale": "The outcome metric is only meaningful if the eval setting has enough headroom and positional sensitivity. Without a pre-check, AC3 can fail or pass for the wrong reason.",
+      "suggested_addition": "Add a pre-registered eval sanity check: `Before interpreting AC3, run the fixed RandomPolicy baseline and v1/blind late-round baselines on Medium. AC3 is considered interpretable only if blind-critic is not already at ceiling, e.g. last eval win-rate <85%, and Medium games show non-trivial duration/decision diversity. If ceiling is reached, report AC3 as inconclusive and do not claim representation has no value.`",
+      "supporting_roles": [
+        "domain_fidelity",
+        "qa_testing",
+        "skeptic"
+      ],
+      "supporting_lenses": [
+        "technical",
+        "user"
+      ],
+      "source_excerpts": [
+        "A model that consumes the FULL observation (map tiles + units + cities + opponents) should reach a higher win-rate where position matters (Medium map)",
+        "Add Medium training+eval for `blind-critic` vs `rich-critic`; two-proportion z-test sized for p<0.05 (~200 eval games)."
+      ],
+      "event_id": "7e1399cb-85a5-4376-9bec-d44e5ab00ea1"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcome",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "No real P0/P1 cut line across the three stages",
+      "severity": "major",
+      "primary_lens": "business",
+      "target_file": "plan.md",
+      "target_section": "Delivery in three stages",
+      "description": "The brief lists Stage A, B, and C as independently verifiable, but it does not say which stage is the minimum shippable outcome or which capabilities are launch-blocking versus nice-to-have. Items like PPO clipping, checkpoint/resume, rich contract parity, Medium eval, and richer metrics are all presented in the same commitment voice.",
+      "rationale": "If schedule or compute slips, the team has no priority truth to guide cuts. That usually results in either overbuilding the bridge before banking the critic learning or weakening acceptance criteria late.",
+      "suggested_addition": "Add a priority table: `P0 launch-blocking: v1-reinforce baseline preservation, blind-critic GAE trajectory training, value-head dropped from export, AC1/AC2 Tiny curves, determinism/provenance/legality, terminal-only reward. P1: rich-critic contract v2 + multi-tensor parity + Medium AC3. P2: PPO K>1 if A2C K=1 is stable, extra metrics beyond required observability, plot polish. If Stage B slips, ship Stage A as an attributable convergence release rather than partially landing contract v2.`",
+      "supporting_roles": [
+        "practitioner",
+        "cost_efficiency",
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "cross_cutting",
+        "technical"
+      ],
+      "source_excerpts": [
+        "Delivery in three stages (each independently verifiable)",
+        "Stage A \u2014 Value critic on the blind input ... Stage B \u2014 Rich representation ... Stage C \u2014 Eval"
+      ],
+      "event_id": "35d8a63e-3945-4ded-9f98-20952f2a4570"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "No edge-case specification for empty entity blocks / zero explored tiles",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Stage B \u2014 Rich representation, Acceptance criteria (AC1-AC7)",
+      "description": "The plan does not define what the model should output when entity blocks have zero elements (e.g., no own units, no own cities, entirely unexplored map). The masked pooling may produce ambiguous or undefined vectors, and the parity test does not explicitly include empty-block scenarios.",
+      "rationale": "Empty inputs are a common source of inference-time failures and parity drift. QA needs a concrete definition: for a block with count 0, the pooled feature must be a zero vector of the expected dimension, and the presence mask must be all zeros. Without this, AC4 (parity) cannot be tested for these realistic corner cases.",
+      "suggested_addition": "Add a bullet under Stage B or AC4: 'When an entity block is empty (count=0), the corresponding pooled feature is a zero vector of the fixed dimension, and its presence mask is all zeros. The parity test MUST include at least one game step where each variable-count block (own_units, opp_units, own_cities, opp_cities, civ_tokens, diplo_edges) is empty, and the spatial block contains only never-explored tiles (all-zero spatial channels) yielding a fully empty validity mask.'",
+      "supporting_roles": [
+        "qa_testing",
+        "architect"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "spatial nTiles\u00d713 \u2192 per-tile token set (13 channels + normalized index positional feature) + a validity mask (explored tiles); padded to batch-max nTiles.",
+        "entity blocks (own_units, opp_units, own_cities, opp_cities, civ_tokens, diplo_edges) \u2192 per-type padded token sets + presence masks (present-only on disk \u2192 padded to batch-max)."
+      ],
+      "event_id": "105864f8-dcfd-42b8-9996-e3213402fff8"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "AC1 'attributable curves' is not testable as written \u2014 lacks operational definition",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Acceptance (operationalized \u2014 see decisions.md D12)",
+      "description": "Acceptance criterion AC1 states 'attributable curves (shared harness/opponent/seeds, only named axis differs)' but does not specify what makes a curve 'attributable' or how to verify it. A test engineer cannot write a test from this description alone.",
+      "rationale": "Testability requires a concrete assertion. AC1 should be expressed as a verifiable condition, e.g., 'the same seeds, opponent, and map are used across all variants; the curve .csv files differ only by the variant column and can be diff'd to confirm.' Without that, the acceptance gate is subjective.",
+      "suggested_addition": "Refine AC1: 'Attributable curves: For each variant, the run loop must accept a common seed set (gen_seed, eval_seed) and produce a curve.csv and curve.png. A test script shall verify that all variant curve.csv files have identical non-variant columns (round, games, winrate, pval, n_steps, loss, ret_pos, onnx_decisions) for the same round index, differing only in the variant name. This confirms the only axis of variation is the algorithm/representation.'",
+      "supporting_roles": [
+        "qa_testing",
+        "architect"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "AC1 attributable curves (shared harness/opponent/seeds, only named axis differs) \u00b7 AC2 blind-critic last-K=4 stddev < v1-reinforce \u00b7 AC3 rich>blind on Medium at p<0.05 (or stated) \u00b7 AC4 multi-tensor parity atol=1e-4 \u00b7 AC5 determinism+provenance+contract bump \u00b7 AC6 legality green \u00b7 AC7 terminal-only reward (grep/assert)."
+      ],
+      "event_id": "6067f366-9ae9-4c64-a854-96c639f64cef"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Spatial validity mask derivation not specified \u2014 parity risk",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Stage B \u2014 Rich representation, AC4",
+      "description": "The brief mentions a 'validity mask (explored tiles)' for the spatial input but never defines how to compute it from the spatial channels. For parity (atol=1e-4), the mask must be computed identically in Python (dataset) and Kotlin (OnnxPolicy), yet the derivation rule is missing.",
+      "rationale": "Parity drift between JVM and Python is a known risk. A missing mask specification is a prime source of drift. QA needs an unambiguous rule to base the parity test on \u2014 otherwise the test can't verify the mask component, only the final logits, and a subtle mask difference could be washed out by pooling.",
+      "suggested_addition": "Specify: 'The validity mask is a boolean array of length nTiles, derived from spatial channel 0 (visibility_state): 1 if the channel value > 0 (tile has been explored), 0 otherwise. Both the Python dataset loader and the Kotlin OnnxPolicy must generate this mask using that exact rule. The parity test shall assert bitwise equality of the mask tensor between JVM and Python for a shared dump.'",
+      "supporting_roles": [
+        "qa_testing",
+        "architect"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "spatial nTiles\u00d713 \u2192 per-tile token set (13 channels + normalized index positional feature) + a validity mask (explored tiles); padded to batch-max nTiles."
+      ],
+      "event_id": "0e62f283-3461-4399-b7cb-8b514ba6a1a0"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Determinism of tile ordering (zeroBasedIndex) not verified \u2014 parity risk",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Decisions \u2014 D3, Parity test",
+      "description": "The plan relies on normalized zeroBasedIndex as the positional feature for the tile token set. The deep scan reveals that zeroBasedIndex is tile-insertion order, which may not be guaranteed deterministic across runs or between JVM and Python dataset parsing. The plan does not verify that the order is stable and consistent, yet parity requires that every tile's position in the spatial block maps to the same index in both environments.",
+      "rationale": "If tile ordering drifts between JVM and Python, the positional feature values differ, breaking parity. QA must have a test that for a fixed game seed, the tile order in the spatial block is byte-identical between a JVM dump and the Python dataset loader. Without this test, the positional feature is untrustworthy.",
+      "suggested_addition": "Add a pre-condition to the parity test: 'Before testing logit parity, verify tile-level parity: generate a shard from a known map seed, load the spatial block in Python, and compare the tile order (by index) with the order produced by Featurizer.buildSpatial on the same game scenario. Assert that the nTiles\u00d713 array is byte-identical (or atol=0). If the order is not deterministic, the positional feature must be dropped (use per-tile tokens only) to preserve parity.'",
+      "supporting_roles": [
+        "qa_testing",
+        "architect"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "per-tile token set (13 channels + normalized index positional feature)",
+        "Tile.zeroBasedIndex = tile-insertion order (TileMap.kt:610-617)"
+      ],
+      "event_id": "f9edb12b-625b-44bc-a6a5-b8e4eb7351d5"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "No test for map-size parameterization (Medium) beyond smoke check",
+      "severity": "minor",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Stage C \u2014 Eval, Operational (D13)",
+      "description": "The plan adds a Medium map size for the AC3 ceiling test, parametrized by a CLI argument. There is no explicit acceptance test that the Medium map configuration is correctly threaded through the entire pipeline (SelfPlayRunner \u2192 runner loop \u2192 dataset dimensions \u2192 model capacity). Only a compute-budget smoke measure is mentioned.",
+      "rationale": "Parametrization bugs often surface only at runtime. While the parity test atol covers inference, it doesn't confirm that the training round uses correct nTiles, entity caps, or map-specific parameters. A simple end-to-end test of a single round with a Medium map would catch configuration drift before the long run.",
+      "suggested_addition": "Add under acceptance criteria: 'AC8 \u2014 Medium map smoke test: run one full round (gen + train + eval) with variant rich-critic on Medium, confirm that the round completes without error and that curve.csv records the map size. This test can be part of the CI or run once before the full budgeted run.'",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "Map-size CLI param (SelfPlayRunner.mapParameters(seed, mapSize)), threaded through gen/eval. Keep Tiny win-rate-vs-RandomPolicy + binomial harness (comparability). Add Medium training+eval for blind-critic vs rich-critic"
+      ],
+      "event_id": "ee49b01c-d42a-4f20-9a2f-86628d1682d6"
+    },
+    {
+      "role_id": "security_red_team",
+      "role_lens": "red-team",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "No untrusted-input boundary on JVM-emitted multi-tensor obs fed to ORT",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Stage B \u2014 item 10 (OnnxPolicy.kt) / item 11 (parity)",
+      "description": "The JVM builds named multi-tensors directly from live Observation block data (variable entity counts, variable nTiles, u8\u2192f32 spatial) and feeds them to session.run with no validation of tensor shapes, counts-vs-mask consistency, or value ranges before the ONNX call. A malformed or adversarially-sized shard/observation (e.g. entity count exceeding SampleCaps, a presence mask that disagrees with the token count, a spatial block whose length \u2260 nTiles\u00d713) becomes an unchecked tensor.",
+      "rationale": "In an LLM/ML-bridge system the model input is the trust boundary; an out-of-contract tensor either crashes the runner mid-budget-burn or, worse, silently produces garbage logits that pass legality masking and corrupt the attributable curve. The contract-version gate only checks metadata, not the per-run tensor inventory it claims to validate.",
+      "suggested_addition": "Add to item 10/Provenance gate: before session.run, assert each named tensor's shape against the contract (spatial.len == nTiles*13, every entity token count == its presence-mask length and \u2264 SampleCaps cap, no NaN/Inf after u8\u2192f32). On violation, fail closed (heuristic fallback or hard error) rather than feeding a malformed tensor. Add a Kotlin test feeding a count/mask-mismatched and an over-cap observation.",
+      "supporting_roles": [
+        "practitioner",
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "build the SAME multi-tensor input from the live `Observation` (reuse `block(name)` + VARIABLE counts; feed u8 spatial as f32)",
+        "Provenance gate validates contract v2 + tensor inventory"
+      ],
+      "event_id": "44f90df7-a6bd-4956-88d0-3c897a83ee6c"
+    },
+    {
+      "role_id": "security_red_team",
+      "role_lens": "red-team",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Parity harness ingests attacker-influenceable JSON of named arrays with no schema guard",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Stage B \u2014 item 11 (parity-dump/parity-run) + Tests",
+      "description": "parity-dump/parity-run switch from a single 199-float CSV to 'JSON of named arrays' parsed on both the Kotlin and Python sides, but the brief specifies no validation of which keys are present, array dtypes, lengths, or that the JSON is the only thing controlling tensor shapes. A crafted parity JSON (wrong key set, mismatched lengths, huge dimensions) is parsed straight into ORT tensors.",
+      "rationale": "The parity path is the AC4 anti-drift gate \u2014 if it accepts arbitrary JSON shapes, an undetected shape mismatch can make Python and JVM 'agree' on garbage (both wrong the same way) or DoS the harness. A free-form JSON parser feeding a tensor allocator is a classic untrusted-deserialization surface.",
+      "suggested_addition": "Specify a strict parity JSON schema: required key set == contract v2 tensor inventory, each array dtype/length validated against contract dims, reject unknown keys, and cap total element count. test_parity.py must include a negative case (malformed/oversized parity JSON \u2192 rejected, not silently tensorized).",
+      "supporting_roles": [
+        "qa_testing",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "dump/run the multi-tensor obs (JSON of named arrays) instead of the single 199-vector",
+        "`test_parity.py` (multi-tensor)"
+      ],
+      "event_id": "41f8e4ef-76f6-436c-a0ac-baec629e18af"
+    },
+    {
+      "role_id": "security_red_team",
+      "role_lens": "red-team",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Checkpoint/resume loads untrusted .pt via torch.load \u2014 arbitrary code execution path",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Operational \u2014 D14 / Stage A item 5 (--resume)",
+      "description": "Per-round `.pt` checkpoints with a resumable loop imply torch.load on disk artifacts at resume time. The brief never states how checkpoints are loaded; default torch.load uses pickle, which executes arbitrary code on deserialization of any tampered or path-confused .pt file.",
+      "rationale": "An attacker who can drop a file into the training-runs directory (or a poisoned shared checkpoint) gains code execution in the training process when --resume picks it up. This is the standard ML-pipeline supply-chain/IDOR-on-the-filesystem vector and it's invisible in a feature brief that just says 'per-round .pt + --resume'.",
+      "suggested_addition": "State explicitly that checkpoint loading uses `torch.load(..., weights_only=True)` (or a state_dict-only path), validates the round/variant metadata embedded in the checkpoint matches the requested run, and refuses checkpoints whose contract/schema fingerprint mismatches the current variant before restoring optimizer/model state.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical",
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "per-round `.pt` checkpoint + `--resume`",
+        "Checkpoint/resume + observability (D14): per-round `.pt` + resumable loop"
+      ],
+      "event_id": "77c8bee3-67e9-423d-8553-951578335c88"
+    },
+    {
+      "role_id": "security_red_team",
+      "role_lens": "red-team",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Value-head-dropped-at-export invariant has no defense against information re-derivation, only a presence test",
+      "severity": "minor",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Stage A item 4 / D9 (value head training-only)",
+      "description": "The only check on the value-head invariant is a negative test that the exported ONNX has no `value` output. But the shared trunk that feeds the value head is exported intact; if the trunk's penultimate activations leak (e.g. via an unintended extra output or graph node left in), an adversary inspecting the .onnx could recover value-like signal. The brief asserts 'provably dropped' but only tests output-name absence.",
+      "rationale": "From a red-team lens, 'no output named value' is not the same as 'the value computation and its weights are absent from the graph.' For an attributable research artifact this is low-stakes, but the claim 'provably dropped' overstates the actual guarantee the test provides.",
+      "suggested_addition": "Tighten the negative test (and the D9 wording) to assert the exported graph contains no value_head weights/nodes (inspect initializers + node names), not merely that no output is named `value`. Or downgrade the 'provably dropped' claim to 'output-suppressed'.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "value head is **training-only** \u2014 export drops it",
+        "**Negative test**: exported model has no `value` output"
+      ],
+      "event_id": "cd15e6da-658b-45f0-b025-c856d859ad65"
+    },
+    {
+      "role_id": "security_red_team",
+      "role_lens": "red-team",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Padding-to-batch-max creates a cross-trajectory contamination path in the masked pools",
+      "severity": "minor",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Stage B item 7-8 (features.py / RichPolicyValueNet pooling)",
+      "description": "Entity/tile token sets are 'present-only on disk \u2192 padded to batch-max' and pooled with presence/validity masks. If any masked-max (or mean) reduction does not strictly zero out padded slots before pooling \u2014 a common off-by-one when pad value is 0 rather than \u2212inf for max-pool \u2014 one game's padded region can leak a non-zero contribution into another's pooled vector within the same batch.",
+      "rationale": "A pooling mask bug is silent: it never throws, passes legality, and just degrades or subtly cross-contaminates the per-state credit the whole convergence claim rests on. It's also exactly the kind of mask-vs-pad mismatch that produces JVM\u2194Python parity drift the atol=1e-4 gate is supposed to catch but might not if both sides share the bug.",
+      "suggested_addition": "Specify the masked-pool semantics precisely in features.py/model.py: masked-mean divides by the true present count (never zero-div on an all-padded type), masked-max uses \u2212inf fill for padded slots, and add a unit test asserting that padding extra (masked) tokens does not change a token set's pooled output. Make this property part of the GAE/feature test file.",
+      "supporting_roles": [
+        "qa_testing",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "per-type padded token sets + presence masks (present-only on disk \u2192 padded to batch-max)",
+        "masked mean+max pool"
+      ],
+      "event_id": "c253cfa2-d92f-46ad-abae-137d0b32b42a"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "GAE temporal sequence broken by no-action step filtering",
+      "severity": "critical",
+      "primary_lens": "technical",
+      "target_file": "plan.md",
+      "target_section": "Stage A \u2014 Value critic on the blind input",
+      "description": "If `dataset.py` filters out steps where no action was taken (both heads = -1) before computing GAE, the temporal sequence is broken and the TD error will bootstrap from the wrong future state.",
+      "rationale": "GAE relies on contiguous state transitions ($s_t \\to s_{t+1}$) to accurately compute value targets. Skipping intermediate states artificially shortens the horizon and corrupts credit assignment.",
+      "suggested_addition": "Explicitly state that `TrainTrajectory` must retain ALL learner steps (including no-action steps) for the GAE computation. Only mask out the policy loss for those steps during the optimization phase.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "add a trajectory loader that returns ordered per-game learner-step sequences",
+        "Reuse _masked_logp + \u22121/no-action handling VERBATIM."
+      ],
+      "event_id": "9b028f7e-2194-4079-9b71-dd6581491416"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Advantage normalization on single trajectories destroys reward signal",
+      "severity": "critical",
+      "primary_lens": "technical",
+      "target_file": "plan.md",
+      "target_section": "Stage A \u2014 Value critic on the blind input",
+      "description": "Normalizing advantages across a batch that contains only a single trajectory will force half of the steps to have negative advantages, even in a perfectly played winning game.",
+      "rationale": "Advantage normalization requires a diverse batch of multiple games (wins and losses) to establish a meaningful mean. Normalizing per-trajectory penalizes below-average actions in a winning game, fundamentally altering the RL semantics.",
+      "suggested_addition": "Specify that advantage normalization must only be applied across a large minibatch drawn from multiple trajectories. If training is executed strictly per-trajectory, advantage normalization must be disabled.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "per trajectory compute \u03b4_t = ... advantage A_t",
+        "normalize advantages (batch)"
+      ],
+      "event_id": "5e2d3533-abb8-483b-bd01-ec0262360314"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "NaN gradients in masked pooling for empty entity sets",
+      "severity": "critical",
+      "primary_lens": "technical",
+      "target_file": "plan.md",
+      "target_section": "Stage B \u2014 Rich representation",
+      "description": "Applying masked mean and max pooling to an entity type that is completely absent (e.g., 0 opponent cities met) will result in divide-by-zero and `-inf` values, causing NaN gradients.",
+      "rationale": "In RL environments with dynamic entity counts, empty sets are guaranteed to occur. Standard PyTorch pooling operations do not natively handle all-zero masks and will crash the training loop.",
+      "suggested_addition": "Add an explicit fallback in the masked pooling logic: if the presence mask sum is 0 for a given entity type, return a zero vector instead of computing the mean/max.",
+      "supporting_roles": [
+        "architect"
+      ],
+      "supporting_lenses": [
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "per-type padded token sets + presence masks",
+        "per-entity-type token MLP \u2192 masked mean+max pool"
+      ],
+      "event_id": "5bf458b5-d8e8-479f-b165-83c697b2e43b"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Entropy bonus numerical instability on masked/inactive heads",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "plan.md",
+      "target_section": "Stage A \u2014 Value critic on the blind input",
+      "description": "Computing entropy over logits padded with `-1e9` can cause numerical instability ($p \\log p$ with tiny probabilities). Furthermore, applying an entropy bonus to a head that isn't acting adds meaningless noise.",
+      "rationale": "Maximizing entropy for a head that isn't making a decision in the current step degrades the policy gradient. The entropy calculation must respect both the legality mask and the action-presence mask.",
+      "suggested_addition": "Specify that the entropy bonus is only computed over legal actions (safely masking out `-1e9` logits) and is only applied to heads that are actively taking an action in the current step.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "entropy bonus; total = policy + c_v\u00b7value \u2212 c_ent\u00b7entropy",
+        "Reuse _masked_logp + \u22121/no-action handling VERBATIM."
+      ],
+      "event_id": "e45a0390-951e-4584-9f2b-7a560aa99730"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "zeroBasedIndex as a positional feature risks overfitting",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "plan.md",
+      "target_section": "Stage B \u2014 Rich representation",
+      "description": "Using `zeroBasedIndex` as a positional feature provides no geometric locality, as the deep scan confirms it is merely the map generator's insertion order.",
+      "rationale": "Feeding insertion order as a spatial feature gives the network a pseudo-random scalar. This provides no spatial relationships and risks the model overfitting to the specific iteration logic of the map generator.",
+      "suggested_addition": "Remove the 'normalized index positional feature' and treat the spatial tiles as a pure permutation-invariant set, or explicitly document that it acts as a non-geometric set identifier rather than a spatial coordinate.",
+      "supporting_roles": [
+        "architect"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "normalized index positional feature",
+        "per-tile token set (13 channels + normalized index positional feature)"
+      ],
+      "event_id": "4d5227e2-2215-4bb5-b5e9-08b0ff8620a3"
+    },
+    {
+      "role_id": "ethics_responsible_ai",
+      "role_lens": "ml-failure-mode",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Brief lacks explicit ethical/societal risk consideration, including dual-use",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Risks",
+      "description": "The risk table only lists technical risks (compute, convergence, parity). There is no mention of ethical or societal risks, such as potential misuse of the trained policy for cheating or unfair advantage, or broader dual-use concerns. The decisions log later addresses dual-use, but the brief itself should acknowledge the consideration.",
+      "rationale": "Even in a research artifact, responsible AI practice requires surfacing potential downstream harms early; omitting them signals that the question was never asked. Explicitly noting the low risk (as later docs do) demonstrates that the team considered second\u2011order effects.",
+      "suggested_addition": "Add a risk entry to the table, e.g.:\n\u201c#: Misuse / dual\u2011use \u2014 the trained model could be used as a cheat bot or repurposed in contexts the team did not intend. Likelihood low; severity low for this research phase. Mitigation: project is an isolated self\u2011play pipeline with no direct user exposure; any future deployment would require a dedicated safety review.\u201d",
+      "supporting_roles": [
+        "security_red_team"
+      ],
+      "supporting_lenses": [
+        "ethics_responsible_ai"
+      ],
+      "source_excerpts": [
+        "| # | Risk | L\u00d7S | Mitigation |",
+        "| 5 | Contract bump breaks v1 path / baseline | L\u00d7H | v1\u2011reinforce variant preserves ... |"
+      ],
+      "event_id": "da898874-d7b8-402b-aafb-3987fd87c80b"
+    },
+    {
+      "role_id": "cost_efficiency",
+      "role_lens": "compute-cost",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Medium run budget is not numerically bounded",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Operational",
+      "description": "The Tiny budget is explicit, but the Medium budget is described as \"bounded rounds\" without a round count, game count per round, wall-clock ceiling, hardware profile, or dollar ceiling. Because AC3 depends on a statistical comparison that may fail, the plan can quietly turn into repeated Medium retraining/eval attempts until the bill is surprising.",
+      "rationale": "Medium games are the cost driver here, not code complexity. A hard FinOps budget needs an actual max spend/time envelope before implementation, otherwise \"full run to acceptance\" is effectively open-ended.",
+      "suggested_addition": "Add a Medium compute envelope: `Medium max = N training rounds per variant, M gen games/round, E lightweight eval games/round, one final 200-game eval per candidate, max wall-clock H hours on hardware X, max estimated cost $Y. If AC3 is not met inside this envelope, stop and report INCONCLUSIVE rather than extending the run.`",
+      "supporting_roles": [
+        "practitioner",
+        "business"
+      ],
+      "supporting_lenses": [
+        "technical",
+        "business"
+      ],
+      "source_excerpts": [
+        "Medium: 2 variants \u00d7 bounded rounds + ~200-game eval.",
+        "Smoke-measure per-round wall-clock, set a ceiling, STOP at budget"
+      ],
+      "event_id": "4cc96b6d-9805-4707-b166-8cadde9cdf7b"
+    },
+    {
+      "role_id": "cost_efficiency",
+      "role_lens": "compute-cost",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "PPO K=4 multiplies trainer cost without a promotion rule",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Stage A \u2014 Value critic on the blind input",
+      "description": "The brief defaults to PPO with K=4 inner epochs, which can roughly quadruple training-side forward/backward compute versus single-epoch A2C. It does not state when that extra compute is justified, whether K=1 is the default smoke path, or what metric promotes a variant to K=4.",
+      "rationale": "With small on-policy batches, the extra epochs may be worth it, but they should be purchased deliberately. Otherwise the team can spend 4x compute before proving PPO improves win-rate variance or sample efficiency.",
+      "suggested_addition": "Add a PPO cost gate: `Run first smoke curves with K=1 A2C. Enable PPO K=4 only if K=1 shows value instability, policy collapse, or late-round variance above threshold after S smoke rounds. Record train_seconds/learner_step for K=1 and K=4, and include the chosen K in curve.csv so cost-per-win-rate-point is attributable.`",
+      "supporting_roles": [
+        "practitioner",
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "optional PPO clip (\u03b5=0.2) with K inner epochs (K=4 default; ratio = exp(new_logp \u2212 old_logp.detach())); single-epoch A2C when K=1",
+        "Tiny: 3 variants \u00d7 12 rounds \u00d7 (24 gen + 100 eval). Medium: 2 variants \u00d7 bounded rounds + ~200-game eval."
+      ],
+      "event_id": "76cbd3af-9d54-4f4c-bc48-dc8002984bd9"
+    },
+    {
+      "role_id": "cost_efficiency",
+      "role_lens": "compute-cost",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Padding strategy lacks token/step cost controls",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Stage B \u2014 Rich representation",
+      "description": "The rich loader pads spatial and entity tensors to batch-max counts, but the brief does not define batching buckets, max token budgets, or metrics for wasted padded tokens. On Medium maps, spatial alone is about 1261 tile tokens per step, and variable entities can make a few large games inflate every batch.",
+      "rationale": "For this model, compute cost is proportional to tokens processed per learner step, not just number of games. Without token-count tracking, the team cannot tell whether rich representation is learning better or merely burning more CPU on padding.",
+      "suggested_addition": "Add batching guardrails: `Bucket training batches by map size and similar entity counts; cap total tokens per batch; emit tiles_per_step, entity_tokens_per_step, padded_token_ratio, train_seconds_per_1k_tokens, and train_seconds_per_1k learner steps. Fail the smoke run if padded_token_ratio exceeds X% or memory exceeds Y GB.`",
+      "supporting_roles": [
+        "architect",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "spatial nTiles\u00d713 \u2192 per-tile token set ... padded to batch-max nTiles",
+        "entity blocks ... \u2192 per-type padded token sets + presence masks (present-only on disk \u2192 padded to batch-max)"
+      ],
+      "event_id": "c45745ed-d024-4d1b-9080-05b2105e90c8"
+    },
+    {
+      "role_id": "cost_efficiency",
+      "role_lens": "compute-cost",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "High-N Medium eval should be final-gated, not per-round by default",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Stage C \u2014 Eval",
+      "description": "The plan calls for a ~200-game Medium eval for p<0.05 but does not say whether that happens every round, every checkpoint, or only once at the end. If applied per round, evaluation can dominate compute spend and slow feedback loops.",
+      "rationale": "Statistical confidence is valuable, but buying 200 Medium games repeatedly before a model is plausibly competitive is waste. A staged eval schedule keeps cost proportional to decision value.",
+      "suggested_addition": "Add an eval schedule: `Use low-cost per-round Medium eval, e.g. 25\u201350 games, to track trend only. Run the ~200-game two-proportion z-test only for the final selected checkpoint or when rich exceeds blind by a predeclared margin in lightweight eval. Record eval_games, eval_seconds, and cost_per_eval_game in curve.csv.`",
+      "supporting_roles": [
+        "qa_testing",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical",
+        "business"
+      ],
+      "source_excerpts": [
+        "Add Medium training+eval for `blind-critic` vs `rich-critic`; two-proportion z-test sized for p<0.05 (~200 eval games).",
+        "Medium: 2 variants \u00d7 bounded rounds + ~200-game eval."
+      ],
+      "event_id": "a232f08a-1c96-4de0-92ec-f1aba54c677b"
+    },
+    {
+      "role_id": "cost_efficiency",
+      "role_lens": "compute-cost",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Shard/checkpoint retention lacks a storage budget",
+      "severity": "minor",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Operational",
+      "description": "The brief adds per-round checkpoints, rich multi-tensor parity dumps, and Medium shards, but it does not specify retention, compression, or a maximum run directory size. Rich Medium trajectories can become the hidden cost even when compute is bounded.",
+      "rationale": "Storage is usually cheap until iterative ML runs leave many GB of shards and checkpoints in every failed experiment. A retention policy prevents cloud/workstation disk surprises and keeps reruns reproducible without hoarding every artifact.",
+      "suggested_addition": "Add artifact retention rules: `Keep last K shard directories per variant, all curve.csv/metrics, final ONNX, and selected checkpoints only; compress or delete raw Medium shards after training unless marked for repro. Emit run_dir_bytes per round and stop/cleanup when size exceeds Z GB.`",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "per-round `.pt` checkpoint + `--resume`",
+        "SelfPlayRunner.kt parity-dump/parity-run: dump/run the multi-tensor obs (JSON of named arrays)"
+      ],
+      "event_id": "66400a7b-79cc-4632-8969-3aca5fb58138"
+    }
+  ]
+}
