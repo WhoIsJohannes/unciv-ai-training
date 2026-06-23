@@ -6,7 +6,6 @@ import com.unciv.logic.GameInfo
 import com.unciv.logic.GameStarter
 import com.unciv.logic.automation.Timers
 import com.unciv.logic.simulation.dataplane.DataPlaneHooks
-import com.unciv.logic.simulation.dataplane.ShardRecorder
 import com.unciv.models.metadata.GameSetupInfo
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.Dispatchers
@@ -14,7 +13,6 @@ import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlin.math.max
-import kotlin.math.sqrt
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.ExperimentalTime
@@ -28,6 +26,13 @@ class Simulation(
     private val statTurns: List<Int> = listOf(),
     /** Opt-in self-play data plane. Null ⇒ existing behavior (no featurization, no shards). */
     private val dataPlane: com.unciv.logic.simulation.dataplane.DataPlaneContext? = null,
+    /** Self-play win rule (D7): when a game reaches the turn cap with no formal victory, award the
+     *  win to the highest-score alive major (draw on a tie). Off ⇒ legacy "Draw at cap" behavior,
+     *  so ConsoleLauncher/SimBenchmark are unchanged. Set by the self-play GENERATE + EVAL runner. */
+    private val scoreLeaderOnTimeout: Boolean = false,
+    /** Base seed offset for the self-play data-plane path so each loop ROUND generates different
+     *  games (and EVAL reproduces with a fixed base). 0 ⇒ legacy per-(thread,iteration) seeds. */
+    private val seedBase: Long = 0,
 ) {
     private val maxSimulations = threadsNumber * simulationsPerThread
     private val majorCivs = newGameInfo.civilizations.filter { !it.isSpectator() && it.isMajorCiv() }.map { it.civID }
@@ -111,21 +116,21 @@ class Simulation(
                     // Determinism: the data-plane path uses a non-zero seed + seeded shuffle so a
                     // recorded scenario replays byte-identically. Default benchmark path keeps seed=0.
                     if (dataPlane != null) {
-                        gameSetupInfo.mapParameters.seed = (threadId.toLong() shl 20) + iteration + 1
+                        gameSetupInfo.mapParameters.seed = seedBase + (threadId.toLong() shl 20) + iteration + 1
                         gameSetupInfo.gameParameters.deterministicShuffle = true
                     } else {
                         gameSetupInfo.mapParameters.seed = 0
                     }
                     val gameInfo = GameStarter.startNewGame(gameSetupInfo)
 
-                    // Data-plane hook (open shard): deterministic gameId + register a per-game recorder.
-                    var recorder: ShardRecorder? = null
+                    // Data-plane hook (register): the installed policy CONTROLS this game's deciding
+                    // civs (tech+policy); shards are EMITTED only when the emitter is enabled
+                    // (GENERATE). EVAL registers for control with emit=false (no shards).
                     if (dataPlane != null) {
                         gameInfo.gameId = "$workerName-$iteration"
-                        recorder = ShardRecorder(gameInfo, dataPlane.vocab, dataPlane.config,
+                        DataPlaneHooks.registerGame(gameInfo, dataPlane.vocab, dataPlane.config,
                             dataPlane.fingerprint, gameInfo.gameId, gameSetupInfo.mapParameters.seed,
-                            "shard-$workerName-$iteration")
-                        DataPlaneHooks.register(gameInfo, recorder)
+                            "shard-$workerName-$iteration", emit = dataPlane.config.enabled)
                     }
 
                     gameInfo.simulateUntilWin = true
@@ -151,14 +156,15 @@ class Simulation(
                         step.winner = step.currentPlayer
                         println("${step.winner} won ${step.victoryType} victory on turn ${step.turns}")
                     } else {
-                        println("Max simulation ${step.turns} turns reached: Draw")
+                        // Self-play win rule (D7): decide a turn-cap game by total score (draw on a tie).
+                        if (scoreLeaderOnTimeout)
+                            step.winner = com.unciv.logic.simulation.SimStats.scoreLeader(gameInfo)?.civID
+                        println("Max simulation ${step.turns} turns reached: ${step.winner?.let { "$it leads on score" } ?: "Draw"}")
                     }
 
-                    // Data-plane hook (finalize/close): publish this game's shard, unregister recorder.
-                    if (recorder != null) {
-                        DataPlaneHooks.unregister(gameInfo)
-                        recorder.close()
-                    }
+                    // Data-plane hook (finalize): emit the per-civ terminal reward, publish the shard,
+                    // and unregister (no-op for EVAL's control-only games).
+                    if (dataPlane != null) DataPlaneHooks.finalizeGame(gameInfo, step.winner)
 
                     // ⚠️ these need to be thread-safe
                     updateCounter(threadId)
@@ -219,10 +225,15 @@ class Simulation(
             it.values.forEach { it.value = 0 }
         }
         steps.forEach {
-            if (it.winner != null) {
-                numWins[it.winner!!]!!.inc()
-                winRateByVictory[it.winner!!]!![it.victoryType]!!.inc()
-                winTurnByVictory[it.winner!!]!![it.victoryType]!!.add(it.turns)
+            val winner = it.winner
+            if (winner != null) {
+                numWins[winner]?.inc()
+                // victoryType is null for a score-leader-at-cap win (D7) — count it in numWins only.
+                val vt = it.victoryType
+                if (vt != null) {
+                    winRateByVictory[winner]?.get(vt)?.inc()
+                    winTurnByVictory[winner]?.get(vt)?.add(it.turns)
+                }
             }
             for (civ in majorCivs) {
                 for (turn in statTurns) {
@@ -270,7 +281,7 @@ class Simulation(
             outString += "$winRate% total win rate \n"
             if (numSteps * expWinRate >= 10 && numSteps * (1 - expWinRate) >= 10) {
                 // large enough sample size, binomial distribution approximates the Normal Curve
-                val pval = binomialTest(
+                val pval = SimStats.binomialTest(
                     numWins[civ]!!.value.toDouble(),
                     numSteps.toDouble(),
                     expWinRate.toDouble(),
@@ -315,36 +326,5 @@ class Simulation(
         outString += "Total time: $totalDuration\n"
 
         return outString
-    }
-
-    private fun binomialTest(successes: Double, trials: Double, p: Double, alternative: String): Double {
-        val q = 1 - p
-        val mean = trials * p
-        val variance = trials * p * q
-        val stdDev = sqrt(variance)
-        val z = (successes - mean) / stdDev
-        val pValue = 1 - normalCdf(z)
-        return when (alternative) {
-            "greater" -> pValue
-            "less" -> 1 - pValue
-            else -> throw IllegalArgumentException("Alternative must be 'greater' or 'less'")
-        }
-    }
-
-    private fun normalCdf(z: Double): Double {
-        return 0.5 * (1 + erf(z / sqrt(2.0)))
-    }
-
-    // Approximation of the error function
-    private fun erf(x: Double): Double {
-        val t = 1.0 / (1.0 + 0.5 * kotlin.math.abs(x))
-        val tau =
-            t * kotlin.math.exp(
-                -x * x - 1.26551223 +
-                    t * (1.00002368 + t * (0.37409196 + t * (0.09678418
-                    + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 +
-                    t * (1.48851587 + t * (-0.82215223 + t * 0.17087277))))))))
-            )
-        return if (x >= 0) 1 - tau else tau - 1
     }
 }

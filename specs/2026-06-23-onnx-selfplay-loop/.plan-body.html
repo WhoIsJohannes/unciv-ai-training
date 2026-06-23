@@ -1,0 +1,54 @@
+<h2>The ask</h2>
+<blockquote>
+Close the self-play loop on top of the existing data plane: (1) a Kotlin <code>OnnxPolicy</code> that runs a trained net <em>inside the JVM</em> to choose strategic actions (TECH + POLICY) from the legal mask, and (2) a Python training package + round driver that trains a small policy on emitted trajectories, exports ONNX, and measures win-rate vs RandomPolicy. The deliverable is a working end-to-end <strong>LOOP</strong> and a <strong>LEARNING CURVE</strong> — the go/no-go evidence for from-scratch self-play. Reuse the data plane; do not rebuild it.
+</blockquote>
+
+<h2>How this plan solves it — TWO linchpins</h2>
+<p><strong>Linchpin 1 — the policy must DRIVE the game, not just label it (caught by the plan council, FND-0002).</strong> Today <code>NextTurnAutomation.onCivTurn</code> is a <em>recording</em> hook: it records what <code>chooseIndex</code> would pick, but the engine's <code>chooseTechToResearch</code>/<code>adoptPolicy</code> heuristics make the real decisions. Training on those labels would REINFORCE non-causal actions, and "OnnxPolicy vs RandomPolicy" would secretly be heuristic-vs-heuristic (~50%, flat, for the wrong reason). The fix is a <strong>control seam (D14)</strong>: the installed policy drives the learner's (and opponent's) tech+policy — pre-fill <code>techsToResearch</code> (the heuristic respects a non-empty queue) and adopt the chosen policy + guard the heuristic. Control runs in gen <em>and</em> eval; recorded action == applied action.</p>
+<p><strong>Linchpin 2 — the shards carry no learning signal.</strong> Reward is hardcoded <code>0f</code> and there is no terminal flag. Wire a per-civ <strong>terminal ±1 reward</strong> into the shards (a sanctioned <code>SampleSchema.VERSION</code> 1→2 bump).</p>
+<p>With both, REINFORCE-with-baseline trains a tiny MLP on <code>concat(global, acting_civ)</code> → <code>{tech_logits, policy_logits}</code>; the same net runs in-JVM via onnxruntime behind a <code>RoutingPolicy</code> (learner→ONNX, opponents→<code>RandomPolicy</code>). A plain-script driver loops generate→train→export→eval for K rounds, writes <code>curve.csv</code> + a plot, and emits an explicit <strong>GO / PLATEAU / INCONCLUSIVE</strong> verdict. A golden PARITY test pins the single observation code-path so train-time and infer-time never drift.</p>
+
+<h2>Worked walkthrough</h2>
+<p><em>Illustrative mock values — not measured. LLM-authored; sanity-check against the architecture detail below. Widths (232 / 80 / ~80) are pinned at build time from the generated <code>schema.json</code>, not hardcoded.</em></p>
+<table>
+<thead><tr><th>#</th><th>Stage</th><th>Contract (who → what → whom)</th><th>Mock payload shape</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Learner civ-turn fires</td><td><code>NextTurnAutomation.onCivTurn(civ)</code> → existing <code>install()</code> → <code>RoutingPolicy.chooseIndex("tech", Babylon, mask, turn=42)</code></td><td>learner=<code>Babylon</code>; <code>mask_tech</code> legal at {3,7,9}</td></tr>
+<tr><td>2</td><td>OnnxPolicy featurizes</td><td><code>Featurizer.observe(civ)</code> → <code>concat(global[26], acting_civ[206])</code></td><td><code>obs = f32[232]</code></td></tr>
+<tr><td>3</td><td>ONNX forward (memoized per civ-turn)</td><td><code>OrtSession.run({"obs": [1,232]})</code> → <code>tech_logits[80]</code>, <code>policy_logits[~80]</code></td><td>tech idx7 = 2.1 (max legal)</td></tr>
+<tr><td>4</td><td>Mask + choose</td><td>illegal→−inf; sample over {3,7,9} via <code>rngFor(civ,42)</code> (argmax in eval)</td><td>picks <strong>idx 7</strong> → <code>actions[0]=7</code></td></tr>
+<tr><td>5</td><td>Game ends (turn 188, domination)</td><td><code>Simulation</code> → <code>recorder.recordTerminal({Babylon:+1, Sumeria:−1})</code></td><td>terminal step <code>civ_slot=0, reward=+1, is_terminal=1</code></td></tr>
+<tr><td>6</td><td>Train (next round)</td><td><code>dataset</code>: Babylon's step-42 return <code>R=+1</code>; masked <code>logp(tech=7)</code>; <code>A = +1 − baseline</code>; loss <code>−A·logp</code></td><td>net nudges tech-7 probability up</td></tr>
+</tbody>
+</table>
+
+<h2>Architecture detail</h2>
+
+<details>
+<summary><strong>The linchpin: terminal reward + VERSION 2 (current → proposed)</strong></summary>
+<p><strong>Current</strong> (<code>DataPlaneHooks.recordCivTurn</code>): writes <code>turn, civSlot, isFirst, isLast=0, isTerminal=0, overflow, reward=0f</code> + obs blocks + the <code>actions</code> block (4 chosen indices). Reward and terminal are placeholders — no learning signal.</p>
+<p><strong>Proposed</strong>: at game end, <code>Simulation</code> determines the per-civ outcome (win=+1 / lose=−1 / draw=0) and calls a new <code>ShardRecorder.recordTerminal(...)</code> that appends ONE record per recorded civ with <code>isTerminal=1, reward=±1</code> (zero-filled obs — terminal obs is unused for training). <code>SampleSchema.VERSION</code> 1→2; Python <code>SCHEMA_VERSION</code> in lockstep (the reader already refuses a version mismatch → old shards correctly rejected, datasets are perishable by design). Python <code>dataset.py</code> groups steps by <code>civ_slot</code>, reads the terminal reward, and broadcasts it as the undiscounted return for that civ's non-terminal steps.</p>
+</details>
+
+<details>
+<summary><strong>Win / tiebreaker definition (D7) — same for reward AND eval</strong></summary>
+<p>Win = formal victory if one occurs. The turn cap defaults high so games play to a real victory (your decision). Only at the hard cap (the rare case) is the winner the civ with higher <code>calculateTotalScore()</code>; an exact tie is a draw (reward 0, excluded from the win numerator). Gated behind a new <code>Simulation(scoreLeaderOnTimeout=true)</code> flag so <code>ConsoleLauncher</code>/<code>SimBenchmark</code> behavior is unchanged.</p>
+</details>
+
+<details>
+<summary><strong>Module placement (D4, revised by council + scan)</strong></summary>
+<p><code>OnnxPolicy</code> lives in <code>desktop</code> (where the onnxruntime native dep belongs), implementing <code>core</code>'s <code>PolicyProvider</code>. <code>RoutingPolicy</code> + <code>SimStats</code> (no ORT dep) stay in <code>core</code>. onnxruntime is a <code>desktop</code>-only dependency (via <code>gradle/libs.versions.toml</code>). This keeps <code>core</code> ML-runtime-free — no dependency inversion, no <code>compileOnly</code> hack, zero Android-APK risk. <em>Deviation from the task's "OnnxPolicy in core/.../dataplane" — see the Deviations table; the data plane already places heavy concerns (DataPlaneGen) in desktop.</em></p>
+</details>
+
+<details>
+<summary><strong>ONNX I/O contract + anti-drift</strong></summary>
+<p>Input tensor <code>obs</code> = <code>concat(global, acting_civ)</code> f32 (runtime GnK width). Outputs <code>tech_logits[techCount]</code>, <code>policy_logits[policyCount]</code>. Widths read from the generated <code>schema.json</code> on both sides — never hardcoded (the task said policy=70; the scan estimates ~80; the truth is <code>vocab.policyCount</code> at runtime). <code>policy.onnx</code> carries <code>schema_version</code>, <code>ruleset_fingerprint</code>, <code>contract_version</code> as ONNX metadata; the JVM reads them via <code>session.getMetadata().getCustomMetadata()</code> and EVAL refuses a contract-mismatched model. The PARITY test feeds ONE fixed obs through the JVM session and a Python reference, asserting logits match within <code>atol=1e-4</code>.</p>
+</details>
+
+<details>
+<summary><strong>Reuse — what we add vs reuse</strong></summary>
+<ul>
+<li><strong>Reuse unchanged</strong>: <code>Featurizer</code>, <code>Observation</code>, <code>LegalActionMasks</code>, <code>TrajectoryEmitter</code>, <code>ShardFormat</code>, <code>RulesetFingerprint</code>, <code>Vocab</code>, the python <code>reader</code>, <code>Simulation</code>'s game loop + <code>numWins</code>, <code>NextTurnAutomation.onCivTurn</code> install seam, the <code>RandomPolicy</code> template, the <code>GdxTestRunner</code>/<code>TestGame</code>/<code>FairnessAndDeterminismTests</code> test patterns.</li>
+<li><strong>Add</strong>: terminal reward emission, <code>RoutingPolicy</code>, <code>OnnxPolicy</code>, <code>SimStats</code> (extracted), <code>SelfPlayRunner</code>, the whole <code>unciv_train</code> package, and the 6 tests.</li>
+</ul>
+</details>

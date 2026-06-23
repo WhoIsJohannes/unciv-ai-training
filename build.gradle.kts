@@ -118,6 +118,10 @@ project(":desktop") {
 
         // Needed for Windows turn notifiers
         "api"(rootProject.libs.bundles.jna)
+
+        // Self-play: in-JVM ONNX inference (OnnxPolicy + SelfPlayRunner). Desktop-only — keeps the
+        // native runtime OUT of the Android APK and `core` free of any ML-runtime dependency.
+        "implementation"(rootProject.libs.onnxruntime)
     }
 }
 

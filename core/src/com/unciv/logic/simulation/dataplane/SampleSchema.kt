@@ -12,10 +12,43 @@ package com.unciv.logic.simulation.dataplane
  * Featurizer derives them at runtime and records them verbatim in the shard header + schema.json.
  */
 object SampleSchema {
-    const val VERSION = 1
+    /**
+     * VERSION 2 (was 1): trajectory shards now carry a real terminal reward + an end-of-game
+     * terminal step per civ (was a hardcoded `reward=0f`, `isTerminal=0` placeholder). The recorded
+     * civ-level action is now ALSO applied to the game (the policy DRIVES tech+policy for controlled
+     * civs — see [DataPlaneHooks]), so a v1 shard (label-only, no reward) is not training-compatible.
+     * The Python reader REFUSES a VERSION mismatch ⇒ regenerate; datasets are perishable by design.
+     */
+    const val VERSION = 2
 
     /** 8 ASCII bytes at the head of every shard. */
     const val MAGIC = "UNCVSMP1"
+
+    /**
+     * ONNX policy-net I/O contract (the single Kotlin-side source of truth for tensor NAMES;
+     * the matching Python constants live in `python/unciv_train/contract.py`, kept in lockstep by
+     * the cross-boundary PARITY test). Tensor SHAPES/WIDTHS are runtime-derived from the loaded GnK
+     * vocab (`Vocab.techCount`/`policyCount`) — never hardcoded — and stamped into the ONNX metadata.
+     *
+     * v1 models ONLY the `tech` + `policy` civ-level heads; `greatPerson`/`diplomaticVote` and all
+     * per-entity heads keep the heuristic/RandomPolicy fallback.
+     */
+    object OnnxContract {
+        const val CONTRACT_VERSION = 1
+        /** Net input tensor: concat(observation block "global", block "acting_civ"), float32. */
+        const val INPUT_NAME = "obs"
+        const val OUTPUT_TECH = "tech_logits"
+        const val OUTPUT_POLICY = "policy_logits"
+        /** The civ-level heads the net controls in v1, in `actions`-block order. */
+        val MODELED_HEADS = listOf("tech", "policy")
+        // ONNX metadata_props keys (provenance gate — read on the JVM via session.getMetadata()).
+        const val META_SCHEMA_VERSION = "schema_version"
+        const val META_RULESET_FINGERPRINT = "ruleset_fingerprint"
+        const val META_CONTRACT_VERSION = "contract_version"
+        const val META_INPUT_WIDTH = "input_width"
+        const val META_TECH_WIDTH = "tech_width"
+        const val META_POLICY_WIDTH = "policy_width"
+    }
 
     // numpy-style little-endian dtype tags recorded in the header (cross-checked by the reader).
     const val DT_F32 = "<f4"

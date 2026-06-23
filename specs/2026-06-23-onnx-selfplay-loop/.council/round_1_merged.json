@@ -1,0 +1,829 @@
+[
+  {
+    "title": "Concurrent games will corrupt OnnxPolicy's memoization cache",
+    "severity": "critical",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "Change inventory (file-by-file) > desktop/.../OnnxPolicy.kt",
+    "description": "The brief specifies a `per-(civID,turn) memo` to cache the ONNX forward pass so the second head can reuse it. Because `SelfPlayRunner` runs multiple games concurrently (`<threads>` > 1) sharing a single `OnnxPolicy` instance, `(civID, turn)` is not a unique key. Game A and Game B can both have Babylon on turn 42 simultaneously, causing one game to receive the other's logits or thrash the cache.",
+    "rationale": "Shared state in a multithreaded environment must be keyed by the exact execution context, otherwise silent cross-contamination destroys the integrity of the data plane.",
+    "suggested_addition": "Change the memoization key to include the unique game instance, e.g., `(civ.gameInfo.gameId, civ.civInfo.civName, turn)`. Ensure the cache is thread-safe (`ConcurrentHashMap`) and entries are explicitly removed after the second head is queried to prevent a memory leak.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "chooseIndex: per-(civID,turn) memo \u2192 one forward on concat(global,acting_civ)",
+      "eval <model> <M> <maxTurns> <threads> <seed>"
+    ]
+  },
+  {
+    "title": "RoutingPolicy fallback contradicts OnnxPolicy return contract",
+    "severity": "major",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "Change inventory (file-by-file) > core/.../dataplane/RoutingPolicy.kt",
+    "description": "The brief claims \"heads beyond tech+policy ... stay heuristic via RoutingPolicy fallback\", but the `RoutingPolicy` design only dispatches by `civ.civID`. If it routes the learner to `OnnxPolicy`, and `OnnxPolicy` returns `-1` for unmodeled heads, the engine does not automatically fall back to heuristics\u2014it will simply skip the action.",
+    "rationale": "Abstractions must explicitly handle their boundaries. If `RoutingPolicy` is responsible for the fallback, it must intercept the request before it reaches the ONNX policy.",
+    "suggested_addition": "Update `RoutingPolicy.chooseIndex` to explicitly check the `head` parameter. If `head` is not `\"tech\"` or `\"policy\"`, it must route the request to the `opponent` (RandomPolicy) or a dedicated heuristic policy, rather than sending it to `OnnxPolicy`.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "chooseIndex/actUnit dispatch by civ.civID/unit.civInfo.civID.",
+      "heads beyond tech+policy (greatPerson/diplomaticVote/construction/promotion stay heuristic via RoutingPolicy fallback)"
+    ]
+  },
+  {
+    "title": "Missing Softmax activation before action sampling",
+    "severity": "major",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "Change inventory (file-by-file) > desktop/.../OnnxPolicy.kt",
+    "description": "The brief states `OnnxPolicy` will \"mask illegal logits to \u2212inf ... then sample via rngFor(civ,turn)\". Raw logits (which can be negative or unbounded) cannot be directly sampled as probabilities.",
+    "rationale": "Attempting to perform a weighted random choice on unnormalized logits will either crash the JVM or produce a mathematically invalid distribution, destroying the REINFORCE learning signal.",
+    "suggested_addition": "Explicitly state that `OnnxPolicy` must apply a Softmax function to the masked logits to convert them into a valid probability distribution (summing to 1.0) before sampling.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "mask illegal \u2192 \u2212inf; empty legal \u2192 \u22121; sample via rngFor(civ,turn) (gen)"
+    ]
+  },
+  {
+    "title": "Multithreaded generation breaks training determinism unless shards are sorted",
+    "severity": "major",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "Change inventory (file-by-file) > python/unciv_train/dataset.py",
+    "description": "The brief mandates strict determinism (AC3) while also supporting concurrent game generation (`<threads>`). Concurrent games will finish and write shard files to disk in a non-deterministic order. If `dataset.py` loads these shards in OS-provided order, the REINFORCE batches will vary between runs, causing the Adam optimizer to produce a non-deterministic model.",
+    "rationale": "A non-negotiable determinism constraint conflicts with concurrent execution unless the integration boundary (the filesystem) is explicitly linearized.",
+    "suggested_addition": "Specify that `dataset.py` must explicitly sort the discovered shard file paths (e.g., alphabetically by filename) before loading them into the dataset to guarantee identical batch ordering across runs.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "DETERMINISM \u2014 fixed model + seed \u2192 identical trajectory calculateChecksum across two runs.",
+      "gen <model|random> <out> <nGames> <maxTurns> <threads> <seed>"
+    ]
+  },
+  {
+    "title": "run_loop.py has no failure handling for a crashed subprocess round",
+    "severity": "critical",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "Architecture: the loop / run_loop.py",
+    "description": "The driver chains gen\u2192train\u2192export\u2192eval as subprocess calls per round, but the brief commits only to a 'per-process timeout backstop' and never says what happens when ./gradlew selfPlay exits non-zero, the JVM OOMs at -Xmx8G, or EVAL_RESULT fails to parse. A 10-round overnight run that dies on round 7 with no resume leaves you with a partial curve and no signal.",
+    "rationale": "This is a long-running batch job that is the entire deliverable; if round N silently corrupts curve.csv or the loop hangs, the on-call (here, the researcher at 3am) has nothing to act on and loses the whole run.",
+    "suggested_addition": "Add an explicit per-round failure contract to run_loop.py: (1) check subprocess exit codes and a parse-guard on EVAL_RESULT \u2014 on failure, log a structured error line, write a 'round N FAILED' row to curve.csv, and either abort cleanly or skip-and-continue (state which); (2) make the loop resumable \u2014 record last-completed-round so a re-run continues rather than restarting; (3) commit what the timeout value is and what happens on timeout (kill subprocess, mark round failed). State whether a single failed round is fatal to the run or recoverable.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Fresh per-round shard dir + retention; per-process timeout backstop.",
+      "append curve.csv (round, games, winrate, pval) ; replot curve.png"
+    ]
+  },
+  {
+    "title": "OnnxPolicy fail-fast on inference error aborts the whole game/run with no isolation",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "Change inventory \u2014 desktop/OnnxPolicy.kt",
+    "description": "D9 commits to 'fail fast (loud), never silent-fallback' on model-load or inference failure, but the blast radius is undefined. A single ORT inference exception on game 4,200 of an eval batch could tear down the whole multithreaded Simulation run, discarding thousands of completed games and the entire round's eval result.",
+    "rationale": "Fail-fast is correct for a poisoned model, but conflating 'model is structurally wrong' (fail the run) with 'one inference threw' (a recoverable per-game event) means one transient native-memory hiccup nukes hours of compute \u2014 exactly the unbounded-blast-radius failure mode that pages you.",
+    "suggested_addition": "Distinguish two failure classes in OnnxPolicy: (1) load-time / contract-mismatch / metadata-refusal \u2192 fail the whole run loudly before any game starts (correct per D9); (2) per-inference runtime exceptions mid-run \u2192 decide explicitly whether to abort the run or abort just that game and record it as excluded, and log enough context (civID, turn, obs width) to debug. State which, and where the boundary is.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "model-load/inference failure \u2192 fail fast (loud), never silent-fallback (a broken model must not masquerade as a learning signal)",
+      "Lazy shared `OrtEnvironment`+`OrtSession` (intra-op threads=1)"
+    ]
+  },
+  {
+    "title": "No throughput/capacity numbers committed \u2014 defaults and timeouts are blind",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "P0/P1 split + Risks",
+    "description": "The 'baked balanced defaults' for K rounds \u00d7 N gen-games \u00d7 M eval-games \u00d7 turn-cap are never given concrete values, and the brief explicitly punts throughput to 'round 0 measures'. The walkthrough shows a game running to turn 188 with a 'high turn cap' \u2014 at unknown turns/sec across cores\u22121 threads, the run could be 20 minutes or 20 hours, and the 'generous per-process timeout' has no number to anchor on.",
+    "rationale": "Without a committed throughput estimate and concrete defaults, the timeout backstop is unset-able, the user can't size a run before launching it, and 'it'll scale to K=10' is an assumption, not a plan \u2014 the classic 'capacity assumed without numbers' kill.",
+    "suggested_addition": "Commit concrete default values (e.g. K=10, gen=2000, eval=500, turn-cap=N, threads=cores\u22121) and a rough expected wall-clock per round derived from a quick spike or the existing simBench numbers. State the per-process timeout as a multiple of expected round time (e.g. 3\u00d7 the measured round-0 time). If round-0 must measure first, have run_loop print the projected total wall-clock after round 0 and let the operator abort before committing K rounds.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "The widths 232/80/~80 are illustrative",
+      "high turn cap is the user's choice"
+    ]
+  },
+  {
+    "title": "Per-round structured log line is P1 \u2014 observability is optional, not committed",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "P1 \u2014 polish",
+    "description": "The 'structured per-round log line' and 'turns/s' measurement are listed under P1 ('do if cheap; never blocks the curve'). curve.csv records only (round, games, winrate, pval) \u2014 there is no committed record of per-round wall-clock, gen/train/eval timing breakdown, onnx_decisions count, or loss trajectory.",
+    "rationale": "When the curve is flat (Risk #2: 'honest curve will show a flat line if broken'), a flat line alone cannot tell you whether reward wiring broke, the net didn't train, or eval routing failed \u2014 you need the per-round diagnostics to localize the failure, and burying them in P1 means the first debugging session has no data.",
+    "suggested_addition": "Promote per-round structured logging to P0: extend curve.csv (or a sibling metrics.jsonl) to include per-round wall-clock, gen/train/eval phase timings, training loss/baseline, and onnx_decisions count. A flat learning curve must be diagnosable from the emitted artifacts alone, without re-running with added instrumentation.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Per-round shard retention/rotation; structured per-round log line; plot styling",
+      "honest curve will show a flat line if broken"
+    ]
+  },
+  {
+    "title": "Shared OrtSession thread-safety is asserted from docs, not verified under the actual concurrent load",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "Risks \u2014 #3 onnxruntime JVM thread-safety / native mem",
+    "description": "The design rests one shared read-only OrtSession across all Simulation worker threads, with the mitigation being 'verify on pinned Javadoc in build'. There is no test that exercises concurrent run() calls under the real multithreaded harness, and the determinism test uses a fixed model on what may be a single deterministic path.",
+    "rationale": "Reading the Javadoc is not verifying behavior; native ORT concurrency bugs and memory leaks manifest only under sustained multithreaded load, which is exactly the gen/eval workload \u2014 a leak or race surfaces as a non-reproducible crash hours into a run, the worst kind of 3am page.",
+    "suggested_addition": "Add a concurrency stress test as a P0 acceptance item: drive the shared OrtSession from N threads (= cores\u22121) for several thousand forwards with the fixture model, asserting no exceptions, stable results, and bounded native memory. Confirm intra-op=1 actually applies and document the observed steady-state RSS so a memory regression is detectable.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "One shared read-only session (ORT supports concurrent `run`), intra-op=1; close tensors/Result; verify on pinned Javadoc in build.",
+      "L\u00d7M"
+    ]
+  },
+  {
+    "title": "Learning curve has no actual go/no-go decision rule",
+    "severity": "critical",
+    "primary_lens": "outcome",
+    "target_file": "plan.md",
+    "target_section": "Tests \u2192 acceptance criteria",
+    "description": "The brief says the deliverable is go/no-go evidence, but AC5 accepts either hitting a target or plainly stating a plateau. That makes the core product outcome unfalsifiable: the team can ship a graph and still claim success even if the experiment provides no actionable decision.",
+    "rationale": "For this feature, the value is not the loop existing; it is whether the loop produces evidence strong enough to decide whether from-scratch self-play is worth continuing. Without a decision rule, engineering can spend weeks building infrastructure and still leave the user with vibes instead of a product decision.",
+    "suggested_addition": "Add a decision rule: `GO = final 3 eval rounds average learner win-rate >= 60% vs RandomPolicy with p<0.05 and no provenance/parity failures. NO-GO = after K configured rounds, win-rate is not significantly above 50% or curve is flat/declining for the final 3 rounds. INCONCLUSIVE = run fails, eval sample too small, timeout rate exceeds X%, or confidence interval width > Y.` Also require `curve.csv` to include enough data to classify the run as GO / NO-GO / INCONCLUSIVE.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "**The deliverable is a working end-to-end LOOP and an honest LEARNING CURVE** \u2014 the go/no-go evidence for from-scratch self-play.",
+      "**Learning curve** \u2192 `curve.csv` + `curve.png`; honest reporting (\u226560% @ p<0.05 target, or a plain-stated plateau)."
+    ]
+  },
+  {
+    "title": "Balanced defaults are promised but not specified",
+    "severity": "major",
+    "primary_lens": "outcome",
+    "target_file": "plan.md",
+    "target_section": "P0 / P1 split",
+    "description": "The plan repeatedly says loop knobs are configurable with baked balanced defaults, but it never commits to actual defaults for K, gen-games, eval-games, maxTurns, threads, seed, retention, or timeout. That leaves the build team unable to know whether the acceptance criterion is a 20-minute smoke run or a multi-day experiment.",
+    "rationale": "Configurable is not a product decision; defaults are. If the first run is too small, the learning curve is statistically meaningless; if it is too large, the feature may be unusable on the intended developer machine.",
+    "suggested_addition": "Add a `Default operating contract` table: `K`, `gen_games_per_round`, `eval_games_per_round`, `maxTurns`, `threads`, `seed`, `learnerNation`, `oppNation`, `per-process timeout`, `retention`, and `expected wall-clock budget on a named machine class`. Include the minimum viable smoke profile separately from the evidence-producing default profile.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Loop K\u226510 rounds headless \u2192 `run_loop.py` end-to-end (gen\u2192train\u2192export\u2192eval), no manual steps; `curve.csv` has K rows.",
+      "`run_loop.py` \u2014 The driver (D8 lean knobs + baked defaults)."
+    ]
+  },
+  {
+    "title": "P0 list is too broad to tell what actually blocks launch",
+    "severity": "major",
+    "primary_lens": "outcome",
+    "target_file": "plan.md",
+    "target_section": "P0 / P1 split",
+    "description": "The P0 section bundles schema changes, JVM policy, Gradle tasks, Python package modules, tests, `curve.csv`, and a plot into one launch-blocking bucket. Some of these are truly load-bearing, while others are reporting polish or implementation packaging choices; the brief does not say which P0 would be cut if the loop works but time slips.",
+    "rationale": "When everything is P0, the plan has not made a priority decision. The team needs a smaller set of launch-blocking user outcomes: generate data with reward, train/export a compatible model, run ONNX eval legally/deterministically, and produce decision evidence.",
+    "suggested_addition": "Replace the P0 list with a table: `Capability | User outcome | Launch-blocking? | Success metric | Proof artifact`. Example: `Terminal reward schema | learner has a reward signal | yes | 100% of completed games emit one terminal record per seen civ with reward in {-1,0,+1} | Python dataset test + shard inspection`. Move `curve.png` styling/reporting and nonessential structured logs to P1 unless the plot itself is required for the go/no-go review.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "**P0 \u2014 required for the loop + all 6 acceptance criteria**",
+      "Tests: legality, determinism, parity, provenance. `curve.csv` + plot."
+    ]
+  },
+  {
+    "title": "The one-command user workflow is not nailed down",
+    "severity": "major",
+    "primary_lens": "outcome",
+    "target_file": "plan.md",
+    "target_section": "Human actions",
+    "description": "The acceptance criteria say there are no manual steps, while Human actions says `pip install -e python/` may be required once. The brief also does not show the canonical command a user runs to produce the learning curve, the expected output directory, or the preconditions for a fresh machine.",
+    "rationale": "The user-facing outcome is being able to run the loop and get evidence. If setup and invocation are ambiguous, the feature can be technically complete but not usable by the person trying to make the go/no-go call.",
+    "suggested_addition": "Add a `User workflow contract`: `From a clean checkout on branch X, run <exact command>. The command installs/checks Python deps or fails with a single actionable message, runs K rounds, and writes <output-dir>/curve.csv, curve.png, policy.onnx, and logs. No manual handoff between Gradle and Python is required after this command.` Clarify whether `pip install -e python/` is genuinely optional or a required setup step.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "**Loop K\u226510 rounds headless** \u2192 `run_loop.py` end-to-end (gen\u2192train\u2192export\u2192eval), no manual steps; `curve.csv` has K rows.",
+      "Human actions \u2014 None required to run the loop. (Optional: `pip install -e python/` once for the training deps.)"
+    ]
+  },
+  {
+    "title": "Baseline validity is acknowledged but not measured",
+    "severity": "major",
+    "primary_lens": "outcome",
+    "target_file": "plan.md",
+    "target_section": "Risks",
+    "description": "The brief accepts fixed learner/opponent nations and RandomPolicy as the stationary baseline, but it does not define what makes that baseline valid enough for the claimed go/no-go evidence. A learner beating RandomPolicy in one pinned Tiny matchup may prove the plumbing works, not that from-scratch self-play is promising.",
+    "rationale": "This is an evidence product. If the evidence is scoped to `Babylon vs Sumeria on Tiny GnK seeds`, the brief should make that the decision scope and avoid overclaiming broader self-play viability.",
+    "suggested_addition": "Add an `Evidence scope` section: `This run only supports a v1 claim: the learner can improve against RandomPolicy in the fixed Tiny 2-civ GnK matchup under varied map seeds. It does not claim transfer across nations, map sizes, rulesets, or non-random opponents.` Require `curve.csv` or a summary JSON to include learner nation, opponent nation, ruleset fingerprint, map seed range, timeout/draw rate, and baseline round-0 win-rate.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "**Stationary opponent**: learner-vs-RandomPolicy gives a clean, low-variance learning signal for a true go/no-go",
+      "Fixed-nation matchup overfitting (FND-0030) | Accepted for v1 stationary-opponent go/no-go; map seed varies per game; documented limitation + v2 todo."
+    ]
+  },
+  {
+    "title": "Parity test observation file source is undefined",
+    "severity": "critical",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "Tests \u2192 acceptance criteria, AC4 PARITY",
+    "description": "The parity test requires a fixed observation (obs) to compare JVM and Python logits, but the brief does not specify how this fixed observation is created or stored (e.g., a synthetic vector at the expected width, a serialized state from a known game, or a generation step in the build). Without a defined obs file, the test cannot be written.",
+    "rationale": "A parity test is a load-bearing verification that JVM and Python inference produce identical results; any ambiguity about the input observation means the test is underspecified and cannot be trusted to detect drift.",
+    "suggested_addition": "Add a bullet in the `SelfPlayRunner` parity mode description or in the test spec: 'The fixed observation is generated by running a deterministic game with a known seed and capturing `concat(global, acting_civ)` from a chosen turn; this obs file is committed to the repository as `tests/resources/parity-obs.bin`.' Or, if using a synthetic obs, define its generation process (widths, dummy values) and commit it as a test fixture.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "`tests/.../SelfPlayDeterminismTest.kt` ... **AC4 PARITY** \u2014 fixed obs+model \u2192 JVM logits (via `selfPlay parity`) == Python reference (onnxruntime) within `atol=1e-4`.",
+      "`SelfPlayRunner` ... `parity <model> <obsFile> <outFile>` \u2192 writes JVM logits for a fixed obs."
+    ]
+  },
+  {
+    "title": "OnnxPolicy error handling beyond metadata mismatch is unspecified",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "Kotlin \u2014 desktop, OnnxPolicy.kt description",
+    "description": "The brief only specifies refusal on metadata (schema/fingerprint/contract) mismatch. It does not define expected behaviour for other failure modes: missing or corrupt ONNX file, runtime inference exceptions, or a session that fails to create. From a QA perspective, these error paths cannot be tested without a defined contract.",
+    "rationale": "Without concrete error handling requirements, the system may silently swallow failures, making debugging impossible and undermining confidence in the loop's integrity. Every failure mode must have a verifiable behaviour (e.g., fail-fast, log an error, and halt the run).",
+    "suggested_addition": "Add a sentence to the `OnnxPolicy` description: 'On model load failure or inference exception, the policy must log the error and terminate the simulation process (fail-fast). The `gen` and `eval` runner must exit with a non-zero code and print the exception to stderr.' This gives QA a clear predicate for error-path tests.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "`class OnnxPolicy(...) : PolicyProvider`. Reads ONNX `getCustomMetadata()` \u2192 refuse on schema/fingerprint/contract mismatch. Close tensors/Result; close session at run end."
+    ]
+  },
+  {
+    "title": "No timeout or hang detection for the loop driver's subprocess calls",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "Python \u2014 unciv_train, run_loop.py description",
+    "description": "The driver `run_loop.py` invokes `./gradlew selfPlay --args=...` for each gen/eval round, but the brief does not specify any timeout or hang-detection mechanism. If one subprocess hangs, the entire loop stalls indefinitely, and there is no testable way to verify that the driver can recover or at least report the failure.",
+    "rationale": "QA must be able to test that the loop terminates within a bounded wall-clock time per round, especially when the plan mentions a 'per-process timeout backstop' in council discussions that never materialized in the brief. A missing timeout makes the loop's reliability untestable.",
+    "suggested_addition": "Add to the `run_loop.py` description: 'Each subprocess call is wrapped in a configurable timeout (default 60 minutes for gen, 30 minutes for eval); on timeout, the driver logs the failure, writes a sentinel row to curve.csv with `winrate=None`, and continues to the next round if retry-on-timeout is enabled, otherwise aborts.' Include `timeout_seconds` in the driver's knobs.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "`run_loop.py` \u2014 The driver (D8 lean knobs + baked defaults). Round 0 = RandomPolicy gen. Each round: gen\u2192train\u2192export\u2192eval (subprocess `./gradlew selfPlay --args=...`, parse `EVAL_RESULT`)"
+    ]
+  },
+  {
+    "title": "Ambiguous definition of 'plain-stated plateau' in learning curve acceptance criterion",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "Tests \u2192 acceptance criteria, AC5 Learning curve",
+    "description": "The criterion says 'honest reporting (\u226560% @ p<0.05 target, or a plain-stated plateau)'. The term 'plain-stated plateau' is subjective and has no operational definition \u2014 at what point is a plateau declared? Without a rule (e.g., no improvement in winrate for N consecutive rounds, or a statistical threshold), the test cannot verify that the plateau is reported correctly.",
+    "rationale": "QA can verify that curve.csv rows match eval results, but cannot validate the 'honest reporting' claim because 'plateau' is undefined. This turns an observable property into an untestable assertion, which is a serious gap for a go/no-go deliverable.",
+    "suggested_addition": "Define an operational plateau rule, for example: 'The driver logs a plateau warning when the last M rounds' winrates are all within one standard error of the mean of those rounds and the p-value exceeds 0.2 for an increase vs the maximum observed winrate. The curve.csv includes a `plateau_alert` column (boolean).' Or, if a plateau is just a human reading of the plot, clarify that the acceptance criterion is just that the data is correctly logged and no automated plateau detection is required.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "**AC5 \u2014 Learning curve** \u2192 `curve.csv` + `curve.png`; honest reporting (\u226560% @ p<0.05 target, or a plain-stated plateau)."
+    ]
+  },
+  {
+    "title": "ONNX model loading is the deserialization attack surface, not just a 'trust assumption'",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "Risks / D9",
+    "description": "The plan dismisses model-path risk as 'self-produced in the loop from a trusted path' (FND-0025/D9), but the loop reads model bytes AND attacker-controllable custom-metadata strings (schema_version, ruleset_fingerprint, contract_version, input/tech/policy widths) from the .onnx via getCustomMetadata(). Those width strings are parsed and used to size FloatBuffers and tensor shapes; a malformed/oversized width drives allocation and indexing on the JVM hot path.",
+    "rationale": "ONNX is a protobuf format with a native runtime (onnxruntime bundles C++); 'self-produced' is only true until someone runs the loop against a downloaded checkpoint, a CI artifact, or a teammate's policy.onnx \u2014 at which point parsed metadata widths and the model graph itself become untrusted input on a path with no validation specified.",
+    "suggested_addition": "Add to OnnxPolicy/contract: validate every metadata field before use \u2014 input_width/tech_width/policy_width must parse as positive ints, must equal the runtime vocab-derived widths (not just 'be present'), and the tensor allocation must be bounded. Refuse (fail fast) on any non-numeric, negative, zero, or mismatched width rather than allocating from the attacker-supplied string. State explicitly that the contract metadata is parsed as untrusted input even for self-produced models.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Reads ONNX `getCustomMetadata()` \u2192 refuse on schema/fingerprint/contract mismatch.",
+      "Model is self-produced in the loop from a trusted path (not third-party). Note as a trust assumption; no untrusted-model loading."
+    ]
+  },
+  {
+    "title": "run_loop.py shells out to ./gradlew via subprocess with interpolated args \u2014 injection + arg-smuggling path",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "Python \u2014 run_loop.py",
+    "description": "The driver invokes `./gradlew selfPlay --args=\"gen <model> <out> ... <learnerNation> <oppNation>\"` as a subprocess and parses the EVAL_RESULT line back from stdout. The brief never specifies that args are passed as an argv list (not a shell string) nor that model paths / output dirs / nation names are validated. A `--args=` string assembled from config knobs (nation names, output paths, seeds) is a classic place for shell-quoting bugs and flag injection (e.g. a path or nation value containing spaces, quotes, or a leading `-`).",
+    "rationale": "Gradle's `--args` is itself a string that gets re-tokenized, so even a list-based subprocess call can smuggle extra Gradle/JVM flags through an unvalidated knob \u2014 and parsing a single line out of mixed gradle stdout is fragile enough that an attacker (or a noisy log) could forge an EVAL_RESULT line to fake the learning curve.",
+    "suggested_addition": "Specify in run_loop.py: (1) build subprocess argv as a list, never a shell string (no shell=True); (2) validate learnerNation/oppNation against an allowlist and reject paths/seeds that aren't simple tokens; (3) parse EVAL_RESULT only from a uniquely-prefixed line written to a dedicated fd/file, not scraped from interleaved gradle stdout, so a forged or log-echoed line cannot be mistaken for the real result.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "gen \u2500\u2500\u25ba ./gradlew selfPlay --args=\"gen <model> <out_r> ...\"  \u2192 shards (VERSION 2)",
+      "eval \u2500\u2500 ./gradlew selfPlay --args=\"eval policy.onnx <M> ...\" \u2192 EVAL_RESULT {json}"
+    ]
+  },
+  {
+    "title": "EVAL_RESULT trust boundary: stdout-parsed metrics are the only evidence the go/no-go decision rests on",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "D10 / Tests \u2192 acceptance criteria",
+    "description": "The entire deliverable \u2014 the 'honest learning curve' and go/no-go evidence \u2014 is built from a JSON line scraped from gradle stdout (`EVAL_RESULT <json>{games,wins,winrate,pval,...}`). There is no integrity check binding that line to the actual model/seed that produced it, and the `onnx_decisions>0` routing assertion is the only sanity check. A stale model path, a silently-fallen-back policy, or a re-used prior round's output could produce a plausible-but-wrong curve.",
+    "rationale": "From a red-team lens the most damaging failure here isn't a crash \u2014 it's a curve that looks real but isn't (silent reward-wiring failure, wrong model loaded, eval run against round r-1's onnx). The decision-forcing risk is that the evidence channel has no provenance binding.",
+    "suggested_addition": "Bind EVAL_RESULT to its inputs: include the loaded model's ruleset_fingerprint + schema_version + a hash/path of the exact policy.onnx evaluated and the seed in the emitted JSON, and have run_loop.py assert these match the model it just exported for that round before appending to curve.csv. Treat a mismatch as a hard failure, not a warning.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "EVAL asserts the learner civ actually invoked OnnxPolicy (decision counter > 0).",
+      "prints `EVAL_RESULT <json>{games,wins,winrate,pval,learner,seed,onnx_decisions}`"
+    ]
+  },
+  {
+    "title": "Mask source ambiguity: chooseIndex masks on the param, training masks on recorded mask block \u2014 divergence is an illegal-action / reward-leak vector",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "Architecture / Walkthrough",
+    "description": "At inference OnnxPolicy masks illegal logits using the authoritative legalMask param; at training, dataset.py masks using the recorded `mask_tech`/`mask_policy` blocks. The parity test pins only the obs path and raw logits (atol 1e-4) \u2014 it does NOT verify that the legality mask used to compute log-prob in training equals the mask the JVM actually enforced when the action was chosen. If those two masks ever disagree for a given recorded step, training can assign gradient to an action the inference path would have masked out.",
+    "rationale": "The brief calls drift 'closed by construction' via one obs path, but masking is a second contract surface that the parity test doesn't cover \u2014 a divergence here silently corrupts the learning signal and is exactly the kind of gap a checklist (which sees 'parity test exists') would miss.",
+    "suggested_addition": "Extend the parity/provenance tests to assert mask agreement: for a fixed recorded step, the BooleanArray the JVM passes to chooseIndex must equal the mask_tech/mask_policy block dataset.py uses. Add an invariant that the recorded chosen action index is legal under its own recorded mask (assert step action bit is set), and reject shards that violate it.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "use the param.",
+      "Masked log-prob: `logits[~m_h] = -1e9` ... mirroring JVM `-inf` masking."
+    ]
+  },
+  {
+    "title": "Determinism + shared mutable session under concurrent run(): silent cross-thread state bleed not adversarially tested",
+    "severity": "minor",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "Risks #3 / OnnxPolicy",
+    "description": "One shared OrtSession is run concurrently across Simulation worker threads, and OnnxPolicy memoizes per-(civID,turn) logits. The brief asserts ORT run() is concurrency-safe but does not state how the per-(civ,turn) memo is keyed/scoped across threads \u2014 if two worker threads process different civs sharing a turn counter, a memo keyed only on turn (not full game/civ identity) could return another game's logits, which would still pass legality but corrupt determinism and the curve.",
+    "rationale": "The determinism test runs the same seed twice and compares checksums \u2014 it will not catch a memo-scoping bug that is deterministic-but-wrong, and cross-game/civ memo bleed is precisely the kind of multi-tenant-style state-leak this lens looks for.",
+    "suggested_addition": "Specify the memo key as the full (gameId, civID, turn) tuple (or make the memo per-OnnxPolicy-instance bound to one game), and add a concurrency test that runs multiple Tiny games in parallel and asserts the trajectory checksums match the single-threaded baseline \u2014 proving no cross-game memo bleed under the shared session.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "per-(civID,turn) memo \u2192 one forward",
+      "One shared read-only session (ORT supports concurrent `run`); intra-op=1"
+    ]
+  },
+  {
+    "title": "Silent negative indexing bug in multi-head loss gathering",
+    "severity": "critical",
+    "primary_lens": "domain",
+    "target_file": "train.py",
+    "target_section": "Python \u2014 `python/unciv_train/`",
+    "description": "If a head did not act on a given step (action is `-1`), gathering `logp[a_h]` in PyTorch will use negative indexing and silently gather the log-probability of the *last* action in the vocabulary.",
+    "rationale": "This is a catastrophic ML bug. Instead of ignoring the inactive head, the network will be actively trained to maximize or minimize the probability of the last action in the array whenever no action is taken, completely destroying the policy.",
+    "suggested_addition": "Explicitly mask the loss calculation per-head. Update the loss definition to: `loss = -A * sum(logp_h[a_h] * (a_h >= 0) for h in heads)`. Do not add loss contributions from heads that did not act.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "gather chosen logp per head, advantage R\u2212running_mean, loss \u2212A\u00b7\u03a3_h logp"
+    ]
+  },
+  {
+    "title": "Row-dropping on inactive heads discards valid training data",
+    "severity": "critical",
+    "primary_lens": "domain",
+    "target_file": "dataset.py",
+    "target_section": "Python \u2014 `python/unciv_train/`",
+    "description": "The instruction to skip steps where \"a head's action < 0\" will discard almost all valid training data, because Tech and Policy actions rarely occur on the exact same turn.",
+    "rationale": "In multi-head discrete action spaces where heads act asynchronously, a step is valid if *any* head acted. If you drop the entire row when one head is inactive, the agent will have virtually no data to learn from.",
+    "suggested_addition": "Change the filter to: \"Skip steps where ALL heads' actions are < 0\". Keep the step if at least one head acted, and pass the `-1` actions to the training loop to be masked out of the loss.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "extract (obs, a_tech, a_policy, mask_tech, mask_policy, R). Skip steps where a head's action <0."
+    ]
+  },
+  {
+    "title": "State aliasing via turn-based inference memoization",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "OnnxPolicy.kt",
+    "target_section": "Kotlin \u2014 `desktop`",
+    "description": "Memoizing the ONNX forward pass by `(civID, turn)` assumes the environment state is static for the entire turn. This is false if a civ takes multiple actions in one turn (e.g., earning two free techs).",
+    "rationale": "If the first action changes the game state or unlocks new legal actions, reusing the cached logits for the second action forces the policy to act blind to its own immediate prior choices, violating the Markov property.",
+    "suggested_addition": "Key the memoization cache by the hash of the `observation` float array, or simply remove the memoization and run a new forward pass for every `chooseIndex` call (the MLP is tiny and fast enough).",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "chooseIndex: per-(civID,turn) memo \u2192 one forward on concat(global,acting_civ)"
+    ]
+  },
+  {
+    "title": "Reward broadcast mixes trajectories if shards contain multiple games",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "dataset.py",
+    "target_section": "Python \u2014 `python/unciv_train/`",
+    "description": "Grouping steps by `(shard, civ_slot)` to broadcast the terminal reward will mix trajectories if a single shard contains multiple games.",
+    "rationale": "If a shard contains both a win and a loss for `civ_slot=0` across different games, broadcasting the reward by shard will average or overwrite the terminal signals, destroying the advantage calculation for those specific episodes.",
+    "suggested_addition": "Group steps by `(game_id, civ_slot)` when broadcasting the terminal reward. Ensure `game_id` is extracted from the shard provenance and attached to each step.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "per (shard,civ_slot) read terminal reward \u2192 return-to-go broadcast"
+    ]
+  },
+  {
+    "title": "No vulnerable-population or failure-mode-harm analysis",
+    "severity": "critical",
+    "primary_lens": "ml-failure-mode",
+    "target_file": "plan.md",
+    "target_section": "Risks",
+    "description": "The Risks table covers observation drift, reward wiring, thread safety, matchup overfitting, and variance \u2014 all technical risks. There is zero analysis of who is harmed when the product fails, which vulnerable populations might be affected, or what the worst-case failure mode looks like for a user.",
+    "rationale": "A brief without any ethics mention isn't 'neutral' \u2014 it's a brief where nobody asked the question. An ML policy that makes scored decisions (tech/policy picks) in a game context may seem low-stakes, but the loop produces a trained model artifact. If that artifact is later deployed or shared, failure modes (biased decisions, exploitable behavior) could affect players \u2014 and the brief never asks who those players are or what 'harm' means in this context.",
+    "suggested_addition": "Add a 'Failure-mode harm' section to Risks or a standalone 'Ethics / Sociotechnical' section:\n\n- **Worst-case failure**: a trained policy that appears to learn but encodes a degenerate strategy (e.g., never researching certain techs, always picking the same policy branch) \u2014 if shared as a 'trained Civ AI,' it could mislead users about AI capability or produce frustrating gameplay for human opponents.\n- **Vulnerable populations**: the primary users are researchers/developers running the loop themselves, so direct end-user harm is low. However, if the model artifact is later integrated into the game for public play, players with accessibility needs (screen-reader users relying on predictable AI behavior) or younger players could be affected by unpredictable or exploitative policy choices.\n- **Mitigation**: the v1 artifact is explicitly a research tool, not a gameplay component; document this boundary. If the model is ever shipped for gameplay, a human-review step for policy outputs and an accessibility impact assessment are prerequisites.",
+    "supporting_roles": [
+      "ethics_responsible_ai"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "## Risks\n| # | Risk | L\u00d7S | Mitigation |\n|---|---|---|---|\n| 1 | Observation drift JVM\u2194Python (the #1 risk) | M\u00d7H | ... |\n| 2 | Terminal-reward wiring wrong (no/incorrect signal) | M\u00d7H | ... |\n| 3 | onnxruntime JVM thread-safety / native mem | L\u00d7M | ... |\n| 4 | Fixed-nation matchup overfitting (FND-0030) | M\u00d7L | ... |\n| 5 | Undiscounted long-horizon variance (FND-0033) | M\u00d7L | ... |"
+    ]
+  },
+  {
+    "title": "Dual-use potential of the trained model artifact is unexamined",
+    "severity": "major",
+    "primary_lens": "ml-failure-mode",
+    "target_file": "plan.md",
+    "target_section": "Out of scope",
+    "description": "The plan produces a trained ONNX model artifact (policy.onnx) as a deliverable. There is no analysis of whether this artifact could be misused \u2014 e.g., loaded into a modified game client to automate gameplay in multiplayer, used to train a bot that impersonates human play patterns, or repurposed as a component in a broader game-cheating pipeline.",
+    "rationale": "Any trained model artifact has dual-use potential. The brief treats policy.onnx as a neutral research output, but once exported, it's a portable file that can be loaded by anyone with onnxruntime. In gaming contexts, trained policy models are the core of botting/cheating tools. The team should at minimum acknowledge this and state the intended-use boundary.",
+    "suggested_addition": "Add to the Risks table or a new 'Dual-use' section:\n\n- **Dual-use concern**: the exported policy.onnx is a portable model artifact that could be loaded into a modified Unciv client to automate gameplay decisions in multiplayer contexts, potentially enabling botting or unfair play.\n- **Mitigation**: (1) The v1 model is trained against RandomPolicy only \u2014 it is not competitive against humans and would perform poorly in real games. (2) The ONNX metadata includes a `contract_version` and `ruleset_fingerprint` that a game client could check to refuse non-official models. (3) Document that this artifact is a research tool, not a gameplay component, and that any deployment to player-facing contexts requires a separate safety review.",
+    "supporting_roles": [
+      "ethics_responsible_ai"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "## Out of scope (task non-goals \u2014 enforced)\nSelf-play co-learning; full entity/spatial net input (v1 = global+acting_civ only); heads beyond tech+policy (greatPerson/diplomaticVote/construction/promotion stay heuristic via RoutingPolicy fallback); GPU/distributed/Ray; PPO/advanced RL; reward shaping beyond terminal \u00b11; hyperparameter sweeps; production model; gameplay/balance changes; fairness-model/featurizer-output changes."
+    ]
+  },
+  {
+    "title": "No red-team or adversarial testing commitment",
+    "severity": "major",
+    "primary_lens": "ml-failure-mode",
+    "target_file": "plan.md",
+    "target_section": "Tests \u2192 acceptance criteria",
+    "description": "The acceptance criteria cover legality, determinism, parity, learning curve, and provenance \u2014 all correctness tests. There is no commitment to adversarial testing: feeding the policy degenerate observations, edge-case legal masks (all-illegal, single-legal), or intentionally broken ONNX models to verify the system fails safely rather than silently.",
+    "rationale": "A system that loads and runs ML models should be tested against adversarial inputs. The plan mentions 'fail fast (loud error), never silent-fallback' for model-load failures (D9), but doesn't extend this to runtime adversarial inputs \u2014 e.g., an observation vector with NaN/Inf values, a legal mask with zero true entries, or an ONNX model with mismatched input dimensions. These are the kinds of inputs that cause silent failures in production ML systems.",
+    "suggested_addition": "Add to the Tests section or as a new acceptance criterion:\n\n- **AC7 ADVERSARIAL**: OnnxPolicy handles degenerate inputs safely: (a) all-illegal mask \u2192 returns \u22121 (no action); (b) single-legal mask \u2192 returns that index deterministically; (c) NaN/Inf in observation vector \u2192 fails fast with a clear error (does not silently produce NaN logits); (d) ONNX model with mismatched input width \u2192 refused at session creation with a provenance-gate error, not a runtime crash.\n- These can be unit tests in `OnnxPolicyLegalityTest.kt` or a separate `OnnxPolicyAdversarialTest.kt`.",
+    "supporting_roles": [
+      "ethics_responsible_ai"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "## Tests \u2192 acceptance criteria\n1. **Loop K\u226510 rounds headless** \u2192 ...\n2. **Legality** \u2192 `OnnxPolicyLegalityTest` (mirrors RandomPolicy legality): zero illegal indices ever.\n3. **Determinism** \u2192 ...\n4. **Parity** \u2192 ...\n5. **Learning curve** \u2192 ...\n6. **Provenance** \u2192 ..."
+    ]
+  },
+  {
+    "title": "AI/LLM involvement is claimed but no hallucination or overconfidence risk is addressed",
+    "severity": "minor",
+    "primary_lens": "ml-failure-mode",
+    "target_file": "plan.md",
+    "target_section": "Walkthrough",
+    "description": "The walkthrough is annotated with '(LLM-authored \u2014 sanity-check against the architecture detail above. The widths 232/80/~80 are illustrative; the build pins them from the generated schema.json.)' \u2014 this is good practice for the plan itself. However, the plan doesn't address whether any LLM involvement is expected in the runtime system (it isn't \u2014 this is pure MLP RL), and the disclaimer could be misread as implying LLM use in the product.",
+    "rationale": "This is a minor documentation clarity issue, not a runtime risk. But in the current climate of AI hype, a plan that says 'LLM-authored' without clarifying that the product itself contains no LLM could confuse stakeholders or reviewers about what's being built. The plan should explicitly state that the trained policy is a tiny MLP, not an LLM.",
+    "suggested_addition": "Add a one-line clarification in the Architecture section or Walkthrough preamble:\n\n- 'Note: the trained policy is a small MLP (2\u00d7128 hidden), not an LLM. The \"LLM-authored\" annotation on the walkthrough refers only to this plan document's authorship, not to the system being built.'",
+    "supporting_roles": [
+      "ethics_responsible_ai"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "(LLM-authored \u2014 sanity-check against the architecture detail above. The widths 232/80/~80 are illustrative; the build pins them from the generated `schema.json`.)"
+    ]
+  },
+  {
+    "title": "No user-facing mechanism to report harm or misuse",
+    "severity": "minor",
+    "primary_lens": "ml-failure-mode",
+    "target_file": "plan.md",
+    "target_section": "Out of scope",
+    "description": "The plan has no mechanism for users of the loop or consumers of the trained model to report issues, unexpected behavior, or misuse. For a research tool this is low-priority, but if the artifact is ever shared (e.g., as a benchmark model or a community-trained policy), there should be a minimal reporting channel.",
+    "rationale": "Accountability requires a feedback loop. Even for research infrastructure, if someone outside the team runs the loop and gets unexpected results (e.g., a policy that appears to cheat or exploit a bug), there should be a way to report that. This is a minor concern for v1 but worth noting as a v2 todo.",
+    "suggested_addition": "Add to the 'Out of scope / v2' list or as a note in the README:\n\n- 'v2: add a minimal issue-reporting mechanism (e.g., a GitHub issue template for unexpected policy behavior) if the trained model artifacts are shared beyond the research team.'",
+    "supporting_roles": [
+      "ethics_responsible_ai"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "## Out of scope (task non-goals \u2014 enforced)\nSelf-play co-learning; full entity/spatial net input ..."
+    ]
+  },
+  {
+    "title": "Loop defaults lack a hard compute budget",
+    "severity": "major",
+    "primary_lens": "compute-cost",
+    "target_file": "brief.md",
+    "target_section": "P0 / P1 split",
+    "description": "The plan says K rounds, N generation games, M eval games, high turn caps, threads, and timeouts are configurable, but it never pins the default cost envelope or an abort condition if round 0 shows the run will be expensive. For this feature, the difference between 10\u00d750\u00d7100-turn games and 10\u00d7500\u00d7500-turn games is not polish \u2014 it is the cloud bill.",
+    "rationale": "A self-play loop is a compute multiplier: simulation games \u00d7 turns \u00d7 civs \u00d7 ONNX decisions \u00d7 training epochs. Without a target wall-clock/CPU-hour budget, the team cannot tell whether the default learning curve is a $5 local experiment or a surprising CI/cloud runner bill.",
+    "suggested_addition": "Add a P0 \"default compute contract\": default K, gen-games, eval-games, maxTurns, threads, train epochs, and a hard max wall-clock/CPU-hours per full loop. Round 0 must measure turns/sec and estimate total runtime before launching K rounds; if projected runtime exceeds the budget, the driver fails with instructions to lower K/N/M/maxTurns or increase the budget explicitly. `curve.csv` should include wall_seconds, cpu_seconds_est, games/sec, civ_turns, and onnx_decisions.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Round 0 = RandomPolicy gen. Each round: gen\u2192train\u2192export\u2192eval",
+      "Loop K\u226510 rounds headless \u2192 `run_loop.py` end-to-end (gen\u2192train\u2192export\u2192eval), no manual steps"
+    ]
+  },
+  {
+    "title": "Shard retention cannot be optional polish",
+    "severity": "major",
+    "primary_lens": "compute-cost",
+    "target_file": "brief.md",
+    "target_section": "P0 / P1 split",
+    "description": "The P0/P1 split puts per-round shard retention/rotation in P1, while the loop creates fresh shard directories every round. Trajectory shards are the likely dominant storage cost and disk-failure risk once rounds and game counts increase.",
+    "rationale": "Leaving retention as \"do if cheap\" is how long-running training jobs fill ephemeral disks, upload huge artifacts, or make CI runners fail non-deterministically. Storage cost is part of the unit economics of a self-play loop, not cosmetic logging.",
+    "suggested_addition": "Move shard retention/rotation to P0. Define defaults such as `keep_last_rounds=2`, `max_shard_gb=<value>`, and `--retain-all` only when explicitly requested. Log `shard_mb`, `records`, and `records/sec` per round; after training/export succeeds, delete or compress older raw shards while preserving `curve.csv`, model metadata, schema, and enough provenance to reproduce the run.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "P1 \u2014 polish (do if cheap; never blocks the curve) - Per-round shard retention/rotation",
+      "`run_loop.py` ... Fresh per-round shard dir + retention; per-process timeout backstop."
+    ]
+  },
+  {
+    "title": "CPU thread ownership is underspecified across JVM, ORT, and PyTorch",
+    "severity": "major",
+    "primary_lens": "compute-cost",
+    "target_file": "brief.md",
+    "target_section": "Kotlin \u2014 desktop / Python \u2014 unciv_train",
+    "description": "The brief sets ORT intra-op threads to 1 and exposes simulation threads, but PyTorch CPU training, BLAS/MKL/OpenMP, Gradle daemon behavior, and the fixed `-Xmx8G` heap are not bounded as one resource contract. On a CI or cloud runner this can oversubscribe cores, inflate runtime, or require larger instances than the actual model warrants.",
+    "rationale": "For a tiny 2\u00d7128 MLP, uncontrolled library thread pools can cost more than the useful work. Right-sizing here means the loop should run predictably on a small CPU runner unless the operator opts into more.",
+    "suggested_addition": "Add a resource-control section: set `torch.set_num_threads(...)`, `torch.set_num_interop_threads(1)`, and environment defaults for `OMP_NUM_THREADS`/`MKL_NUM_THREADS`; document how these relate to `SelfPlayRunner <threads>`. Make Java heap configurable instead of always `-Xmx8G` or justify 8G with measured peak RSS. The driver should print peak RSS if available and the effective thread settings for JVM, ORT, and PyTorch.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`OnnxPolicy` ... Lazy shared `OrtEnvironment`+`OrtSession` (intra-op threads=1)",
+      "`desktop/build.gradle.kts` ... add `selfPlay` `JavaExec` task ... `-Xmx8G`"
+    ]
+  },
+  {
+    "title": "Eval sample size needs a cost/power rationale",
+    "severity": "major",
+    "primary_lens": "compute-cost",
+    "target_file": "brief.md",
+    "target_section": "Acceptance criteria / Out of scope",
+    "description": "The acceptance target is win-rate with p-value, but the plan leaves M as a generic configurable value and explicitly defers adaptive eval-stop. A too-small M produces a cheap but meaningless curve; a too-large M burns most of the budget on evaluation rather than training signal.",
+    "rationale": "Evaluation games can dominate compute because they run every round and do not improve the model. Cost-per-learning-curve-point should be known before implementation, especially if the loop is later run repeatedly during tuning.",
+    "suggested_addition": "Add a small power/cost table for default eval-games M: e.g. expected p<0.05 sensitivity for 55/60/65% win rates and projected eval CPU time from round-0 throughput. If adaptive stopping remains out of scope, state the fixed M chosen and why it is the cheapest value that can support the \u226560% @ p<0.05 acceptance target.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "eval \u2500\u2500 ./gradlew selfPlay --args=\"eval policy.onnx <M> ...\"",
+      "Learning curve \u2192 `curve.csv` + `curve.png`; honest reporting (\u226560% @ p<0.05 target, or a plain-stated plateau)."
+    ]
+  },
+  {
+    "title": "Heavy ML dependencies need CI and packaging guardrails",
+    "severity": "minor",
+    "primary_lens": "compute-cost",
+    "target_file": "brief.md",
+    "target_section": "Python \u2014 python/pyproject.toml",
+    "description": "The plan introduces PyTorch, ONNX Runtime, ONNX, matplotlib, and JVM ONNX Runtime, but does not say whether these are installed in normal test/CI paths or only in an explicit training extra. These packages are large enough that accidental default installation can materially slow CI and increase cache/artifact costs.",
+    "rationale": "Dependency weight is compute cost: cold installs, cache misses, native wheels, and larger CI images all add recurring spend. The training loop should be opt-in tooling, not a tax on every developer/test job.",
+    "suggested_addition": "Define `unciv_train` dependencies as an explicit optional/dev extra or separate lockfile used only by self-play jobs. Standard repo tests should not install PyTorch/ONNX unless running the self-play test target. Pin CPU-only wheels where applicable, document expected download/cache size, and ensure generated `.onnx` models and training outputs are not uploaded as default CI artifacts.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`python/pyproject.toml` | **new** | Package `unciv_train` (+ expose `unciv_dataplane`); deps `torch`, `onnxruntime`, `numpy`, `matplotlib`, `onnx`.",
+      "`gradle/libs.versions.toml` | edit | Add `onnxruntime = \"<pinned>\"`"
+    ]
+  },
+  {
+    "title": "Synthetic terminal samples are schema debt",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "Change inventory \u2014 Kotlin core / DataPlaneHooks.kt",
+    "description": "The plan adds fake terminal records with zero-filled observations just to carry per-civ reward. That creates a special-case row type every reader and future trainer must remember to ignore, and it pollutes a sample stream that otherwise means \"real civ-turn observation.\"",
+    "rationale": "This is exactly the kind of clever-but-costly schema trick that becomes tribal knowledge. If the terminal observation is unused, don't manufacture one unless the existing file format absolutely forces it.",
+    "suggested_addition": "Before committing to `recordTerminal(...)`, add an explicit decision: either prove the shard format cannot carry game outcome metadata elsewhere, or prefer a simpler shard-level `terminal_rewards: {civ_slot: reward}` / outcome sidecar that keeps sample rows as real observations only. If synthetic rows are unavoidable, document the invariant: `is_terminal=1` rows must never be used as observations and must contain no action labels.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`ShardRecorder.recordTerminal(perCivReward: Map<String,Float>)`: for each civ in `seenCivs`, emit ONE record with `isTerminal=1`, `reward=value`, same `civSlot`, zero-filled obs blocks matching the opened layout (terminal obs is unused for training).",
+      "`dataset.py` ... per (shard,civ_slot) read terminal reward \u2192 return-to-go broadcast"
+    ]
+  },
+  {
+    "title": "P0 is still too fat for a minimal go/no-go loop",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "P0 / P1 split",
+    "description": "The stated goal is a minimal end-to-end loop, but P0 includes a full Python package split, ONNX contract docs, parity mode, plotting, provenance gates, multiple new Kotlin classes, and four Python modules before the first curve exists. Some of that is useful, but not all of it is required to prove the learning loop works.",
+    "rationale": "Large P0s are how research spikes turn into half-finished frameworks. The first detailed plan should identify the smallest vertical slice that can produce `curve.csv`, then layer hardening after it works.",
+    "suggested_addition": "Add a `P0a \u2014 first working loop` subsection: reward wiring, desktop `OnnxPolicy`, generate/train/export/eval, and `curve.csv` only. Move non-essential polish such as `curve.png`, duplicated contract docs, retention/rotation, entropy/gamma knobs, and package niceties behind `P0b/P1` unless an acceptance criterion directly depends on them.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "**P0 \u2014 required for the loop + all 6 acceptance criteria** ... `unciv_train`: `contract`, `model`, `dataset`, `train`, `export_onnx`, `run_loop`.",
+      "Tests: legality, determinism, parity, provenance. `curve.csv` + plot."
+    ]
+  },
+  {
+    "title": "Config knobs are creeping back in",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "SelfPlayRunner / run_loop.py / P1",
+    "description": "The brief says the surface is lean, but the runner still exposes model/random mode, output paths, game counts, max turns, threads, seed, learner nation, opponent nation, retention, gamma, entropy, and eval/sample behavior. That is a lot of knobs for a v1 whose real requirement is \"run the same experiment repeatedly and plot the result.\"",
+    "rationale": "Every configurable value needs docs, defaults, validation, and future compatibility. If a junior dev cannot tell which knobs matter, the loop becomes a tiny experiment framework instead of a feature.",
+    "suggested_addition": "Define the v1 CLI contract as a short fixed set: `rounds`, `gen_games`, `eval_games`, `max_turns`, `seed`, and optionally `threads`. Hardcode learner/opponent nations for v1, keep `gamma=1.0` and entropy off in code defaults without public knobs, and make retention a simple fixed policy unless real disk pressure appears.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`gen <model|random> <out> <nGames> <maxTurns> <threads> <seed> <learnerNation> <oppNation>`; `eval <model> <M> <maxTurns> <threads> <seed> <learnerNation> <oppNation>`",
+      "P1 \u2014 `optional \u03b3 discount knob (default 1.0); entropy-bonus knob`"
+    ]
+  },
+  {
+    "title": "`SimStats` is a public utility bag",
+    "severity": "minor",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "Change inventory \u2014 Kotlin core / SimStats.kt",
+    "description": "`SimStats` mixes binomial-test math, normal CDF internals, `erf`, and game score-leader logic into a new public core object. That is a classic utility drawer: easy to add to, hard to delete, and unclear who owns it.",
+    "rationale": "Public helpers in core tend to become permanent API. If the only actual caller needs a p-value and timeout winner, expose those directly and keep the math plumbing private.",
+    "suggested_addition": "Replace `SimStats` with either `EvalStats.binomialPValue(...)` plus private math helpers, or keep the extracted functions internal to `simulation`. Put `scoreLeader(gameInfo)` next to the timeout winner logic, not in a generic stats class. Do not make `normalCdf`/`erf` public unless another current caller needs them.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`core/.../simulation/SimStats.kt` | **new** | Public `binomialTest(successes,trials,p,alt)`, `normalCdf`, `erf` (moved verbatim), `scoreLeader(gameInfo): Civilization?`",
+      "`Simulation.kt` ... Replace private `binomialTest`/`normalCdf`/`erf` with calls to `SimStats`."
+    ]
+  },
+  {
+    "title": "ONNX contract is duplicated in too many places",
+    "severity": "minor",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "Change inventory \u2014 SampleSchema.kt / contract.py / docs",
+    "description": "The plan puts ONNX names and contract constants in `SampleSchema.kt`, `python/unciv_train/contract.py`, `CONTRACT.md`, and a copied spec doc. That is four places for strings like `tech_logits` to drift, two of them documentation-only.",
+    "rationale": "Contract duplication looks tidy on day one and becomes archaeology later. The data-plane sample schema and the ONNX runtime contract are related, but they are not the same abstraction.",
+    "suggested_addition": "Keep one code-level source per language: `OnnxContract.kt` near `SelfPlayRunner/OnnxPolicy` and `unciv_train/contract.py` in Python. Remove ONNX constants from `SampleSchema.kt` unless the shard writer itself uses them. Keep one human-readable contract doc, not both `python/unciv_train/CONTRACT.md` and `specs/.../onnx-io-contract.md`, or generate/copy it as a release artifact rather than maintaining two edited files.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`SampleSchema.kt` ... Add ONNX-contract constants: `OBS_INPUT_NAME=\"obs\"`, `HEAD_TECH=\"tech\"`, `HEAD_POLICY=\"policy\"`, output names `tech_logits`/`policy_logits`, `CONTRACT_VERSION=1`.",
+      "`python/unciv_train/CONTRACT.md` ... `specs/.../onnx-io-contract.md` \u2014 copy of the contract for the spec record."
+    ]
+  }
+]

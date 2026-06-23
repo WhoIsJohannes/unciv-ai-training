@@ -14,6 +14,9 @@ ktor = "3.2.3"
 logback = "1.5.21"
 clikt = "5.0.3"
 
+# self-play: in-JVM ONNX inference (desktop-only; pinned to match the Python onnxruntime for parity)
+onnxruntime = "1.19.2"
+
 purity = "1.6.0"
 detekt = "1.23.8"
 
@@ -69,6 +72,8 @@ clikt = { group = "com.github.ajalt.clikt", name = "clikt", version.ref = "clikt
 
 jna = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
 jna-platform = { group = "net.java.dev.jna", name = "jna-platform", version.ref = "jna" }
+
+onnxruntime = { group = "com.microsoft.onnxruntime", name = "onnxruntime", version.ref = "onnxruntime" }
 
 android-ktx-core = { group = "androidx.core", name = "core-ktx", version.ref = "ktxCore" }
 android-desugar = { group = "com.android.tools", name = "desugar_jdk_libs", version.ref = "desugar" }

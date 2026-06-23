@@ -27,6 +27,12 @@ class Vocab(ruleset: Ruleset) {
     /** Index of [id] within [category], or -1 if absent (an out-of-vocab content drift). */
     fun index(category: String, id: String): Int = map(category)[id] ?: -1
 
+    /** Reverse: the id at dense [index] within [category], or null if out of range. Used by the
+     *  self-play CONTROL path to map a chosen action index back to a tech/policy id to APPLY it. */
+    fun id(category: String, index: Int): String? = sections.firstOrNull { it.first == category }?.second?.getOrNull(index)
+    fun techId(index: Int) = id(TECHS, index)
+    fun policyId(index: Int) = id(POLICIES, index)
+
     // Convenience accessors for the hot paths.
     fun tech(id: String) = index(TECHS, id)
     fun building(id: String) = index(BUILDINGS, id)

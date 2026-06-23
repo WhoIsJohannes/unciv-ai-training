@@ -17,6 +17,7 @@ import com.unciv.logic.civilization.PopupAlert
 import com.unciv.logic.civilization.diplomacy.*
 import com.unciv.logic.map.mapunit.MapUnit
 import com.unciv.logic.map.tile.Tile
+import com.unciv.logic.simulation.dataplane.DataPlaneHooks
 import com.unciv.models.ruleset.MilestoneType
 import com.unciv.models.ruleset.Policy
 import com.unciv.models.ruleset.PolicyBranch
@@ -295,6 +296,10 @@ object NextTurnAutomation {
     }
 
     private fun adoptPolicy(civInfo: Civilization) {
+        // Self-play CONTROL (D14): a policy-controlled civ already adopted the policy its PolicyProvider
+        // chose this turn (see DataPlaneHooks.chooseAndApply). Skip the heuristic so the net/random
+        // policy — not the engine AI — drives policy selection. No-op in normal play (onCivTurn null).
+        if (DataPlaneHooks.controls(civInfo)) return
         val rng = civInfo.state.stateBasedRandom("NextTurnAutomation.adoptPolicy")
         /*
         # Branch-based policy-to-adopt decision

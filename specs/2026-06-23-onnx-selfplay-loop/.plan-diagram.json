@@ -1,0 +1,36 @@
+[
+  {
+    "type": "graph",
+    "caption": "The self-play loop (driver = run_loop.py; JVM = gradle selfPlay; Python = unciv_train)",
+    "nodes": [
+      {"id": "gen", "label": "GENERATE\n./gradlew selfPlay gen\nRoutingPolicy(learner→ONNX/Random, opp→Random)", "kind": "new", "col": 0, "row": 0},
+      {"id": "shards", "label": "shards (VERSION 2)\n+ terminal reward", "kind": "edit", "col": 1, "row": 0},
+      {"id": "train", "label": "TRAIN\nunciv_train.dataset → REINFORCE+baseline", "kind": "new", "col": 2, "row": 0},
+      {"id": "export", "label": "EXPORT\nexport_onnx → policy.onnx\n(+metadata: ver, fingerprint)", "kind": "new", "col": 2, "row": 1},
+      {"id": "eval", "label": "EVAL\n./gradlew selfPlay eval\nOnnxPolicy vs Random → EVAL_RESULT", "kind": "new", "col": 1, "row": 1},
+      {"id": "curve", "label": "curve.csv + curve.png\n(round, games, winrate, pval)", "kind": "new", "col": 0, "row": 1}
+    ],
+    "edges": [
+      {"from": "gen", "to": "shards", "label": "emit"},
+      {"from": "shards", "to": "train", "label": "read"},
+      {"from": "train", "to": "export", "label": "state_dict"},
+      {"from": "export", "to": "eval", "label": "policy.onnx"},
+      {"from": "eval", "to": "curve", "label": "winrate, pval"},
+      {"from": "curve", "to": "gen", "label": "round r+1"}
+    ]
+  },
+  {
+    "type": "before_after",
+    "caption": "Change inventory — the shard schema delta is the linchpin",
+    "rows": [
+      {"before": "reward = 0f, isTerminal = 0 (hardcoded)", "after": "per-civ terminal ±1 + VERSION 1→2 (Kotlin + Python lockstep)", "kind": "edit", "risk": "high — the learning signal"},
+      {"before": "(none)", "after": "OnnxPolicy.kt (desktop) — in-JVM ONNX inference", "kind": "new"},
+      {"before": "(none)", "after": "RoutingPolicy.kt (core) — learner vs opponent", "kind": "new"},
+      {"before": "Simulation.binomialTest (private)", "after": "SimStats.kt (core, public) — reused by EVAL", "kind": "edit"},
+      {"before": "(none)", "after": "SelfPlayRunner.kt (desktop) — gen/eval/parity + gradle task", "kind": "new"},
+      {"before": "(none)", "after": "python/unciv_train/* — model, dataset, train, export_onnx, run_loop", "kind": "new"},
+      {"before": "(none)", "after": "6 tests: legality, determinism, parity, provenance, simstats", "kind": "new"},
+      {"before": "ConsoleLauncher / SimBenchmark win logic", "after": "UNCHANGED (score-leader gated behind a flag)", "kind": "ctx"}
+    ]
+  }
+]

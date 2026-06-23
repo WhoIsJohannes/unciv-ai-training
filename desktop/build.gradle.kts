@@ -66,6 +66,15 @@ tasks.register<JavaExec>("simBench") { // Headless throughput / training-data co
     jvmArgs = listOf("-Xmx4G")
 }
 
+tasks.register<JavaExec>("selfPlay") { // Self-play GENERATE / EVAL / PARITY entrypoint (in-JVM ONNX)
+    dependsOn(tasks.getByName("classes"))
+    mainClass.set("com.unciv.app.desktop.SelfPlayRunner")
+    classpath = sourceSets.main.get().runtimeClasspath
+    workingDir = assetsDir
+    isIgnoreExitValue = true
+    jvmArgs = listOf("-Xmx8G")
+}
+
 tasks.register<Jar>("dist") { // Compiles the jar file
     dependsOn(tasks.getByName("classes"))
 

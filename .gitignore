@@ -196,4 +196,16 @@ detekt/reports.html
 
 # Self-play data-plane: generated trajectory shards are perishable — regenerate, never commit
 dataplane-shards*/
+selfplay-shards*/
 *.bin
+
+# Self-play training loop: models, curves, run dirs, python venv/caches (regenerate, never commit)
+*.onnx
+training-runs/
+**/curve.csv
+**/curve.png
+python/.venv/
+python/**/__pycache__/
+python/**/*.egg-info/
+.pytest_cache/
+.feature-workflow/java.env

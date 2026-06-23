@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Any
 
 # Mirror of com.unciv.logic.simulation.dataplane.SampleSchema.VERSION — keep in lockstep.
-SCHEMA_VERSION = 1
+# v2: shards now carry a real terminal reward + an end-of-game terminal step per civ, and the
+# recorded civ-level action is applied to the game (the policy drives tech+policy). v1 shards
+# (label-only, reward=0) are not training-compatible — the reader refuses them.
+SCHEMA_VERSION = 2
 
 
 class SchemaError(Exception):

@@ -1,0 +1,5 @@
+{ "slug": "onnx-selfplay-loop", "started": "2026-06-23", "mode": "BUILD", "size": "L",
+  "current_phase": 3, "current_step": 12, "last_completed_step": 11,
+  "spec_dir": "specs/2026-06-23-onnx-selfplay-loop", "repo_root": "/Users/j/Unciv-onnx-selfplay-loop",
+  "base_branch": "self-play-data-plane", "test_mode": "integration",
+  "source_commit_at_start": "4648c03642ffc8eb63171a4cd14c21662d950ff0" }

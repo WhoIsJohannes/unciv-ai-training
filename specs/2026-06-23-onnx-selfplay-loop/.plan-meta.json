@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "mode": "BUILD",
+  "size": "L",
+  "base": "self-play-data-plane",
+  "pr_target": "self-play-data-plane",
+  "counts": {"edited": 6, "created": 18, "deleted": 0},
+  "blast_radius": "data plane CONTROL+reward (policy now drives tech/policy; schema VERSION 2) + 1-line NextTurnAutomation.adoptPolicy guard + new desktop/core policy classes + new python/unciv_train package + 6 tests; ConsoleLauncher/SimBenchmark behavior unchanged (flag-gated).",
+  "test_status": "RED-first",
+  "council": "REQUEST_CHANGES → revised (control wiring added; 1 fundamental gap + refinements folded; no KILL/BLOCK)",
+  "risks": [
+    {"n": 1, "text": "Control wiring incorrect — policy doesn't truly drive tech/policy ⇒ meaningless ~50% curve (FND-0002)", "ls": "M×H", "mitigation": "D14 control seam (pre-fill techsToResearch + adopt + adoptPolicy guard); test asserts applied tech == policy's chosen tech; recorded==applied by single-chooseIndex design"},
+    {"n": 2, "text": "Observation drift JVM↔Python (classic #1 risk)", "ls": "M×H", "mitigation": "single concat(global,acting_civ) path; golden PARITY test @1e-4 from a committed fixture; widths runtime-derived from schema.json"},
+    {"n": 3, "text": "Terminal-reward wiring wrong → no/incorrect signal", "ls": "M×H", "mitigation": "VERSION 2 + explicit recordTerminal; reward-extraction + no-negative-index gather tests; determinism guards bytes"},
+    {"n": 4, "text": "Concurrent-game memo corruption (FND-0001)", "ls": "M×H", "mitigation": "ThreadLocal memo keyed by (gameId,civID,turn); concurrent-eval smoke test"},
+    {"n": 5, "text": "Fixed-matchup overfit + undiscounted variance (FND-0030/0033)", "ls": "M×L", "mitigation": "accepted for v1 stationary-opponent go/no-go; map seed varies; baseline; optional γ; documented"}
+  ],
+  "human_actions": ["Optional: pip install -e python/ for training deps (torch/onnx/onnxruntime)"],
+  "rollback": "Revert the branch (master untouched); schema rollback = VERSION back to 1 + regenerate (datasets perishable by design).",
+  "change_inventory": [
+    {"path": "core/.../dataplane/SampleSchema.kt", "change": "edit", "why": "VERSION 1→2 + ONNX-contract name constants"},
+    {"path": "core/.../dataplane/DataPlaneHooks.kt", "change": "edit", "why": "D14 control (drive tech/policy) split from emit; recordTerminal — per-civ terminal ±1"},
+    {"path": "core/.../automation/.../NextTurnAutomation.kt", "change": "edit", "why": "D14 guard: adoptPolicy skips heuristic for policy-controlled civs"},
+    {"path": "core/.../simulation/Simulation.kt", "change": "edit", "why": "score-leader-at-cap flag; call recordTerminal; use SimStats"},
+    {"path": "core/.../simulation/SimStats.kt", "change": "new", "why": "public binomialTest + scoreLeader (extracted, reused by EVAL)"},
+    {"path": "core/.../dataplane/RoutingPolicy.kt", "change": "new", "why": "route learner→ONNX, opponents→Random (no data-plane change)"},
+    {"path": "desktop/.../OnnxPolicy.kt", "change": "new", "why": "in-JVM ONNX inference, masked sample/argmax, per-turn memo"},
+    {"path": "desktop/.../SelfPlayRunner.kt", "change": "new", "why": "headless gen/eval/parity entrypoint, Tiny 2-civ GnK"},
+    {"path": "desktop/build.gradle.kts", "change": "edit", "why": "onnxruntime impl dep + selfPlay JavaExec task"},
+    {"path": "gradle/libs.versions.toml", "change": "edit", "why": "pin onnxruntime version in the catalog"},
+    {"path": "python/unciv_train/*.py", "change": "new", "why": "contract, model, dataset, train, export_onnx, run_loop"},
+    {"path": "python/pyproject.toml", "change": "new", "why": "package unciv_train (torch/onnx/onnxruntime/numpy/matplotlib)"},
+    {"path": "tests/.../dataplane/*Test.kt", "change": "new", "why": "legality, determinism, simstats"},
+    {"path": "python/tests/test_*.py", "change": "new", "why": "parity, provenance"},
+    {"path": ".gitignore", "change": "edit", "why": "*.onnx, selfplay-output, curve.*, __pycache__"}
+  ],
+  "verification": [
+    "./gradlew :tests:test --tests '*OnnxPolicyLegalityTest' — proves zero illegal indices (AC2)",
+    "./gradlew :tests:test --tests '*SelfPlayDeterminismTest' — fixed model+seed ⇒ identical checksum (AC3)",
+    "pytest python/tests/test_parity.py — JVM vs Python logits within 1e-4 (AC4)",
+    "pytest python/tests/test_train_dataset.py — refuses mismatched VERSION/fingerprint (AC6)",
+    "python -m unciv_train.run_loop --rounds 10 — produces curve.csv + curve.png (AC1, AC5)"
+  ],
+  "out_of_scope": [
+    "self-play co-learning (v1 = learner vs RandomPolicy)",
+    "heads beyond tech+policy (greatPerson/diplomaticVote/construction/promotion stay heuristic)",
+    "full entity/spatial net input (v1 = global+acting_civ only)",
+    "GPU/distributed/Ray/PPO/reward-shaping/hyperparam-sweeps",
+    "gameplay/balance, fairness-model, or featurizer-output changes"
+  ],
+  "open_questions": [
+    "Exact GnK policyCount (70 vs ~80) — resolved empirically in build step 1 (read schema.json); contract reads it at runtime regardless"
+  ],
+  "compact": false,
+  "system_fit": {
+    "caption": "The self-play loop: generate → train → export → eval → (curve) → repeat",
+    "nodes": [
+      {"id": "gen", "label": "GENERATE (gradle selfPlay gen)\nRoutingPolicy: learner→ONNX, opp→Random", "kind": "new"},
+      {"id": "shards", "label": "shards VERSION 2\n+ terminal reward", "kind": "edit"},
+      {"id": "train", "label": "TRAIN\ndataset → REINFORCE+baseline", "kind": "new"},
+      {"id": "export", "label": "EXPORT\npolicy.onnx (+metadata)", "kind": "new"},
+      {"id": "eval", "label": "EVAL (gradle selfPlay eval)\nOnnxPolicy vs Random → EVAL_RESULT", "kind": "new"},
+      {"id": "curve", "label": "curve.csv + curve.png\nround, games, winrate, pval", "kind": "new"}
+    ],
+    "edges": [
+      {"from": "gen", "to": "shards", "label": "emit"},
+      {"from": "shards", "to": "train", "label": "read"},
+      {"from": "train", "to": "export", "label": "state_dict"},
+      {"from": "export", "to": "eval", "label": "policy.onnx"},
+      {"from": "eval", "to": "curve", "label": "winrate/pval"},
+      {"from": "curve", "to": "gen", "label": "round r+1"}
+    ]
+  }
+}

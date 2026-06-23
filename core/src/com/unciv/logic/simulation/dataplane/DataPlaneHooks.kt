@@ -19,9 +19,21 @@ class DataPlaneContext(
 )
 
 /**
- * Glue between the engine and the data plane: the startup version/fingerprint check, the shard
- * header/`schema.json` builder, the deterministic policy-RNG factory, and the per-worker
- * [ShardRecorder] that featurizes + records one trajectory step per deciding-civ turn.
+ * Glue between the engine and the data plane. Two responsibilities, deliberately separated so they
+ * compose for both GENERATE and EVAL self-play:
+ *
+ *  - **CONTROL** (always-on when a policy is installed): at each deciding-civ turn the installed
+ *    [PolicyProvider] DRIVES that civ's tech + policy — it chooses an action from the legal mask and
+ *    the choice is APPLIED to the game (not just labelled). Pre-filling `tech.techsToResearch` makes
+ *    `NextTurnAutomation.chooseTechToResearch` respect it; the chosen policy is adopted and
+ *    `adoptPolicy` is guarded to skip the heuristic for controlled civs. Decision-gated: a TECH
+ *    action is taken only when the research queue is empty; a POLICY action only when a slot is free
+ *    (otherwise the head records −1 = "no decision this turn"). This is what makes REINFORCE valid
+ *    and "OnnxPolicy vs RandomPolicy" a real comparison rather than heuristic-vs-heuristic.
+ *  - **EMIT** (only when a [ShardRecorder] is registered, i.e. GENERATE): featurize + write the
+ *    trajectory step, recording the SAME action that control just applied (recorded == applied).
+ *
+ * `onCivTurn` is `null` in normal play ⇒ ZERO behavior change. Set/cleared by the self-play runner.
  */
 object DataPlaneHooks {
 
@@ -46,20 +58,85 @@ object DataPlaneHooks {
     fun defaultRngFor(): (Civilization, Int) -> Random =
         { civ, turn -> GameContext(civInfo = civ).stateBasedRandom("dataplane-policy-$turn") }
 
-    // ---- per-game recorder routing (the static onCivTurn hook dispatches to the right shard) ----
-    private val recorders = ConcurrentHashMap<GameInfo, ShardRecorder>()
+    // ---- per-game state: a Featurizer (always, for control masks + emit obs) + an optional recorder ----
+    private class GameState(val featurizer: Featurizer, val vocab: Vocab, val recorder: ShardRecorder?)
+    private val games = ConcurrentHashMap<GameInfo, GameState>()
+    @Volatile private var installedPolicy: PolicyProvider? = null
 
-    /** Install the civ-turn recording hook (once per run). The closure routes each civ's turn to
-     *  its game's recorder; games with no registered recorder are ignored. */
+    /** Install the civ-turn hook once per run: control every registered game's deciding civ, and
+     *  emit if that game has a recorder. */
     fun install(policy: PolicyProvider) {
-        NextTurnAutomation.onCivTurn = { civ -> recorders[civ.gameInfo]?.recordCivTurn(civ, policy) }
+        installedPolicy = policy
+        NextTurnAutomation.onCivTurn = { civ -> games[civ.gameInfo]?.let { handleCivTurn(civ, it) } }
     }
 
-    fun register(gameInfo: GameInfo, recorder: ShardRecorder) { recorders[gameInfo] = recorder }
-    fun unregister(gameInfo: GameInfo) { recorders.remove(gameInfo) }
+    /** Register a game for control (+ emission if [emit]). Both GENERATE and EVAL register; only
+     *  GENERATE passes emit=true (writes shards). */
+    fun registerGame(
+        gameInfo: GameInfo, vocab: Vocab, config: SampleConfig, fingerprint: String,
+        gameId: String, seed: Long, baseName: String, emit: Boolean,
+    ) {
+        val recorder = if (emit) ShardRecorder(gameInfo, vocab, config, fingerprint, gameId, seed, baseName) else null
+        games[gameInfo] = GameState(Featurizer(gameInfo, vocab, config), vocab, recorder)
+    }
+
+    /** End-of-game: emit the per-civ terminal reward record (if emitting), publish the shard, and
+     *  unregister. [winnerCivId] is the winning civ's id, or null for a draw. */
+    fun finalizeGame(gameInfo: GameInfo, winnerCivId: String?): File? {
+        val state = games.remove(gameInfo) ?: return null
+        val rec = state.recorder ?: return null
+        rec.recordTerminal(winnerCivId)
+        return rec.close()
+    }
+
+    fun abortGame(gameInfo: GameInfo) { games.remove(gameInfo)?.recorder?.abort() }
 
     /** Clear the hook + registry at run end (restores byte-identical interactive behavior). */
-    fun uninstall() { NextTurnAutomation.onCivTurn = null; recorders.clear() }
+    fun uninstall() { NextTurnAutomation.onCivTurn = null; installedPolicy = null; games.clear() }
+
+    /** True iff a controlling policy is installed for [civ] (a registered, non-spectator major civ).
+     *  Used by `NextTurnAutomation.adoptPolicy` to skip the heuristic for controlled civs. */
+    fun controls(civ: Civilization): Boolean =
+        installedPolicy != null && civ.isMajorCiv() && !civ.isSpectator() && games.containsKey(civ.gameInfo)
+
+    private fun handleCivTurn(civ: Civilization, state: GameState) {
+        val policy = installedPolicy ?: return
+        if (!civ.isMajorCiv() || civ.isSpectator()) return
+        val obs = state.featurizer.observe(civ)
+        val turn = civ.gameInfo.turns
+        val actions = chooseAndApply(civ, policy, state.vocab, obs, turn)
+        state.recorder?.recordStep(civ, obs, actions, turn)
+    }
+
+    /** Choose (and APPLY) the controlled civ-level actions. Returns the per-head action vector in
+     *  [SampleSchema.MASK_HEADS] order; −1 = "no decision this head this turn". v1 controls tech +
+     *  policy only; greatPerson/diplomaticVote stay heuristic (recorded as −1). */
+    private fun chooseAndApply(civ: Civilization, policy: PolicyProvider, vocab: Vocab, obs: Observation, turn: Int): FloatArray {
+        val actions = FloatArray(SampleSchema.MASK_HEADS.size) { -1f }
+
+        // TECH — decision only when no current research target (queue empty); pre-fill ⇒ heuristic respects it.
+        if (civ.tech.techsToResearch.isEmpty()) {
+            val mask = boolMask(obs, "mask_tech")
+            val idx = policy.chooseIndex("tech", civ, mask, turn)
+            actions[0] = idx.toFloat()
+            if (idx >= 0) vocab.techId(idx)?.let { if (civ.tech.canBeResearched(it)) civ.tech.techsToResearch.add(it) }
+        }
+
+        // POLICY — decision only when a free policy slot is available; adopt the chosen policy.
+        if (civ.policies.canAdoptPolicy()) {
+            val mask = boolMask(obs, "mask_policy")
+            val idx = policy.chooseIndex("policy", civ, mask, turn)
+            actions[1] = idx.toFloat()
+            if (idx >= 0) vocab.policyId(idx)?.let { name ->
+                val pol = civ.gameInfo.ruleset.policies[name]
+                if (pol != null && civ.policies.isAdoptable(pol)) civ.policies.adopt(pol)
+            }
+        }
+        return actions
+    }
+
+    private fun boolMask(obs: Observation, blockName: String): BooleanArray =
+        obs.block(blockName).let { BooleanArray(it.size) { k -> it[k] != 0f } }
 
     private fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
 
@@ -74,6 +151,11 @@ object DataPlaneHooks {
             """{"name":"${esc(b.name)}","dtype":"${b.dtype}","kind":"$kind","perItem":${b.perItem},"len":${b.values.size}}"""
         }
         val channels = SampleSchema.SPATIAL_CHANNELS.joinToString(",") { "\"${esc(it)}\"" }
+        // slot↔civId for the major civs (agnostic provenance) — lets the trainer filter to its
+        // learner's steps even though turn-order shuffle varies civ_slot per game.
+        val majorSlots = gameInfo.civilizations.withIndex()
+            .filter { (_, c) -> c.isMajorCiv() && !c.isSpectator() }
+            .joinToString(",") { (i, c) -> """{"slot":$i,"civId":"${esc(c.civID)}"}""" }
         return "{" +
             """"schemaVersion":${SampleSchema.VERSION},""" +
             """"uncivVersionText":"${esc(v.text)}","uncivVersionNumber":${v.number},""" +
@@ -81,6 +163,7 @@ object DataPlaneHooks {
             """"gitSha":${gitSha()?.let { "\"${esc(it)}\"" } ?: "null"},""" +
             """"rulesetFingerprint":"${esc(fingerprint)}",""" +
             """"gameId":"${esc(gameId)}","seed":$seed,""" +
+            """"majorCivSlots":[$majorSlots],""" +
             """"nTiles":${gameInfo.tileMap.tileList.size},""" +
             """"caps":{"maxMajorCivs":${caps.maxMajorCivs},"maxCityStates":${caps.maxCityStates},""" +
             """"maxOwnCities":${caps.maxOwnCities},"maxVisOppCities":${caps.maxVisOppCities},""" +
@@ -99,8 +182,9 @@ object DataPlaneHooks {
 }
 
 /**
- * One recorder per worker → one shard file. Featurizes the deciding civ, samples the policy's
- * action per factored head, and writes a step record. NOT thread-shared.
+ * One recorder per worker → one shard file. Writes one step per controlled civ-turn (obs + the
+ * already-applied action labels), then one TERMINAL record per civ at game end carrying the
+ * ±1/0 reward. NOT thread-shared.
  */
 class ShardRecorder(
     private val gameInfo: GameInfo,
@@ -111,43 +195,63 @@ class ShardRecorder(
     private val seed: Long,
     baseName: String,
 ) {
-    private val featurizer = Featurizer(gameInfo, vocab, config)
     private val emitter = TrajectoryEmitter(File(config.outputDir ?: "."), baseName)
     private var opened = false
     private val seenCivs = HashSet<String>()
+    private val civSlotById = LinkedHashMap<String, Int>()   // preserves recording order for terminal pass
+    private var layout: List<Observation.Block> = emptyList() // captured at open for terminal zero-fill
 
-    private val actionHeads = listOf("mask_tech", "mask_policy", "mask_greatPerson", "mask_diplomaticVote")
-
-    /** Record one trajectory step for civ [x]. `isFirst` is computed from first-occurrence; the
-     *  terminal flag is left false in v1 (the game-end step is not separately buffered). */
-    fun recordCivTurn(x: Civilization, policy: PolicyProvider) {
-        val obs = featurizer.observe(x)
-        val turn = gameInfo.turns
+    /** Emit one non-terminal step for [x] with the already-chosen-and-applied [actions]. */
+    fun recordStep(x: Civilization, obs: Observation, actions: FloatArray, turn: Int) {
         val isFirst = seenCivs.add(x.civID)
+        val civSlot = gameInfo.civilizations.indexOf(x)
+        civSlotById[x.civID] = civSlot
 
-        // sample the chosen action per civ-level head (recorded as the step's action labels)
-        val actions = FloatArray(actionHeads.size) { i ->
-            val head = actionHeads[i].removePrefix("mask_")
-            val mask = obs.block(actionHeads[i]).let { BooleanArray(it.size) { k -> it[k] != 0f } }
-            policy.chooseIndex(head, x, mask, turn).toFloat()
-        }
-
-        val blocks = obs.blocks +
-            Observation.Block("actions", SampleSchema.DT_F32, BlockKind.FIXED, 0, actions)
+        val blocks = obs.blocks + Observation.Block("actions", SampleSchema.DT_F32, BlockKind.FIXED, 0, actions)
         if (!opened) {
+            layout = blocks
             val header = DataPlaneHooks.buildHeaderJson(gameInfo, fingerprint, gameId, seed, config.caps, blocks)
             emitter.open(header)
             writeSchemaSidecar(header)
             opened = true
         }
+        emitter.record(framePayload(turn, civSlot, isFirst = isFirst, isLast = false, isTerminal = false,
+            overflow = obs.overflow, reward = 0f, blocks = blocks))
+    }
 
-        val civSlot = gameInfo.civilizations.indexOf(x)
+    /** Emit one terminal reward-carrier per recorded civ: isTerminal=1, reward=±1 (winner/loser) or
+     *  0 (draw). Obs blocks are zero-filled (terminal obs is unused for training — dataset.py reads
+     *  only the reward). No-op if no steps were recorded. */
+    fun recordTerminal(winnerCivId: String?) {
+        if (!opened) return
+        val zero = zeroBlocks()
+        val turn = gameInfo.turns
+        for ((civId, civSlot) in civSlotById) {
+            val reward = when {
+                winnerCivId == null -> 0f
+                civId == winnerCivId -> 1f
+                else -> -1f
+            }
+            emitter.record(framePayload(turn, civSlot, isFirst = false, isLast = true, isTerminal = true,
+                overflow = false, reward = reward, blocks = zero))
+        }
+    }
+
+    private fun zeroBlocks(): List<Observation.Block> = layout.map { b ->
+        val len = if (b.kind == BlockKind.VARIABLE) 0 else b.values.size
+        Observation.Block(b.name, b.dtype, b.kind, b.perItem, FloatArray(len))
+    }
+
+    private fun framePayload(
+        turn: Int, civSlot: Int, isFirst: Boolean, isLast: Boolean, isTerminal: Boolean,
+        overflow: Boolean, reward: Float, blocks: List<Observation.Block>,
+    ): ByteArray {
         val payload = LeBuffer(blocks.sumOf { it.values.size } + 64)
             .i32(turn).i32(civSlot)
-            .u8(if (isFirst) 1 else 0).u8(0).u8(0) // isFirst | isLast | isTerminal (last/terminal v1=0)
-            .u8(if (obs.overflow) 1 else 0).f32(0f) // overflow flag | reward placeholder
+            .u8(if (isFirst) 1 else 0).u8(if (isLast) 1 else 0).u8(if (isTerminal) 1 else 0)
+            .u8(if (overflow) 1 else 0).f32(reward)
         for (b in blocks) Observation.writeBlock(payload, b)
-        emitter.record(payload.toByteArray())
+        return payload.toByteArray()
     }
 
     private fun writeSchemaSidecar(headerJson: String) {
