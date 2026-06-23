@@ -1,0 +1,33 @@
+{
+  "ac2": {
+    "last_k": 4,
+    "stddev_v1_reinforce": 0.22735180235338656,
+    "stddev_blind_critic": 0.1114653663700075,
+    "mean_winrate_v1_reinforce": 0.49768500000000004,
+    "mean_winrate_blind_critic": 0.34953500000000004,
+    "blind_critic_steadier": true
+  },
+  "ac3": {
+    "blind": {
+      "games": 204,
+      "wins": 59,
+      "winrate": 0.28921568627450983,
+      "pval": 0.99999999913438,
+      "learner": "SimulationCiv1",
+      "seed": 4242424,
+      "onnx_decisions": 15895
+    },
+    "rich": {
+      "games": 204,
+      "wins": 30,
+      "winrate": 0.14705882352941177,
+      "pval": 1.0,
+      "learner": "SimulationCiv1",
+      "seed": 4242424,
+      "onnx_decisions": 13846
+    },
+    "z": -3.476463984943729,
+    "p_one_sided_rich_gt_blind": 0.9997459637688944,
+    "significant_p05": false
+  }
+}
