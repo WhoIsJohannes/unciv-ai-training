@@ -157,7 +157,9 @@ def main(argv=None) -> int:
     ap.add_argument("--lam", type=float, default=0.95)
     ap.add_argument("--value-coef", type=float, default=0.5)
     ap.add_argument("--entropy-coef", type=float, default=0.01)
-    ap.add_argument("--clip-eps", type=float, default=None, help="optional PPO clip (off by default)")
+    ap.add_argument("--clip-eps", type=float, default=0.2,
+                    help="PPO clip epsilon (default 0.2; required because K epochs reuse fixed "
+                         "advantages — pass 0 for single-epoch plain A2C)")
     ap.add_argument("--resume", action="store_true", help="skip rounds already in curve.csv")
     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
     args = ap.parse_args(argv)

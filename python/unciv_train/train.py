@@ -134,44 +134,47 @@ def _optimize_actor_critic(
 ) -> tuple[object, dict]:
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     n = int(a_tech.shape[0])
-    old_logp = None
     stats = {"n": n, "n_traj": len(traj_lens), "ret_pos": n_pos}
+
+    # --- Compute advantages + value targets ONCE per round from a V-snapshot (standard PPO/A2C).
+    # Recomputing each epoch makes the target chase V (degenerate value_loss); a fixed target ≈ the
+    # bounded discounted-terminal return at λ≈1, so the critic regresses toward a stable signal.
+    with torch.no_grad():
+        tl0, pl0, val0 = forward_fn()
+        val0 = val0.reshape(-1)
+        old_logp = (_masked_logp(tl0, a_tech, m_tech) + _masked_logp(pl0, a_policy, m_policy)).detach()
+    v_np = val0.cpu().numpy()
+    adv_np = np.zeros(n, dtype=np.float32)
+    ret_np = np.zeros(n, dtype=np.float32)
+    off = 0
+    for L in traj_lens:
+        a, r = compute_gae(rewards_np[off:off + L], v_np[off:off + L], gamma, lam)
+        adv_np[off:off + L] = a
+        ret_np[off:off + L] = r
+        off += L
+    adv = torch.tensor(adv_np)
+    ret = torch.tensor(ret_np)                              # fixed value target for the round
+    if norm_adv and adv.numel() > 1:                        # BATCH-level normalization (not per-traj)
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    adv = adv.detach()
+
     for ep in range(epochs):
         opt.zero_grad()
         tl, pl, val = forward_fn()
-        val = val.reshape(-1)                              # [N]
-
-        # GAE per trajectory from the CURRENT critic (detached).
-        v_np = val.detach().cpu().numpy()
-        adv_np = np.zeros(n, dtype=np.float32)
-        ret_np = np.zeros(n, dtype=np.float32)
-        off = 0
-        for L in traj_lens:
-            a, r = compute_gae(rewards_np[off:off + L], v_np[off:off + L], gamma, lam)
-            adv_np[off:off + L] = a
-            ret_np[off:off + L] = r
-            off += L
-        adv = torch.tensor(adv_np)
-        ret = torch.tensor(ret_np)
-        if norm_adv and adv.numel() > 1:                   # BATCH-level normalization (not per-traj)
-            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-
+        val = val.reshape(-1)
         logp = _masked_logp(tl, a_tech, m_tech) + _masked_logp(pl, a_policy, m_policy)
-        if clip_eps is not None:                           # optional PPO clip (off by default)
-            if old_logp is None:
-                old_logp = logp.detach()
-            ratio = torch.exp(logp - old_logp)
-            surr = torch.min(ratio * adv.detach(),
-                             torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv.detach())
+        if clip_eps:                                        # PPO clip (default ON; 0/None ⇒ plain A2C)
+            logratio = (logp - old_logp).clamp(-20.0, 20.0)  # guard exp() overflow on big policy shifts
+            ratio = torch.exp(logratio)
+            surr = torch.min(ratio * adv, torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv)
             policy_loss = -surr.mean()
-        else:
-            policy_loss = -(adv.detach() * logp).mean()
-
+        else:                                               # plain A2C (single-epoch use)
+            policy_loss = -(adv * logp).mean()
         value_loss = F.mse_loss(val, ret)
         ent = (_entropy(tl, m_tech) + _entropy(pl, m_policy)).mean()
         loss = policy_loss + value_coef * value_loss - entropy_coef * ent
 
-        if not torch.isfinite(loss):                       # divergence guard (R8)
+        if not torch.isfinite(loss):                        # divergence guard (R8)
             stats["note"] = f"non-finite loss at epoch {ep} — aborting round"
             stats["diverged"] = True
             return net, stats

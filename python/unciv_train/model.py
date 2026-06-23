@@ -17,6 +17,15 @@ import torch.nn as nn
 from .contract import Dims
 
 
+def _small_init_value_head(layer: nn.Linear) -> None:
+    """Initialize the value head near zero so V≈0 at init — game features are unnormalized
+    (gold, science, …), so a default-init linear head would otherwise emit huge values and the
+    bounded discounted-terminal return target couldn't be fit in a few epochs. v1-reinforce ignores
+    the value head, so this does not perturb the attributable baseline."""
+    nn.init.uniform_(layer.weight, -1e-3, 1e-3)
+    nn.init.zeros_(layer.bias)
+
+
 class PolicyNet(nn.Module):
     """Blind variant: trunk over concat(global, acting_civ) → {tech, policy, value}."""
 
@@ -29,10 +38,13 @@ class PolicyNet(nn.Module):
         self.tech_head = nn.Linear(hidden, dims.tech_w)
         self.policy_head = nn.Linear(hidden, dims.policy_w)
         self.value_head = nn.Linear(hidden, 1)  # training-only critic
+        _small_init_value_head(self.value_head)  # V≈0 at init (game features are unnormalized)
 
     def forward(self, obs: torch.Tensor):
         h = self.trunk(obs)
-        return self.tech_head(h), self.policy_head(h), self.value_head(h)
+        # tanh-bound the value: the true value = expected discounted terminal reward ∈ [-1,1], so
+        # this is the correct range and it keeps V bounded despite unnormalized game features.
+        return self.tech_head(h), self.policy_head(h), torch.tanh(self.value_head(h))
 
 
 def masked_pool(tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -91,10 +103,11 @@ class RichPolicyValueNet(nn.Module):
         self.tech_head = nn.Linear(hidden, dims.tech_w)
         self.policy_head = nn.Linear(hidden, dims.policy_w)
         self.value_head = nn.Linear(hidden, 1)
+        _small_init_value_head(self.value_head)
 
     def forward(self, inputs: dict[str, torch.Tensor]):
         parts = [inputs[self.INPUT_GLOBAL], inputs[self.INPUT_ACTING]]
         for name in self.token_names:
             parts.append(self.encoders[name](inputs[name], inputs[name + "_mask"]))
         h = self.trunk(torch.cat(parts, dim=1))
-        return self.tech_head(h), self.policy_head(h), self.value_head(h)
+        return self.tech_head(h), self.policy_head(h), torch.tanh(self.value_head(h))
