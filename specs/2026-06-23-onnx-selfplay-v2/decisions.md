@@ -63,3 +63,19 @@ Reused v1's intake roster (identical RL/ML self-play domain): Core 6 + `domain_f
 - **R9 (🟡 AC2 stable-but-bad):** report BOTH last-K stddev AND mean late win-rate; "steadier" is only meaningful alongside the level (a stable 50% is not a win).
 - **R10 (🟡 padding/cost):** pad to batch-max (not global cap) per batch; entity counts already capped by SampleCaps; Medium high-N eval is FINAL-gated (run once at the end), not per-round.
 - **R11 (🟡 Stage B big-bang):** Stage B validated incrementally behind the parity test (spatial pool, then entity pools) but shipped together; parity atol=1e-4 is the correctness guard.
+
+## R12 — Final A2C/GAE recipe (supersedes R4 + progress.md's "recompute-each-epoch" note)
+Calibration on real (large-magnitude, unnormalized) game features surfaced two failures that drove
+the final recipe; the as-built `_optimize_actor_critic` is the **standard PPO/A2C** form:
+- **Advantages + GAE returns computed ONCE per round from a V-snapshot** (fixed regression target ≈
+  bounded discounted-terminal return at λ≈0.95). Recompute-each-epoch (the R4 attempt) degenerated
+  `value_loss` to `mean(adv²)` (≈477) because the target chased V — rejected.
+- **PPO clip ε=0.2 default ON, K=8 inner epochs** (a fresh net per round needs K steps to fit the
+  critic; multi-epoch reuse of fixed advantages ⇒ clipping required, exactly the council's point).
+  `clamp(logp−old_logp, ±20)` guards `exp()` overflow on large fresh-net policy shifts.
+- **tanh-bounded value head** (true value = expected discounted terminal reward ∈ [−1,1]) + **small
+  value-head init** (V≈0 at start) so the critic stays bounded despite unnormalized inputs. The value
+  head is dropped at export ⇒ zero parity/contract impact.
+Result: value_loss ~1, diverged=0, healthy entropy. **Attribution preserved:** v1-reinforce ignores
+the value head (baseline byte-unchanged); blind-critic and rich-critic share the identical PPO+GAE
+algorithm so blind→rich isolates representation, v1→blind isolates the credit mechanism.
