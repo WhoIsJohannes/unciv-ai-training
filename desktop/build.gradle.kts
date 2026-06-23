@@ -57,6 +57,15 @@ tasks.register<JavaExec>("dataGen") { // Self-play data-plane trajectory generat
     jvmArgs = listOf("-Xmx4G")
 }
 
+tasks.register<JavaExec>("simBench") { // Headless throughput / training-data cost benchmark
+    dependsOn(tasks.getByName("classes"))
+    mainClass.set("com.unciv.app.desktop.SimBenchmark")
+    classpath = sourceSets.main.get().runtimeClasspath
+    workingDir = assetsDir
+    isIgnoreExitValue = true
+    jvmArgs = listOf("-Xmx4G")
+}
+
 tasks.register<Jar>("dist") { // Compiles the jar file
     dependsOn(tasks.getByName("classes"))
 
