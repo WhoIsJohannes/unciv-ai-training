@@ -1,5 +1,5 @@
 { "slug": "onnx-selfplay-v2", "started": "2026-06-23", "mode": "BUILD", "size": "L",
-  "current_phase": 3, "current_step": 12, "last_completed_step": 11,
+  "current_phase": 4, "current_step": 17, "last_completed_step": 16,
   "spec_dir": "specs/2026-06-23-onnx-selfplay-v2", "repo_root": "/Users/j/Unciv",
   "source_commit_at_start": "8e0e4ba0ac3607d0bbabdc1296020702ccdc3497",
   "test_mode": "integration", "plan_approved": true }
