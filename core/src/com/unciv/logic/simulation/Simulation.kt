@@ -5,6 +5,8 @@ import com.unciv.UncivGame
 import com.unciv.logic.GameInfo
 import com.unciv.logic.GameStarter
 import com.unciv.logic.automation.Timers
+import com.unciv.logic.simulation.dataplane.DataPlaneHooks
+import com.unciv.logic.simulation.dataplane.ShardRecorder
 import com.unciv.models.metadata.GameSetupInfo
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.Dispatchers
@@ -23,7 +25,9 @@ class Simulation(
     val simulationsPerThread: Int = 1,
     private val threadsNumber: Int = 1,
     private val maxTurns: Int = 500,
-    private val statTurns: List<Int> = listOf()
+    private val statTurns: List<Int> = listOf(),
+    /** Opt-in self-play data plane. Null ⇒ existing behavior (no featurization, no shards). */
+    private val dataPlane: com.unciv.logic.simulation.dataplane.DataPlaneContext? = null,
 ) {
     private val maxSimulations = threadsNumber * simulationsPerThread
     private val majorCivs = newGameInfo.civilizations.filter { !it.isSpectator() && it.isMajorCiv() }.map { it.civID }
@@ -94,14 +98,35 @@ class Simulation(
 
         newGameInfo.gameParameters.shufflePlayerOrder = true
 
+        // Data-plane hook (init): install the per-civ recording hook for this run (no-op otherwise).
+        dataPlane?.let { DataPlaneHooks.install(it.policy) }
+
         Timers.singleton.startTiming()
         val jobs = (1..threadsNumber).map { threadId ->
             launch(Dispatchers.Default + CoroutineName("simulation-$threadId")) {
-                repeat(simulationsPerThread) {
+                val workerName = coroutineContext[CoroutineName]?.name ?: "simulation-$threadId"
+                repeat(simulationsPerThread) { iteration ->
                     val step = SimulationStep(newGameInfo, statTurns)
                     val gameSetupInfo = GameSetupInfo(newGameInfo)
-                    gameSetupInfo.mapParameters.seed = 0
+                    // Determinism: the data-plane path uses a non-zero seed + seeded shuffle so a
+                    // recorded scenario replays byte-identically. Default benchmark path keeps seed=0.
+                    if (dataPlane != null) {
+                        gameSetupInfo.mapParameters.seed = (threadId.toLong() shl 20) + iteration + 1
+                        gameSetupInfo.gameParameters.deterministicShuffle = true
+                    } else {
+                        gameSetupInfo.mapParameters.seed = 0
+                    }
                     val gameInfo = GameStarter.startNewGame(gameSetupInfo)
+
+                    // Data-plane hook (open shard): deterministic gameId + register a per-game recorder.
+                    var recorder: ShardRecorder? = null
+                    if (dataPlane != null) {
+                        gameInfo.gameId = "$workerName-$iteration"
+                        recorder = ShardRecorder(gameInfo, dataPlane.vocab, dataPlane.config,
+                            dataPlane.fingerprint, gameInfo.gameId, gameSetupInfo.mapParameters.seed,
+                            "shard-$workerName-$iteration")
+                        DataPlaneHooks.register(gameInfo, recorder)
+                    }
 
                     gameInfo.simulateUntilWin = true
 
@@ -129,6 +154,12 @@ class Simulation(
                         println("Max simulation ${step.turns} turns reached: Draw")
                     }
 
+                    // Data-plane hook (finalize/close): publish this game's shard, unregister recorder.
+                    if (recorder != null) {
+                        DataPlaneHooks.unregister(gameInfo)
+                        recorder.close()
+                    }
+
                     // ⚠️ these need to be thread-safe
                     updateCounter(threadId)
                     add(step)
@@ -138,6 +169,8 @@ class Simulation(
         }
 
         jobs.joinAll()
+        // Data-plane hook (teardown): clear the recording hook + registry (restores normal behavior).
+        dataPlane?.let { DataPlaneHooks.uninstall() }
         Timers.singleton.endTiming()
     }
 

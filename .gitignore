@@ -193,3 +193,7 @@ detekt/reports.html
 /buildSrc/.kotlin/errors/*
 /buildSrc/.kotlin/sessions/*
 /.claude/
+
+# Self-play data-plane: generated trajectory shards are perishable — regenerate, never commit
+dataplane-shards*/
+*.bin

@@ -48,6 +48,15 @@ tasks.register<JavaExec>("debug") {
     debug = true
 }
 
+tasks.register<JavaExec>("dataGen") { // Self-play data-plane trajectory generator (headless)
+    dependsOn(tasks.getByName("classes"))
+    mainClass.set("com.unciv.app.desktop.DataPlaneGen")
+    classpath = sourceSets.main.get().runtimeClasspath
+    workingDir = assetsDir
+    isIgnoreExitValue = true
+    jvmArgs = listOf("-Xmx4G")
+}
+
 tasks.register<Jar>("dist") { // Compiles the jar file
     dependsOn(tasks.getByName("classes"))
 

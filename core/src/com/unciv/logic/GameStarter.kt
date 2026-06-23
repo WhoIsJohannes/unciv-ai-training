@@ -318,8 +318,12 @@ class GameStarter private constructor(
         val spectators = chosenPlayers.filter { it.chosenCiv == Constants.spectator }
         val otherPlayers = chosenPlayers.filterNot { it.chosenCiv == Constants.spectator }.toMutableList()
 
-        // Shuffle Major Civs
-        if (newGameParameters.shufflePlayerOrder) otherPlayers.shuffle()
+        // Shuffle Major Civs. Default: unseeded (interactive play unchanged). Data-plane/sim path
+        // (deterministicShuffle) routes through the seeded state-based RNG for byte-identical replay.
+        if (newGameParameters.shufflePlayerOrder) {
+            if (newGameParameters.deterministicShuffle) otherPlayers.shuffle(rng)
+            else otherPlayers.shuffle()
+        }
 
         chosenPlayers.clear()
         chosenPlayers.addAll(spectators)

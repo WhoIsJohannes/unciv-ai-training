@@ -34,12 +34,22 @@ import yairm210.purity.annotations.Readonly
 
 object NextTurnAutomation {
 
+    /**
+     * Self-play data-plane injection seam (PolicyProvider). When set (sim/data-plane path ONLY),
+     * invoked at the start of each non-barbarian, non-spectator civ's automated turn so the data
+     * plane can featurize this decision point + record a trajectory step. `null` in normal play ⇒
+     * ZERO behavior change (interactive games never set it). Set/cleared by the data-gen runner.
+     */
+    var onCivTurn: ((Civilization) -> Unit)? = null
+
     /** Top-level AI turn task list */
     fun automateCivMoves(civInfo: Civilization,
                          /** set false for 'forced' automation, such as skip turn */
                          tradeAndChangeState: Boolean = true): Unit = timeThis("automateCivMoves") {
         if (civInfo.isBarbarian) return BarbarianAutomation(civInfo).automate()
         if (civInfo.isSpectator()) return // When there's a spectator in multiplayer games, it's processed automatically, but shouldn't be able to actually do anything
+
+        onCivTurn?.invoke(civInfo) // data-plane recording hook (no-op unless the sim path set it)
 
         respondToPopupAlerts(civInfo)
         TradeAutomation.respondToTradeRequests(civInfo, tradeAndChangeState)

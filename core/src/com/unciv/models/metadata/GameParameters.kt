@@ -32,6 +32,10 @@ class GameParameters : IsPartOfGameInfoSerialization { // Default values are the
     var espionageEnabled = false
     var noStartBias = false
     var shufflePlayerOrder = false
+    /** Self-play data plane (sim path only): route the player-order shuffle through the seeded
+     *  state-based RNG so scenarios are byte-identically reproducible. Default off ⇒ interactive
+     *  play is unchanged (keeps the unseeded shuffle). See logic/simulation/dataplane. */
+    var deterministicShuffle = false
 
     var victoryTypes: ArrayList<String> = arrayListOf()
     var startingEra = "Ancient era"
