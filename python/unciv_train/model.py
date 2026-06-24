@@ -270,15 +270,19 @@ def _masked_softmax_attend(scores: torch.Tensor, kv_mask: torch.Tensor,
     """NaN-safe masked attention readout (FND-0025).
 
     `scores`: [B,H,Lq,Lk] raw QKᵀ/√dk. `kv_mask`: [B,Lk] (1 keep / 0 pad). `v`: [B,H,Lk,dk].
-    Masks padded keys with −inf then softmax. A row whose keys are ALL masked yields NaN after
-    softmax (−inf − (−inf)); we detect it and force the context to ZEROS (never NaN), mirroring the
-    max-over-empty → 0 guard in masked_pool (model.py:62). Returns context [B,H,Lq,dk]."""
+    Masks padded keys with a FINITE large-negative bias (NOT −inf) then softmax. Using −inf would
+    zero the forward but produce NaN GRADIENTS in the backward pass for a fully-masked row — the
+    classic torch.where(cond, softmax(masked_fill(-inf)), 0) trap that poisons training even though
+    the forward looks correct (ship-council FND-0009/0021). A finite bias (−1e9) makes a fully-masked
+    row a uniform (finite-grad) softmax; the `where` then zeros that row's CONTEXT in the forward and
+    blocks its gradient — so neither forward nor backward ever sees NaN. Mirrors the max-over-empty→0
+    guard in masked_pool. Returns context [B,H,Lq,dk]."""
     m = kv_mask[:, None, None, :]                                   # [B,1,1,Lk] broadcast over H,Lq
-    scores = scores.masked_fill(m == 0, float("-inf"))             # padded keys → −inf
-    w = torch.softmax(scores, dim=-1)                              # all-masked row → NaN here
+    scores = scores.masked_fill(m == 0, -1e9)                      # padded keys → finite −big (NOT −inf)
+    w = torch.softmax(scores, dim=-1)                              # finite everywhere (no NaN fwd/bwd)
     # all-masked detector: a query row has NO live key iff every kv_mask entry is 0.
     any_key = (kv_mask.sum(dim=-1) > 0)                            # [B] True if ≥1 live key
-    w = torch.where(any_key[:, None, None, None], w, torch.zeros_like(w))  # dead row → 0 weights
+    w = torch.where(any_key[:, None, None, None], w, torch.zeros_like(w))  # dead row → 0 ctx + 0 grad
     ctx = torch.matmul(w, v)                                       # [B,H,Lq,dk]; dead row → 0 ctx
     return ctx
 

@@ -150,3 +150,26 @@ Round 2 added 37 findings (74 total, 17 crit) but did NOT converge — the counc
 Decision: all actionable findings across both rounds are addressed; remaining "criticals" are
 carried-forward-resolved, soft-signal-inherent, or out-of-scope. Proceed to the user approval gate (the user
 adjudicates final sufficiency with the council verdict visible).
+
+## Ship-council triage (Phase 4 Step 18 — 28 findings: 3 crit / 15 maj)
+- **FND-0009/0021 (crit) NaN-grad in masked-softmax backward — FIXED**: replaced `masked_fill(-inf)`
+  with a finite `-1e9` bias in `_masked_softmax_attend` (the -inf forward is zeroed by `where` but the
+  softmax-jacobian backward NaNs even so). Added `test_attention_backward_finite_on_fully_masked_set`
+  (backprops with every entity set masked + all nodes isolated; asserts finite grads). 12 attn/train tests green.
+- **FND-0010 (crit) ORT threading**: v4 did NOT change the shared-session / intraOp=1 design (pre-existing
+  v2/v3); a single session is shared across Simulation threads (ORT run is thread-safe). Out of scope.
+- **FND-0001 bench base mutation**: bench-onnx runs two Simulations on the same `base` template — the same
+  pattern eval uses; Simulation clones the template per game (else concurrent games would interfere), so
+  baseline/onnx start from equivalent states. Low risk; the verdict ratio is a guard, not a precise metric.
+- **FND-0004/0013 duplication** (HEX_OFFSETS Kotlin↔Python, _ALIASES seam): guarded by the adjacency-parity
+  + contract fail-loud tests; logged to cleanup-opportunities.
+- **FND-0007/0019 map-dims positional** (GLOBAL_MAPDIM_OFFSET=5): impl is positional + a worldWrap∈{0,1}
+  runtime assert (not a named schema field as the plan aspired). The assert guards drift; acceptable.
+- **FND-0017 coexistence**: model contract coexistence (gate accepts {1,2,3}) still holds; v1/v2 SHARDS are
+  refused (perishable, SCHEMA_VERSION=3) by design.
+- **FND-0023 per-decision neighbor rebuild**: correctness-safe; a per-game cache is a future optimization
+  (the graph is static within a game). Logged as future work.
+- **FND-0024 rectangular/flatEarth**: Unciv is hex-based for ALL shapes; getIfTileExistsOrNull + the hex
+  offsets apply to every shape (only the wrap radius differs, pre-resolved). Adjacency-fidelity tested hex;
+  a rectangular case would be more thorough (noted).
+- Remaining majors/minors (OOM bound, opaque exceptions, clamp sentinel): low-risk / documented / cleanup.

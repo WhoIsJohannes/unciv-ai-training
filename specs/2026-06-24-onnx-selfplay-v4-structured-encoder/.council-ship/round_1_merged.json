@@ -1,0 +1,576 @@
+[
+  {
+    "title": "ONNX benchmark may reuse a mutated base game",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt",
+    "target_section": "benchOnnx / runWith",
+    "description": "benchOnnx builds one `base` game and then runs the baseline simulation followed by the ONNX simulation against that same object. If `Simulation` mutates the supplied GameInfo instead of deep-copying it, the ONNX rung is benchmarked from an already-advanced or finished game, giving bogus turns/s and decision counts.",
+    "rationale": "This is exactly the kind of small hidden coupling that makes a throughput gate look authoritative while measuring the wrong thing. A false PASS/REJECT here can ship a slow model or reject a good one.",
+    "suggested_addition": "Build or clone a fresh base game inside `runWith`, or add a focused test asserting two consecutive `runWith` calls start from identical turn/state and produce nonzero turns/decisions.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "val base = buildBaseGameInfo(ruleset, mapSizeName)",
+      "fun runWith(policy: PolicyProvider): Triple<Double, Int, Double> {  // (turns/s, turns, wallS)\n            val sim = Simulation(\n                base, simulationsPerThread = 1, threadsNumber = threads, maxTurns = turns,"
+    ]
+  },
+  {
+    "title": "spatial_coords count drift can silently corrupt adjacency",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "python/unciv_train/features.py",
+    "target_section": "build_rich_batch",
+    "description": "build_rich_batch derives `maxn` from the spatial token rows but never verifies each step's `spatial_coords` has the same row count. If coords are truncated, extra spatial nodes are trained as isolated/padded; if coords are longer, the failure is an opaque broadcast error.",
+    "rationale": "This adds a second per-tile representation and assumes ordering/count equality by convention. That is a fragile coupling; one malformed shard should fail loud at the boundary, not train a wrong graph.",
+    "suggested_addition": "Before `_neighbor_graph_for`, guard `coords.shape[0] == s['spatial'].shape[0]` and raise a ValueError naming the step and both counts. Add a unit test with mismatched spatial/spatial_coords rows.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "spatial_arrays = [np.asarray(s[\"spatial\"], np.float32) for s in steps]\n    maxn = max(1, max(int(a.shape[0]) for a in spatial_arrays))",
+      "coords = np.asarray(s[\"spatial_coords\"], np.float32)\n            ni = int(coords.shape[0])\n            if ni:\n                gi, gm = _neighbor_graph_for(coords, s[\"global\"])"
+    ]
+  },
+  {
+    "title": "Negative entity tile index gathers tile 0, not pad row",
+    "severity": "minor",
+    "primary_lens": "yagni",
+    "target_file": "python/unciv_train/model.py",
+    "target_section": "StructuredPolicyValueNet._gather_node_by_tile",
+    "description": "The comment says absent or negative tile indices should land on the zero pad row, but `tile_idx.clamp(0, N)` maps negative values to tile 0. A bad or future sentinel value would fuse an entity with the first map tile instead of no tile.",
+    "rationale": "The entity\u2194node join is a new implicit contract. If it goes wrong, the model still runs and learns nonsense, which is worse than a clean failure.",
+    "suggested_addition": "Change the index prep to map `< 0` to `N` before clamping, and add a tiny test for `tile_idx = -1` returning the zero pad embedding.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`h_pad`: [B,N+1,C] post-GNN node features with a ZERO pad row at index N ... anything outside the real\n        node range (including the \u22121/absent sentinel after clamp) lands on the zero pad row.",
+      "idx = tile_idx.clamp(0, N).long()                            # [B,M] in [0,N] (pad row safe)"
+    ]
+  },
+  {
+    "title": "HEX_OFFSETS duplicated in Kotlin + Python with no compile-time link",
+    "severity": "major",
+    "primary_lens": "architecture",
+    "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+    "target_section": "HEX_OFFSETS:165-169 + hexgraph.OFFSETS",
+    "description": "The 6 clock-direction offsets are hand-copied into three places (OnnxPolicy.HEX_OFFSETS, hexgraph.OFFSETS, and the frozen-comment in SampleSchema). They are only kept in sync by the gradle-gated adjacency-fidelity test, which is skipped whenever the JVM toolchain is absent (`@pytest.mark.skipif(not _toolchain_ok())`). A future edit to one array in a CI environment without the JVM passes green while silently corrupting train\u2194inference adjacency agreement.",
+    "rationale": "Cross-language constant duplication with a guard that can be skipped is exactly the silent-drift failure mode this lens kills; the GNN's entire positional signal rides on these offsets matching, and a mismatch produces a wrong-but-not-crashing model.",
+    "suggested_addition": "Add a non-gradle Python assertion (in test_hexgraph or test_contract_failloud) that hard-codes the frozen offset tuple and asserts `hexgraph.OFFSETS == EXPECTED`, so offset drift fails even without the JVM toolchain. The Kotlin side already has the comment; the cheap guard is the always-run Python invariant.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "internal val HEX_OFFSETS = arrayOf(\n            intArrayOf(1, 1), intArrayOf(0, 1), intArrayOf(-1, 0),",
+      "OFFSETS: tuple[tuple[int, int], ...] = ((1, 1), (0, 1), (-1, 0), (-1, -1), (0, -1), (1, 0))",
+      "@pytest.mark.skipif(not _toolchain_ok(), reason=\"JVM toolchain (gradlew + JDK) not available\")"
+    ]
+  },
+  {
+    "title": "buildSpatialCoords silently drops tiles whose zeroBasedIndex collides or is out of range",
+    "severity": "major",
+    "primary_lens": "architecture",
+    "target_file": "core/src/com/unciv/logic/simulation/dataplane/Featurizer.kt",
+    "target_section": "buildSpatialCoords:283-296",
+    "description": "The coords block is sized `tiles.size * w` and indexed by `tile.zeroBasedIndex`. The `continue` on `base < 0 || base + w > out.size` silently skips any tile whose zeroBasedIndex >= tiles.size. If zeroBasedIndex is ever non-contiguous or > tileList.size (e.g. a sparse/edited map), that tile gets (0,0) coords, which hexgraph then maps to a real position-(0,0) row \u2014 corrupting adjacency for two tiles with no error.",
+    "rationale": "The adjacency builder keys a `{(x,y)->row}` dict; a silently-zeroed coord row creates a phantom (0,0) duplicate that the integer-exact dict lookup will resolve to the wrong node, and the only guard (the fidelity test) runs on a generated map where the invariant happens to hold.",
+    "suggested_addition": "Add a one-line invariant log/throw when `tile.zeroBasedIndex >= tiles.size` (or when two tiles map to the same base) in buildSpatialCoords, rather than silently `continue`. Even a `Log.error` line makes the corruption debuggable in production.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "val base = tile.zeroBasedIndex * w\n            if (base < 0 || base + w > out.size) continue",
+      "pos_to_row: dict[tuple[int, int], int] = {(int(x), int(y)): i for i, (x, y) in enumerate(zip(xs, ys))}"
+    ]
+  },
+  {
+    "title": "vocabCounts header emits keys the schema-reader does not all consume; partial-drift risk",
+    "severity": "minor",
+    "primary_lens": "architecture",
+    "target_file": "core/src/com/unciv/logic/simulation/dataplane/DataPlaneHooks.kt",
+    "target_section": "buildHeaderJson:146-156",
+    "description": "buildHeaderJson emits 11 vocab counts (incl. policies, policyBranches, religions, eras, nations) but the embedding model + vocab_counts_from_schema only key off a subset, and the fail-loud test (test_contract_failloud) checks a schema missing several of these keys yet still passes. A future schema that drops, say, `units` would only fail if that exact singular key is dereferenced \u2014 the contract surface is wider than the validated surface.",
+    "rationale": "An interface that emits more than its consumers validate is a quiet evolvability trap: a producer-side rename (terrains\u2192terrain) would pass the emit, pass the plural\u2192singular bridge for known aliases, and silently KeyError only at model-build time, not at the fail-loud gate.",
+    "suggested_addition": "Add a single assertion in vocab_counts_from_schema that the bridged dict contains the exact set of singular keys the embedding tables require (terrain/resource/improvement/slot-derived/unit/...), raising listing any missing \u2014 so a producer-side key drift fails at the schema gate, not at first forward().",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "\"\"\"\"terrains\":${vocab.size(Vocab.TERRAINS)},\"resources\":${vocab.resourceCount},\"\"\" +",
+      "_ALIASES = {\n        \"terrains\": \"terrain\", \"resources\": \"resource\", \"improvements\": \"improvement\","
+    ]
+  },
+  {
+    "title": "GLOBAL_MAPDIM_OFFSET=5 is a positional contract with buildGlobal, asserted only on worldWrap",
+    "severity": "major",
+    "primary_lens": "architecture",
+    "target_file": "python/unciv_train/features.py",
+    "target_section": "_read_mapdims:41-58",
+    "description": "Python reads effWrapRadius/worldWrap/shape positionally at global slots 5,6,7, coupling to the exact field order of Kotlin buildGlobal's head. The only runtime check is that slot 6 rounds to {0,1}. If anyone inserts a scalar into buildGlobal's head before the map-dims (which the diff itself just did \u2014 it grew the head from 5 to 8), effWrapRadius and shape would shift undetected; only worldWrap's 0/1 assert would catch it, and only if the shifted value happens to fall outside {0,1}.",
+    "rationale": "The decision log explicitly chose 'read by NAMED schema field, not a fragile positional offset' for robustness, yet the Python side reads positionally \u2014 the named-field intent is undermined, and a head-layout edit silently feeds a wrong wrap radius into the entire adjacency build.",
+    "suggested_addition": "Either read the three map-dims from the named schema vocabCounts/layout fields (as the Kotlin comment promises), or add an assert that effWrapRadius >= 0 and shape in {0,1,2} alongside the existing worldWrap check, so a positional shift trips on more than one slot.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "o = GLOBAL_MAPDIM_OFFSET\n    eff_wrap_radius = int(round(float(g[o])))",
+      "assert ww_round in (0, 1), (\n        f\"worldWrap global slot {o + 1} = {ww_raw!r} is not in {{0,1}} \"",
+      "GLOBAL_MAPDIM_OFFSET = 5"
+    ]
+  },
+  {
+    "title": "Live-inference neighbor build uses zeroBasedIndex order but never validates contiguity vs N",
+    "severity": "minor",
+    "primary_lens": "architecture",
+    "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+    "target_section": "buildNeighborTensorsLive:180-199",
+    "description": "buildNeighborTensorsLive allocates idx/mask of size `n*deg` indexed by `tile.zeroBasedIndex` and skips rows where `r !in 0 until n`. If the live TileMap ever has a tile whose zeroBasedIndex == n (or a gap), that node's whole neighbor row stays at sentinel N with mask 0 \u2014 the model treats a real board tile as isolated, silently degrading the GNN at inference only (the train side builds from coords and would not match). No log marks it.",
+    "rationale": "This is a train/inference adjacency-agreement divergence that the parity tests cannot catch (they inject fixture tensors, not the live map), so it would surface only as quietly-worse play in production \u2014 the exact silent-correctness class this lens guards.",
+    "suggested_addition": "Add a debug-gated `Log` line (or a one-time assert) when any `tile.zeroBasedIndex` is skipped in buildNeighborTensorsLive, so an out-of-range/gap map index is observable rather than silently producing an isolated node.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "val r = tile.zeroBasedIndex\n                if (r < 0 || r >= n) continue",
+      "val idx = LongArray(n * deg) { n.toLong() }   // sentinel = N"
+    ]
+  },
+  {
+    "title": "NaN gradients in masked softmax backward pass will poison training",
+    "severity": "critical",
+    "primary_lens": "production-readiness",
+    "target_file": "python/unciv_train/model.py",
+    "target_section": "_masked_softmax_attend",
+    "description": "The code intentionally allows `torch.softmax` to evaluate on all `-inf` inputs for fully-masked rows, producing `NaN`s, which are then zeroed out via `torch.where`. While this prevents `NaN`s in the forward output, PyTorch's `SoftmaxBackward` saves the `NaN` outputs. During backpropagation, multiplying the zero gradient from `torch.where` by the `NaN` from softmax results in `NaN` gradients (`0 * NaN = NaN`), which will silently corrupt the model weights.",
+    "rationale": "The test suite only verifies `NaN`-safety inside `with torch.no_grad()`. In a real training loop, encountering a single empty entity set (e.g., no opponent units) will cause irreversible gradient divergence, destroying the training run and wasting hours of compute.",
+    "suggested_addition": "Prevent the all `-inf` condition before softmax: `scores = torch.where(any_key[:, None, None, None], scores, 0.0)` right before `w = torch.softmax(scores, dim=-1)`.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "scores = scores.masked_fill(m == 0, float(\"-inf\"))             # padded keys \u2192 \u2212inf",
+      "w = torch.softmax(scores, dim=-1)                              # all-masked row \u2192 NaN here",
+      "w = torch.where(any_key[:, None, None, None], w, torch.zeros_like(w))  # dead row \u2192 0 weights"
+    ]
+  },
+  {
+    "title": "ONNX Runtime thread pool exhaustion causes severe CPU thrashing",
+    "severity": "critical",
+    "primary_lens": "production-readiness",
+    "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+    "target_section": "init block (OrtSession creation)",
+    "description": "`OrtSession` is created using default `SessionOptions`, which configures ONNX Runtime to use all available physical CPU cores for intra-op parallelism. Because `SelfPlayRunner` runs multiple simulations concurrently, this spawns `threads * CPU_CORES` active threads, leading to catastrophic CPU context switching.",
+    "rationale": "Unbounded thread creation in a multi-threaded host application is a classic performance killer. It will choke the host machine, artificially degrade throughput, and likely cause the model to fail the 70% benchmark gate.",
+    "suggested_addition": "Pass `SessionOptions` to `env.createSession(modelPath, options)` and explicitly set `setIntraOpNumThreads(1)` and `setInterOpNumThreads(1)`.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "private val env: OrtEnvironment = OrtEnvironment.getEnvironment()",
+      "private val session: OrtSession",
+      "session = env.createSession(modelPath)"
+    ]
+  },
+  {
+    "title": "Opaque ONNX Runtime exceptions hide critical debugging context",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+    "target_section": "forwardRich",
+    "description": "If `session.run(inputs)` throws an `OrtException` (e.g., due to a shape mismatch, missing tensor, or internal ONNX error), the exception is propagated raw. The input tensor shapes and names that caused the crash are lost.",
+    "rationale": "When an ML model crashes in production at 3am, the on-call engineer needs the exact input shapes to reproduce the crash. Without this, debugging is a guessing game that requires adding custom logging and redeploying.",
+    "suggested_addition": "Wrap `session.run(inputs)` in a `try/catch`, log the keys and shapes of all tensors in `inputs` on failure, and rethrow the exception.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "try {",
+      "    return Timers.timeThis(\"onnxForward\") {   // D8: ms/decision span",
+      "        session.run(inputs).use { res ->",
+      "            val tech = row(res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor)"
+    ]
+  },
+  {
+    "title": "Unbounded tensor allocation in batch builder risks OOM",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "python/unciv_train/features.py",
+    "target_section": "build_rich_batch",
+    "description": "`maxn` is derived directly from the maximum spatial array size in the batch (`max(int(a.shape[0]) ...)`). If a single corrupted shard reports an astronomically high tile count, the subsequent `np.zeros((n, maxn, HEX_DEGREE), dtype=np.int64)` will attempt a massive memory allocation and crash the pipeline.",
+    "rationale": "Input data should never dictate unbounded memory allocations without a sanity check. A single malformed shard can take down the entire training pipeline, requiring manual intervention to clear the bad data.",
+    "suggested_addition": "Add a defensive hard cap or assertion on `maxn` before allocation: `if maxn > 10000: raise ValueError(f\"Suspiciously large spatial dimension: {maxn}\")`.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "spatial_arrays = [np.asarray(s[\"spatial\"], np.float32) for s in steps]",
+      "maxn = max(1, max(int(a.shape[0]) for a in spatial_arrays))",
+      "if have_coords:",
+      "    nbr_idx = np.zeros((n, maxn, HEX_DEGREE), dtype=np.int64)"
+    ]
+  },
+  {
+    "title": "vocab_counts_from_schema _ALIASES dict is an unguarded Kotlin\u2194Python integration seam",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "python/unciv_train/contract.py",
+    "target_section": "vocab_counts_from_schema",
+    "description": "The _ALIASES dict maps Kotlin-emitted PLURAL vocab keys (\"terrains\", \"buildings\") to Python embedding-table SINGULAR names (\"terrain\", \"building\"). A future vocab category added in Kotlin (e.g. \"greatPeople\") would pass through the fallback `str(k)` unchanged, producing a key that doesn't match any embedding table name in the model. The model would fail at construction time with a cryptic KeyError on `self.tables[wrong_key]` \u2014 loud but non-obvious, and the existing test only checks the CURRENT set of keys, not future ones.",
+    "rationale": "This is a documented-but-unautomated lockstep point. Every new vocab category requires a coordinated edit to this dict. A missed update blocks training entirely for that ruleset/mod. As a PM, I count this as a load-bearing integration seam with no automated guard \u2014 the kind of thing that breaks silently in CI on a Friday when someone adds a new terrain type.",
+    "suggested_addition": "Add a runtime assertion after aliasing that every returned key matches a known embedding table name in StructuredPolicyValueNet's expected vocab set, OR a schema-driven test that iterates the actual vocabCounts keys from a live schema.json and asserts every key is either already singular OR has an explicit alias entry (no bare fallthrough).",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "_ALIASES = { \"terrains\": \"terrain\", \"resources\": \"resource\", ... }",
+      "return {_ALIASES.get(str(k), str(k)): int(v) for k, v in vc.items()}"
+    ]
+  },
+  {
+    "title": "Per-decision neighbor graph rebuild is O(tiles\u00d76) inside the inference hot path",
+    "severity": "minor",
+    "primary_lens": "outcomes",
+    "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+    "target_section": "buildNeighborTensorsLive",
+    "description": "`buildNeighborTensorsLive` rebuilds the entire degree-6 neighbor graph (nTiles \u00d7 6 \u00d7 getIfTileExistsOrNull lookups with world-wrap retries) inside `forwardRich`, which is called on every decision. Tile positions are static within a game, so this is O(decisions \u00d7 tiles) redundant work. For a Medium map (~1261 tiles, ~97 decisions in the benchmark) this passes the 70% throughput gate, but the scaling is linear in both tiles and decisions \u2014 larger maps or longer games could hit a latency cliff that the current bench config doesn't exercise.",
+    "rationale": "Hidden coupling between map size and decision latency. The bench-onnx mode only measures one map size (Medium). A PM seeing 'PASS' on the gate might assume all map sizes are fine, but the neighbor rebuild cost scales with tile count and isn't separately measured \u2014 it's buried inside the composite wall-clock metric.",
+    "suggested_addition": "Memoize the neighbor graph per game (e.g., compute once in `forwardRich` and reuse for subsequent decisions on the same TileMap), or at minimum log the wall-clock fraction spent in `buildNeighborTensorsLive` separately from `session.run` so the scaling behavior is visible in bench-onnx output.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "fun buildNeighborTensorsLive(env: OrtEnvironment, tileMap: TileMap): Pair<OnnxTensor, OnnxTensor> {",
+      "val tiles = tileMap.tileList; val n = tiles.size; ... for (tile in tiles) { ... }"
+    ]
+  },
+  {
+    "title": "GLOBAL_MAPDIM_OFFSET positional read contradicts plan's \"named schema field\" promise",
+    "severity": "minor",
+    "primary_lens": "outcomes",
+    "target_file": "python/unciv_train/features.py",
+    "target_section": "_read_mapdims",
+    "description": "The plan (and the Kotlin comment in `buildGlobal`) says map dims are \"Read by NAMED schema field (not a fragile positional offset)\", but `_read_mapdims` reads `effWrapRadius`, `worldWrap`, and `shape` positionally at `GLOBAL_MAPDIM_OFFSET=5`. If any new scalar is inserted into the global head before the map dims (e.g., a new game-state feature), the offset would shift and all three values would be silently wrong. Only `worldWrap` has a runtime \u2208{0,1} assert; `effWrapRadius` and `shape` have no validation.",
+    "rationale": "The plan explicitly called this risk out and claimed it was mitigated by named fields. The implementation didn't follow through. The `worldWrap` assert catches gross corruption, but a 1-slot drift (e.g., reading `aliveMajors` as `effWrapRadius` and `effWrapRadius` as `worldWrap`) could produce a plausible-but-wrong wrap radius that passes the {0,1} check. A PM reviewing this diff sees a plan-implementation gap on a documented risk.",
+    "suggested_addition": "Add validation asserts for all three values: `effWrapRadius >= 0`, `shape in (0, 1, 2)`. Alternatively, read map dims from the shard's header JSON (where they are surfaced as named `mapDims` fields) instead of the positional global vector, matching the plan's stated intent.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "GLOBAL_MAPDIM_OFFSET = 5",
+      "eff_wrap_radius = int(round(float(g[o])))",
+      "ww_raw = float(g[o + 1])",
+      "Read by NAMED schema field (not a fragile positional offset)"
+    ]
+  },
+  {
+    "title": "vocabCounts JSON in buildHeaderJson uses manual string concatenation (no escaping)",
+    "severity": "nit",
+    "primary_lens": "outcomes",
+    "target_file": "core/src/com/unciv/logic/simulation/dataplane/DataPlaneHooks.kt",
+    "target_section": "buildHeaderJson (vocabCounts construction)",
+    "description": "The `vocabCounts` JSON object is built with raw string concatenation: `\"\"\"{\"\"\" + \"\"\"\"terrains\":${vocab.size(Vocab.TERRAINS)},...\"\"\"`. Vocab keys are compile-time constants so the risk of a special character is low, but there's no escaping and the format is fragile. If a future vocab category name contains a double-quote or backslash, the emitted `schema.json` would be malformed JSON and break every Python reader.",
+    "rationale": "Low probability (controlled vocab names), but zero-cost to fix. A PM sees tech debt that future maintainers could trip over \u2014 the kind of thing that's fine until it isn't, and then the error message ('Unexpected token in schema.json') doesn't point back to this string builder.",
+    "suggested_addition": "Use Unciv's existing JSON serialization (e.g., `JsonParser().toJson(mapOf(...))` or `JSONObject`) to build the vocabCounts object, matching how the rest of the header JSON is structured.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "val vocabCounts = \"\"\"{\"\"\" + \"\"\"\"terrains\":${vocab.size(Vocab.TERRAINS)},\"resources\":${vocab.resourceCount},\"\"\" + ..."
+    ]
+  },
+  {
+    "title": "v2/v1 model coexistence claim is no longer true",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+    "target_section": "init provenance gate",
+    "description": "The bridge now advertises v1/v2/v3 coexistence, but still hard-checks `model schema_version == live SampleSchema.VERSION`. After `SampleSchema.VERSION` is bumped to 3, any previously exported v1/v2 ONNX model with schema_version 1 or 2 fails before contract dispatch, even though contract handling accepts `{1,2,3}`.",
+    "rationale": "This is a backward-compat regression for existing callers who already have exported models on disk. QA needs either an intentional migration test/documented refusal or an actual compatibility path; right now the comment and behavior disagree.",
+    "suggested_addition": "Add a regression test with an older contract-v2/schema-v2 model asserting the intended behavior. If refusal is intended, update the coexistence comments and make the error message explicitly say old schema models must be regenerated; if coexistence is intended, relax the schema gate per contract path.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "check(mSchema == expectedSchemaVersion) { \"OnnxPolicy: model schema_version=$mSchema != live $expectedSchemaVersion (regenerate)\" }",
+      "structured = mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_STRUCTURED\nrich = structured || mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_RICH",
+      "Contract v3 = v4 STRUCTURED encoder... OnnxPolicy reads META_CONTRACT_VERSION and selects the build path, so v1/v2/v3 coexist."
+    ]
+  },
+  {
+    "title": "Batch builder does not validate coords match spatial rows",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "python/unciv_train/features.py",
+    "target_section": "build_rich_batch",
+    "description": "`build_rich_batch` derives `maxn` from the spatial token arrays but fills neighbor tensors using `coords.shape[0]` without asserting it equals the spatial row count for that step. A corrupt or partially-written shard with missing/extra `spatial_coords` rows can silently train with a graph that does not correspond to the spatial tokens, or crash with a late broadcast error when `coords > spatial`.",
+    "rationale": "This is a data-contract edge case that should fail at ingestion with a useful message, not become silent label/input drift in training. The new contract depends on exact row alignment between `spatial` and `spatial_coords`.",
+    "suggested_addition": "Add a guard before `_neighbor_graph_for`: `if coords.shape[0] != spatial_arrays[i].shape[0]: raise ValueError(...)`. Add a unit test with mismatched `spatial`/`spatial_coords` counts asserting fail-loud behavior.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "spatial_arrays = [np.asarray(s[\"spatial\"], np.float32) for s in steps]\nmaxn = max(1, max(int(a.shape[0]) for a in spatial_arrays))",
+      "coords = np.asarray(s[\"spatial_coords\"], np.float32)\nni = int(coords.shape[0])\nif ni:\n    gi, gm = _neighbor_graph_for(coords, s[\"global\"])",
+      "nbr_idx[i, :ni] = gi\nnbr_mask[i, :ni] = gm"
+    ]
+  },
+  {
+    "title": "Map-dim slots are positional despite named-schema claim",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "python/unciv_train/contract.py",
+    "target_section": "GLOBAL_MAPDIM_OFFSET / features._read_mapdims",
+    "description": "The implementation hardcodes `GLOBAL_MAPDIM_OFFSET = 5`, while the Kotlin header only emits block names/perItem/len and does not emit field names or a `mapDims` offset. If Kotlin ever inserts another global head scalar before these three slots, Python will still read slots 5-7 and build the wrong adjacency graph without a schema-level failure.",
+    "rationale": "This is hidden cross-language coupling in a load-bearing contract field. QA cannot derive an acceptance test from the schema alone because the schema does not describe where `eff_wrap_radius`, `world_wrap`, and `shape` live.",
+    "suggested_addition": "Emit either `globalFields` or `mapDimsOffset` in `schema.json`, and validate it in `_read_mapdims`/contract loading. Add a fail-loud test where the schema omits or moves map-dim metadata.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "GLOBAL_MAPDIM_OFFSET = 5\nMAPDIM_SLOTS = (\"eff_wrap_radius\", \"world_wrap\", \"shape\")",
+      "o = GLOBAL_MAPDIM_OFFSET\neff_wrap_radius = int(round(float(g[o])))\nww_raw = float(g[o + 1])\nshape = int(round(float(g[o + 2])))",
+      "val layoutJson = blocks.joinToString(\",\") { b ->\n    val kind = if (b.kind == BlockKind.FIXED) \"fixed\" else \"variable\"\n    \"\"\"{\"name\":\"${esc(b.name)}\",\"dtype\":\"${b.dtype}\",\"kind\":\"$kind\",\"perItem\":${b.perItem},\"len\":${b.values.size}}\"\"\"\n}"
+    ]
+  },
+  {
+    "title": "Malformed v3 neighbor input types fail only at first decision",
+    "severity": "minor",
+    "primary_lens": "testability",
+    "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+    "target_section": "init input inventory check",
+    "description": "The v3 provenance check verifies that `neighbor_index` and `neighbor_mask` names exist, but it does not verify type or rank. A bad export with `neighbor_index` as float or `[B,N]` can pass initialization and fail later inside `session.run`, making the production failure harder to diagnose.",
+    "rationale": "The diff adds a strict int64/rank-sensitive integration point. QA wants malformed artifacts rejected at load time with a deterministic, actionable error rather than an opaque ORT runtime error on the first policy decision.",
+    "suggested_addition": "Extend the init check to inspect `session.inputInfo` for `neighbor_index: int64 [B,N,6]` and `neighbor_mask: float [B,N,6]`. Add a small test/export fixture with wrong neighbor dtype or rank asserting fail-loud load-time rejection.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "if (structured) want += SampleSchema.OnnxContract.NEIGHBOR_INPUT_NAMES\nval have = session.inputNames\nval missing = want.filter { it !in have }\ncheck(missing.isEmpty()) { \"OnnxPolicy: model missing expected inputs $missing (model has $have)\" }",
+      "const val INPUT_NEIGHBOR_INDEX = \"neighbor_index\"\nconst val INPUT_NEIGHBOR_MASK = \"neighbor_mask\"",
+      "val idxT = OnnxTensor.createTensor(env, LongBuffer.wrap(idx), longArrayOf(1, n.toLong(), deg.toLong()))\nval mskT = OnnxTensor.createTensor(env, FloatBuffer.wrap(mask), longArrayOf(1, n.toLong(), deg.toLong()))"
+    ]
+  },
+  {
+    "title": "NaN gradient poisoning in `_masked_softmax_attend` causes training divergence",
+    "severity": "critical",
+    "primary_lens": "red-team",
+    "target_file": "python/unciv_train/model.py",
+    "target_section": "_masked_softmax_attend",
+    "description": "When a batch contains an item with a fully masked entity set (e.g., `opp_units` is empty), `masked_fill` sets all scores to `-inf`, causing `torch.softmax` to output `NaN`s. Although `torch.where` zeros out the `NaN`s in the forward pass, PyTorch's autograd still routes gradients through the `NaN` outputs of the softmax during the backward pass (`0 * NaN = NaN`). This poisons the entire batch's gradients, causing the model weights to become `NaN` and permanently crashing the training loop.",
+    "rationale": "A core red team / ML security concern is model denial of service via poisoned gradients. An attacker (or just normal gameplay edge cases like no visible enemies) can trigger an empty entity set, reliably crashing the automated RL training pipeline.",
+    "suggested_addition": "Prevent `-inf` before softmax for fully masked rows. Update the mask condition: `safe_m = (m == 0) & any_key[:, None, None, None]`. Then `scores = scores.masked_fill(safe_m, float(\"-inf\"))`. This ensures empty rows get a uniform distribution (finite) from softmax before being safely zeroed out by `torch.where`.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "scores = scores.masked_fill(m == 0, float(\"-inf\"))             # padded keys \u2192 \u2212inf",
+      "w = torch.softmax(scores, dim=-1)                              # all-masked row \u2192 NaN here",
+      "w = torch.where(any_key[:, None, None, None], w, torch.zeros_like(w))  # dead row \u2192 0 weights"
+    ]
+  },
+  {
+    "title": "Uninitialized padded neighbor indices gather from tile 0 instead of sentinel",
+    "severity": "minor",
+    "primary_lens": "red-team",
+    "target_file": "python/unciv_train/features.py",
+    "target_section": "build_rich_batch",
+    "description": "In `build_rich_batch`, `nbr_idx` is initialized with `np.zeros`. For padded spatial nodes (where `ni < maxn`), the neighbor indices remain `0`, causing the GNN to gather features from tile `0` instead of the dedicated zero-padding sentinel row at index `maxn`.",
+    "rationale": "While functionally safe because `nbr_mask` is `0` for these nodes (multiplying the gathered features by zero), gathering from a valid tile instead of the sentinel row breaks the semantic isolation of padded nodes and could leak information if mask handling is ever modified or buggy.",
+    "suggested_addition": "Initialize `nbr_idx` with the sentinel value `maxn` instead of `0`: `nbr_idx = np.full((n, maxn, HEX_DEGREE), maxn, dtype=np.int64)`.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "nbr_idx = np.zeros((n, maxn, HEX_DEGREE), dtype=np.int64)",
+      "nbr_mask = np.zeros((n, maxn, HEX_DEGREE), dtype=np.float32)"
+    ]
+  },
+  {
+    "title": "Neighbor adjacency tensors rebuilt per decision without caching, raising inference CPU cost",
+    "severity": "major",
+    "primary_lens": "cost",
+    "target_file": "desktop/src/com/unciv/app/desktop/OnnxPolicy.kt",
+    "target_section": "forwardRich and buildNeighborTensorsLive (lines 135\u2013139 and 165\u2013183 in diff)",
+    "description": "The hex neighbor index and mask are derived from the game's TileMap on every policy decision by iterating over all tiles and calling getIfTileExistsOrNull for each of the 6 directions. The map geometry is static per game, so this O(N) computation per decision adds avoidable CPU cost that could degrade throughput and violate the 70% guard.",
+    "rationale": "In a production data-generation loop, uncached per-decision map processing wastes CPU cycles and increases cost-per-decision, potentially pushing the ONNX throughput below the cost-efficiency threshold. Caching adjacency once per game would reduce ms/decision and improve throughput without any loss of correctness.",
+    "suggested_addition": "Precompute the neighbor tensors lazily on the first decision of a game (or on game start) and store them in a field keyed by TileMap identity within OnnxPolicy; reuse for all subsequent decisions.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "if (tileMap != null) {  // v3 structured: add the hex-GNN neighbor inputs from the LIVE map",
+      "val (idx, mask) = buildNeighborTensorsLive(env, tileMap)",
+      "fun buildNeighborTensorsLive(env: OrtEnvironment, tileMap: TileMap): Pair<OnnxTensor, OnnxTensor> { ... for (tile in tiles) { ... tileMap.getIfTileExistsOrNull(x + HEX_OFFSETS[d][0], y + HEX_OFFSETS[d][1]) ... } }"
+    ]
+  },
+  {
+    "title": "Hex neighbor offsets assume hexagonal geometry but are applied to rectangular/flatEarth maps",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "python/unciv_train/hexgraph.py",
+    "target_section": "build_neighbor_graph",
+    "description": "The 6 clock-direction offsets and the single world-wrap retry rule (nx\u00b1R, ny\u2213R) model the HEXAGONAL coordinate space. The `shape` ordinal is accepted but explicitly ignored (`kept for signature symmetry; the wrap rule is fully captured by eff_wrap_radius, identical for hex/rectangular given R`). Unciv's rectangular and flatEarth maps do not share the hex neighbor topology or wrap geometry \u2014 a rectangular map's 6 logical neighbors and its wrap edges differ from the hex case, so adjacency will be silently wrong on those map shapes even though the model and the adjacency-fidelity test only exercise hex.",
+    "rationale": "Domain fidelity: the GNN's entire value proposition is encoding TRUE 2D board locality. If the adjacency graph is wrong on rectangular/flatEarth maps the model learns from a corrupt board topology with no error \u2014 exactly the silent-mis-decode failure the plan's fail-loud philosophy exists to prevent. The fidelity test (`adjacency-dump`) only runs a hex map, so this never gets caught in CI.",
+    "suggested_addition": "Either (a) add an explicit assertion/fail-loud in build_neighbor_graph and OnnxPolicy.buildNeighborTensorsLive that shape==hexagonal (the only validated topology), refusing rectangular/flatEarth shards rather than silently building a wrong graph; or (b) add an adjacency-fidelity test case for shape=0 (rectangular, width/2\u2260radius) as the plan's D10 item #2 explicitly required ('hex + rectangular width/2\u2260radius').",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "shape: map-shape ordinal (kept for signature symmetry; the wrap rule is fully captured by\n            ``eff_wrap_radius``, identical for hex/rectangular given R).",
+      "MapShape.rectangular -> 0f\n            MapShape.flatEarth -> 2f\n            else -> 1f   // hexagonal (default)"
+    ]
+  },
+  {
+    "title": "spatial_coords emitted for ALL tiles but fog-of-war makes spatial channels conditional \u2014 node/coord desync risk",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "core/src/com/unciv/logic/simulation/dataplane/Featurizer.kt",
+    "target_section": "buildSpatialCoords",
+    "description": "buildSpatialCoords writes (x,y) for every tile unconditionally (correct \u2014 position is static/fog-independent), but buildSpatial only fills categorical channels for explored/visible tiles (the `if (!explored) continue` / `if (!visible) continue` gates). The GNN therefore builds a full-board adjacency graph that connects fogged-but-zero-feature nodes into the message passing. The model will aggregate messages from tiles the acting civ cannot actually see, leaking board structure that the fog-of-war domain rule says the civ should not know.",
+    "rationale": "Domain fidelity: fog-of-war is a core game rule. The v3 pool encoder was permutation-invariant and only pooled real feature vectors; the new GNN gathers over the FULL coordinate graph, so unexplored neighbors now contribute (zero-feature) message slots and connect the visible board to the invisible board's geometry. This is a subtle information-leak the masked-pool never had \u2014 the agent's spatial reasoning now depends on knowing the whole map's tile count and shape even where it has no vision.",
+    "suggested_addition": "Document the intended semantics explicitly and add a test: either confirm full-board adjacency is desired (board geometry is non-secret, only contents are fogged) and assert spatial_mask gating still zeros fogged node FEATURES, or gate neighbor_mask edges to explored tiles. A one-line comment in buildSpatialCoords stating the fog decision plus a unit test over a partially-explored map would lock the intent.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Always written (position is static, fog-independent)",
+      "for (tile in tiles) {\n            val base = tile.zeroBasedIndex * w\n            if (base < 0 || base + w > out.size) continue\n            out[base] = tile.position.x.toFloat()\n            out[base + 1] = tile.position.y.toFloat()"
+    ]
+  },
+  {
+    "title": "Construction code field width vs collision-free range: city token may silently truncate large codes",
+    "severity": "minor",
+    "primary_lens": "domain",
+    "target_file": "core/src/com/unciv/logic/simulation/dataplane/Vocab.kt",
+    "target_section": "constructionCode",
+    "description": "constructionCode now returns values up to buildingCount + unitCount (a unit#k \u2192 buildingCount+k+1). This is written into a single TokenSlice float field via w.put. The fix is correct for collision-freedom, but the embedding table on the Python side must size num_embeddings = buildingCount+unitCount+1. The model's _SpatialEmbed does not embed construction at all (it's a city-token field, not a spatial channel), and there is no test asserting the city-token construction field's value range matches an embedding table sized buildingCount+unitCount+1.",
+    "rationale": "Domain fidelity: D1.4 was flagged as a live bug whose fix D2's single construction embedding 'depends on'. The collision fix landed and has a Kotlin injectivity test (ConstructionCodeTest), but the consuming side (the embedding that reads this enlarged namespace) isn't covered \u2014 a future model change that embeds construction off buildingCount+1 instead of buildingCount+unitCount+1 would silently clamp unit constructions to garbage.",
+    "suggested_addition": "Add the vocabCounts-derived num_embeddings assertion for the construction namespace where it is eventually embedded, OR a comment in constructionCode pinning the consuming embedding size to buildingCount+unitCount+1, mirroring the +1-sentinel convention documented for the spatial tables.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "fun constructionCode(name: String): Int {\n        val b = building(name)\n        if (b >= 0) return b + 1\n        val u = unit(name)\n        return if (u >= 0) buildingCount + u + 1 else 0\n    }"
+    ]
+  },
+  {
+    "title": "vocabCounts header emits policies/policyBranches but model never embeds them \u2014 silent contract surface",
+    "severity": "minor",
+    "primary_lens": "domain",
+    "target_file": "core/src/com/unciv/logic/simulation/dataplane/DataPlaneHooks.kt",
+    "target_section": "buildHeaderJson",
+    "description": "The header now emits 11 vocab counts including policies, policyBranches, nations, religions, eras, promotions. The model's _SpatialEmbed and entity encoders only consume terrain/resource/improvement/slot/unit_type/road (and the test fixtures list terrain/resource/improvement/religion/era/building/unit/nation/promotion). policies and policyBranches are emitted but the singular-alias bridge maps them to 'policy'/'policyBranch' which no embedding table reads. This is harmless today but is an undocumented divergence between what's emitted and what's modeled.",
+    "rationale": "Domain fidelity: the ubiquitous-language contract between Kotlin emit and Python model should be tight \u2014 emitting cardinalities the model provably ignores invites a future reader to assume policy embeddings exist. The acting_civ block already carries policy/branch one-hots, so the embedding-vs-one-hot representation choice for policies is a real domain modeling decision that's currently implicit.",
+    "suggested_addition": "Add a one-line comment in buildHeaderJson noting which vocabCounts are model-consumed (embeddings) vs informational/reserved (policies/policyBranches consumed as one-hots in acting_civ), so the emit/model seam documents the representation choice rather than leaving it to inference.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "\"\"\"\"eras\":${vocab.size(Vocab.ERAS)},\"policies\":${vocab.policyCount},\"\"\" +\n            \"\"\"\"policyBranches\":${vocab.policyBranchCount},\"promotions\":${vocab.promotionCount},\"\"\""
+    ]
+  },
+  {
+    "title": "Entity tile-index join uses raw float tile index with clamp \u2014 stale/negative sentinel could co-locate to a real node",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "python/unciv_train/model.py",
+    "target_section": "_gather_node_by_tile",
+    "description": "The entity\u2194node join gathers a unit/city's co-located GNN node via tok[..., tile_field] clamped to [0,N]. The Kotlin side writes currentTile.zeroBasedIndex / centerTile.zeroBasedIndex as a float. A padded/absent entity row has all-zero features, so its tile_field is 0.0 \u2192 clamp(0,N) \u2192 gathers REAL node 0's embedding, not the zero pad row. The masking (t = t * m.unsqueeze(-1)) zeroes the padded token AFTER the join, so the fused node-0 embedding is multiplied out \u2014 but only because padding mask happens to be applied. Any entity whose tile index is genuinely 0 (the real tile at zeroBasedIndex 0) is indistinguishable from a padded entity at the join step.",
+    "rationale": "Domain fidelity: the join is the load-bearing entity-grounding mechanism (FND-0036). Conflating 'padded entity (no tile)' with 'real entity on tile 0' means the model's grounding semantics for the corner/origin tile are ambiguous; correctness today relies entirely on the downstream presence-mask multiply, an implicit ordering assumption that a future refactor could break.",
+    "suggested_addition": "Add a test asserting an entity legitimately located on tile index 0 produces the same join behavior as expected (its node-0 embedding fused) while a padded row contributes zero post-mask \u2014 pinning the 'tile 0 vs padding' distinction. Alternatively emit tile index as index+1 with 0=none (mirroring the +1-sentinel convention used everywhere else) so padding and real-tile-0 are distinguishable at the join.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "idx = tile_idx.clamp(0, N).long()                            # [B,M] in [0,N] (pad row safe)",
+      "node = self._gather_node_by_tile(h_pad, tok[..., tile_field], N)  # [B,M,C]\n                t = t + self.node_to_attn(node)              # [B,M,attn_dim] fused",
+      "# zero out padded tokens so they contribute nothing as cross-attn keys/values.\n            t = t * m.unsqueeze(-1)"
+    ]
+  }
+]

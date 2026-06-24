@@ -1,0 +1,17 @@
+[
+  {
+    "role_id": "product_manager",
+    "model": "deepseek/deepseek-v4-pro",
+    "seconds": 311.7
+  },
+  {
+    "role_id": "security_red_team",
+    "model": "google/gemini-3.1-pro-preview",
+    "seconds": 245.2
+  },
+  {
+    "role_id": "practitioner",
+    "model": "google/gemini-3.1-pro-preview",
+    "seconds": 159.5
+  }
+]

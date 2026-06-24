@@ -1,0 +1,2366 @@
+diff --git a/core/src/com/unciv/logic/simulation/dataplane/DataPlaneHooks.kt b/core/src/com/unciv/logic/simulation/dataplane/DataPlaneHooks.kt
+index eddda36ec..46d393e61 100644
+--- a/core/src/com/unciv/logic/simulation/dataplane/DataPlaneHooks.kt
++++ b/core/src/com/unciv/logic/simulation/dataplane/DataPlaneHooks.kt
+@@ -143,7 +143,7 @@ object DataPlaneHooks {
+     /** Provenance + caps + layout header JSON (also written verbatim as `schema.json`). */
+     fun buildHeaderJson(
+         gameInfo: GameInfo, fingerprint: String, gameId: String, seed: Long,
+-        caps: SampleCaps, blocks: List<Observation.Block>,
++        caps: SampleCaps, blocks: List<Observation.Block>, vocab: Vocab,
+     ): String {
+         val v = UncivGame.VERSION
+         val layoutJson = blocks.joinToString(",") { b ->
+@@ -151,6 +151,16 @@ object DataPlaneHooks {
+             """{"name":"${esc(b.name)}","dtype":"${b.dtype}","kind":"$kind","perItem":${b.perItem},"len":${b.values.size}}"""
+         }
+         val channels = SampleSchema.SPATIAL_CHANNELS.joinToString(",") { "\"${esc(it)}\"" }
++        // v3: vocab counts so the Python model sizes its nn.Embedding tables (num_embeddings=count+1)
++        // from the schema — NEVER hardcoded. Names match the keys the Python embedding builder reads.
++        val vocabCounts = """{""" +
++            """"terrains":${vocab.size(Vocab.TERRAINS)},"resources":${vocab.resourceCount},""" +
++            """"improvements":${vocab.size(Vocab.IMPROVEMENTS)},"buildings":${vocab.buildingCount},""" +
++            """"units":${vocab.unitCount},"religions":${vocab.size(Vocab.RELIGIONS)},""" +
++            """"eras":${vocab.size(Vocab.ERAS)},"policies":${vocab.policyCount},""" +
++            """"policyBranches":${vocab.policyBranchCount},"promotions":${vocab.promotionCount},""" +
++            """"nations":${vocab.nationCount}""" +
++            """}"""
+         // slot↔civId for the major civs (agnostic provenance) — lets the trainer filter to its
+         // learner's steps even though turn-order shuffle varies civ_slot per game.
+         val majorSlots = gameInfo.civilizations.withIndex()
+@@ -169,6 +179,7 @@ object DataPlaneHooks {
+             """"maxOwnCities":${caps.maxOwnCities},"maxVisOppCities":${caps.maxVisOppCities},""" +
+             """"maxOwnUnits":${caps.maxOwnUnits},"maxVisOppUnits":${caps.maxVisOppUnits}},""" +
+             """"spatialChannels":[$channels],""" +
++            """"vocabCounts":$vocabCounts,""" +
+             """"layout":[$layoutJson]""" +
+             "}"
+     }
+@@ -210,7 +221,7 @@ class ShardRecorder(
+         val blocks = obs.blocks + Observation.Block("actions", SampleSchema.DT_F32, BlockKind.FIXED, 0, actions)
+         if (!opened) {
+             layout = blocks
+-            val header = DataPlaneHooks.buildHeaderJson(gameInfo, fingerprint, gameId, seed, config.caps, blocks)
++            val header = DataPlaneHooks.buildHeaderJson(gameInfo, fingerprint, gameId, seed, config.caps, blocks, vocab)
+             emitter.open(header)
+             writeSchemaSidecar(header)
+             opened = true
+diff --git a/core/src/com/unciv/logic/simulation/dataplane/Featurizer.kt b/core/src/com/unciv/logic/simulation/dataplane/Featurizer.kt
+index 04683301a..de00ab780 100644
+--- a/core/src/com/unciv/logic/simulation/dataplane/Featurizer.kt
++++ b/core/src/com/unciv/logic/simulation/dataplane/Featurizer.kt
+@@ -4,6 +4,7 @@ import com.unciv.logic.GameInfo
+ import com.unciv.logic.battle.CityCombatant
+ import com.unciv.logic.city.City
+ import com.unciv.logic.civilization.Civilization
++import com.unciv.logic.map.MapShape
+ import com.unciv.logic.map.mapunit.MapUnit
+ import com.unciv.ui.screens.victoryscreen.RankingType
+ 
+@@ -26,8 +27,8 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
+     private val channels = SampleSchema.NUM_SPATIAL_CHANNELS
+ 
+     val civTokenWidth get() = fair.tokenWidth
+-    private val cityTokenWidth = 16
+-    private val unitTokenWidth = 8
++    private val cityTokenWidth = 17  // v3: +centerTile.zeroBasedIndex (entity↔GNN-node co-location)
++    private val unitTokenWidth = 9   // v3: +currentTile.zeroBasedIndex
+ 
+     fun observe(x: Civilization): Observation {
+         var overflow = false
+@@ -127,6 +128,7 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
+             varF32("own_units", unitTokenWidth, ownUnits),
+             varF32("opp_units", unitTokenWidth, oppUnits),
+             fixedU8("spatial", buildSpatial(x, ownerSlot)),
++            fixedF32(SampleSchema.BLOCK_SPATIAL_COORDS, buildSpatialCoords()),  // v3: signed (x,y), GNN adjacency source
+             fixedU8("mask_tech", boolF(LegalActionMasks.techMask(x, vocab))),
+             fixedU8("mask_policy", boolF(LegalActionMasks.policyMask(x, vocab, ruleset))),
+             fixedU8("mask_greatPerson", boolF(LegalActionMasks.greatPersonMask(x, vocab))),
+@@ -156,11 +158,24 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
+             val s = demoCtx.perCategory.getValue(cat)
+             agg[i * 3] = s.best; agg[i * 3 + 1] = s.avg; agg[i * 3 + 2] = s.worst
+         }
++        // v3 map dims: the Python hex-GNN adjacency builder needs the EFFECTIVE wrap radius
++        // (rectangular maps wrap by width/2, hex by radius — see TileMap.getIfTileExistsOrNull),
++        // plus the worldWrap bit + shape ordinal. Read by NAMED schema field (mapDims), not a raw offset.
++        val mp = gameInfo.tileMap.mapParameters
++        val effWrapRadius = if (mp.shape == MapShape.rectangular) mp.mapSize.width / 2 else mp.mapSize.radius
++        val shapeOrdinal = when (mp.shape) {
++            MapShape.rectangular -> 0f
++            MapShape.flatEarth -> 2f
++            else -> 1f   // hexagonal (default)
++        }
+         val head = floatArrayOf(
+             gameInfo.turns.toFloat(), x.tech.era.eraNumber.toFloat(),
+             gameInfo.tileMap.tileList.size.toFloat(),
+             x.getKnownCivs().count { it.isMajorCiv() }.toFloat(),
+             gameInfo.civilizations.count { it.isMajorCiv() && it.isAlive() }.toFloat(),
++            effWrapRadius.toFloat(),
++            if (mp.worldWrap) 1f else 0f,
++            shapeOrdinal,
+         )
+         return head + agg
+     }
+@@ -200,9 +215,10 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
+         val hasSpy = config.omniscientOpponents ||
+             (!isOwn && x.espionageManager.getSpiesInCity(city).any { it.isSetUp() })
+         w.put(if (hasSpy) 1f else 0f)
++        w.put(city.getCenterTile().zeroBasedIndex)   // v3: tile index → co-locate entity with its GNN node
+         if (isOwn || hasSpy) {
+-            val cur = city.cityConstructions.currentConstructionName()
+-            w.put((vocab.building(cur).takeIf { it >= 0 } ?: vocab.unit(cur)) + 1)
++            // v3 fix: collision-free building∪unit code (see Vocab.constructionCode).
++            w.put(vocab.constructionCode(city.cityConstructions.currentConstructionName()))
+             w.put(city.cityConstructions.getBuiltBuildings().count())
+         }
+     }
+@@ -220,6 +236,7 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
+         w.put(if (capital != null) t.position.x.toInt() - capital.position.x.toInt() else 0)
+         w.put(if (capital != null) t.position.y.toInt() - capital.position.y.toInt() else 0)
+         w.put(u.promotions.getAvailablePromotions().count())
++        w.put(t.zeroBasedIndex)   // v3: tile index → co-locate entity with its GNN node
+     }
+ 
+     private fun unitTypeCat(u: MapUnit): Int = when {
+@@ -261,6 +278,24 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
+         return out
+     }
+ 
++    /**
++     * v3: per-tile signed (x,y) hex coords as a SEPARATE f32 block (u8 `spatial` clamps [0,255] and
++     * can't carry signed/large coords). Always written (position is static, fog-independent). The
++     * Python hex-GNN adjacency builder reads this; it is NOT an ONNX model input.
++     */
++    private fun buildSpatialCoords(): FloatArray {
++        val tiles = gameInfo.tileMap.tileList
++        val w = SampleSchema.NUM_SPATIAL_COORDS
++        val out = FloatArray(tiles.size * w)
++        for (tile in tiles) {
++            val base = tile.zeroBasedIndex * w
++            if (base < 0 || base + w > out.size) continue
++            out[base] = tile.position.x.toFloat()
++            out[base + 1] = tile.position.y.toFloat()
++        }
++        return out
++    }
++
+     private class TokenSlice(val arr: FloatArray, val off: Int, val width: Int) {
+         private var c = 0
+         fun put(v: Float) { if (c < width) arr[off + c] = v; c++ }
+diff --git a/core/src/com/unciv/logic/simulation/dataplane/SampleSchema.kt b/core/src/com/unciv/logic/simulation/dataplane/SampleSchema.kt
+index 3fff2585f..48f278681 100644
+--- a/core/src/com/unciv/logic/simulation/dataplane/SampleSchema.kt
++++ b/core/src/com/unciv/logic/simulation/dataplane/SampleSchema.kt
+@@ -13,13 +13,14 @@ package com.unciv.logic.simulation.dataplane
+  */
+ object SampleSchema {
+     /**
+-     * VERSION 2 (was 1): trajectory shards now carry a real terminal reward + an end-of-game
+-     * terminal step per civ (was a hardcoded `reward=0f`, `isTerminal=0` placeholder). The recorded
+-     * civ-level action is now ALSO applied to the game (the policy DRIVES tech+policy for controlled
+-     * civs — see [DataPlaneHooks]), so a v1 shard (label-only, no reward) is not training-compatible.
++     * VERSION 3 (was 2): v4 structured-encoder layout. Adds a per-tile `spatial_coords` (f32 x,y)
++     * block (the hex-GNN adjacency source — `spatial` stays u8 and cannot hold signed coords), map
++     * dims in `global` (effective wrap radius + worldWrap + shape), a per-entity tile index in the
++     * unit/city tokens, and fixes the construction-namespace collision in the city token. A v2 shard
++     * is not layout-compatible. (VERSION 2 was: real terminal reward + applied civ-level action.)
+      * The Python reader REFUSES a VERSION mismatch ⇒ regenerate; datasets are perishable by design.
+      */
+-    const val VERSION = 2
++    const val VERSION = 3
+ 
+     /** 8 ASCII bytes at the head of every shard. */
+     const val MAGIC = "UNCVSMP1"
+@@ -37,9 +38,12 @@ object SampleSchema {
+         /** Contract v1 = blind single-tensor input ("obs"); v1-reinforce + blind-critic models. */
+         const val CONTRACT_VERSION = 1
+         /** Contract v2 = rich MULTI-TENSOR input (global, acting_civ, per-type token sets + masks);
+-         *  rich-critic models. OnnxPolicy reads META_CONTRACT_VERSION and selects the build path,
+-         *  so v1 and v2 models coexist (the provenance gate accepts either). */
++         *  rich-critic (pool) models. */
+         const val CONTRACT_VERSION_RICH = 2
++        /** Contract v3 = v4 STRUCTURED encoder: the v2 multi-tensor input PLUS two hex-GNN adjacency
++         *  inputs (neighbor_index int64 + neighbor_mask f32, both [B,N,6] sharing spatial's N axis).
++         *  OnnxPolicy reads META_CONTRACT_VERSION and selects the build path, so v1/v2/v3 coexist. */
++        const val CONTRACT_VERSION_STRUCTURED = 3
+         /** Net input tensor (v1): concat(observation block "global", block "acting_civ"), float32. */
+         const val INPUT_NAME = "obs"
+         // v2 named multi-tensor inputs. Each token set pairs with a "<name>_mask" presence mask.
+@@ -47,6 +51,13 @@ object SampleSchema {
+         const val INPUT_ACTING = "acting_civ"
+         val RICH_TOKEN_NAMES = listOf("spatial", "own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens")
+         const val MASK_SUFFIX = "_mask"
++        // v3 hex-GNN adjacency inputs (NOT token sets — distinct int64 index + float mask, degree-6).
++        // Derived from per-tile coords at train time (Python) and from the live TileMap at inference (JVM).
++        const val INPUT_NEIGHBOR_INDEX = "neighbor_index"
++        const val INPUT_NEIGHBOR_MASK = "neighbor_mask"
++        val NEIGHBOR_INPUT_NAMES = listOf(INPUT_NEIGHBOR_INDEX, INPUT_NEIGHBOR_MASK)
++        /** Fixed hex degree (6 clock directions); missing neighbor → sentinel index N + mask 0. */
++        const val HEX_DEGREE = 6
+         const val OUTPUT_TECH = "tech_logits"
+         const val OUTPUT_POLICY = "policy_logits"
+         /** The civ-level heads the net controls, in `actions`-block order. */
+@@ -100,6 +111,14 @@ object SampleSchema {
+     )
+     val NUM_SPATIAL_CHANNELS get() = SPATIAL_CHANNELS.size
+ 
++    /**
++     * v3: per-tile signed (x,y) hex coordinates, emitted as a SEPARATE f32 block (the u8 `spatial`
++     * plane clamps to [0,255] and cannot carry signed/large coords). Shard-only — the Python hex-GNN
++     * adjacency builder reads it; it is NOT an ONNX model input (the model gets `neighbor_index`).
++     */
++    const val BLOCK_SPATIAL_COORDS = "spatial_coords"
++    const val NUM_SPATIAL_COORDS = 2  // (x, y)
++
+     /** Factored legal-action mask heads (boolean per candidate). Unit-intent + per-city
+      *  construction are emitted per-entity in the UNIT/CITY tokens, not as global heads. */
+     val MASK_HEADS = listOf("tech", "policy", "greatPerson", "diplomaticVote")
+diff --git a/core/src/com/unciv/logic/simulation/dataplane/Vocab.kt b/core/src/com/unciv/logic/simulation/dataplane/Vocab.kt
+index fd7300870..359677ca4 100644
+--- a/core/src/com/unciv/logic/simulation/dataplane/Vocab.kt
++++ b/core/src/com/unciv/logic/simulation/dataplane/Vocab.kt
+@@ -48,6 +48,19 @@ class Vocab(ruleset: Ruleset) {
+     fun victory(id: String) = index(VICTORIES, id)
+     fun religion(id: String) = index(RELIGIONS, id)
+ 
++    /**
++     * v3 collision-free construction code over the disjoint building∪unit namespace (field width is
++     * reserved as buildingCount+unitCount): building#k → k+1, unit#k → buildingCount+k+1, none → 0.
++     * The +1 keeps 0 = "no/empty construction". (Was a latent bug: the unit branch lacked the
++     * buildingCount offset, so building#k and unit#k collided onto the same code.)
++     */
++    fun constructionCode(name: String): Int {
++        val b = building(name)
++        if (b >= 0) return b + 1
++        val u = unit(name)
++        return if (u >= 0) buildingCount + u + 1 else 0
++    }
++
+     val techCount get() = size(TECHS)
+     val buildingCount get() = size(BUILDINGS)
+     val unitCount get() = size(UNITS)
+diff --git a/desktop/src/com/unciv/app/desktop/OnnxPolicy.kt b/desktop/src/com/unciv/app/desktop/OnnxPolicy.kt
+index 0fe70462b..b6067bb71 100644
+--- a/desktop/src/com/unciv/app/desktop/OnnxPolicy.kt
++++ b/desktop/src/com/unciv/app/desktop/OnnxPolicy.kt
+@@ -3,8 +3,10 @@ package com.unciv.app.desktop
+ import ai.onnxruntime.OnnxTensor
+ import ai.onnxruntime.OrtEnvironment
+ import ai.onnxruntime.OrtSession
++import com.unciv.logic.automation.Timers
+ import com.unciv.logic.automation.unit.UnitAutomation
+ import com.unciv.logic.civilization.Civilization
++import com.unciv.logic.map.TileMap
+ import com.unciv.logic.map.mapunit.MapUnit
+ import com.unciv.logic.simulation.dataplane.Featurizer
+ import com.unciv.logic.simulation.dataplane.Observation
+@@ -13,6 +15,7 @@ import com.unciv.logic.simulation.dataplane.SampleConfig
+ import com.unciv.logic.simulation.dataplane.SampleSchema
+ import com.unciv.logic.simulation.dataplane.Vocab
+ import java.nio.FloatBuffer
++import java.nio.LongBuffer
+ import kotlin.random.Random
+ 
+ /**
+@@ -40,8 +43,10 @@ class OnnxPolicy(
+ 
+     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
+     private val session: OrtSession
+-    /** True when the loaded model is contract v2 (rich multi-tensor input). */
++    /** True when the loaded model uses the multi-tensor input (contract v2 rich OR v3 structured). */
+     private val rich: Boolean
++    /** True when the loaded model is contract v3 (structured: rich + hex-GNN neighbor inputs). */
++    private val structured: Boolean
+ 
+     init {
+         val f = java.io.File(modelPath)
+@@ -56,21 +61,24 @@ class OnnxPolicy(
+         val mContract = req(SampleSchema.OnnxContract.META_CONTRACT_VERSION).toInt()
+         val mFingerprint = req(SampleSchema.OnnxContract.META_RULESET_FINGERPRINT)
+         check(mSchema == expectedSchemaVersion) { "OnnxPolicy: model schema_version=$mSchema != live $expectedSchemaVersion (regenerate)" }
+-        rich = mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_RICH
++        structured = mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_STRUCTURED
++        rich = structured || mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_RICH
+         check(mContract == SampleSchema.OnnxContract.CONTRACT_VERSION || rich) {
+-            "OnnxPolicy: model contract_version=$mContract not in {${SampleSchema.OnnxContract.CONTRACT_VERSION}, ${SampleSchema.OnnxContract.CONTRACT_VERSION_RICH}}"
++            "OnnxPolicy: model contract_version=$mContract not in {1, 2, 3}"
+         }
+         check(mFingerprint == expectedRulesetFingerprint) { "OnnxPolicy: model ruleset_fingerprint mismatch (regenerate against the live ruleset)" }
+-        // PROVENANCE (council): a v2 model must actually expose the full multi-tensor input inventory —
+-        // catches a contract_version=2 model whose token set drifted from the contract.
++        // PROVENANCE (council): a multi-tensor model must expose the full input inventory; a v3
++        // structured model ALSO requires the hex-GNN neighbor inputs — a malformed export that drops
++        // them fails LOUD here, not with an opaque runtime missing-input at the first decision.
+         if (rich) {
+             val want = mutableListOf(SampleSchema.OnnxContract.INPUT_GLOBAL, SampleSchema.OnnxContract.INPUT_ACTING)
+             for (n in SampleSchema.OnnxContract.RICH_TOKEN_NAMES) {
+                 want += n; want += n + SampleSchema.OnnxContract.MASK_SUFFIX
+             }
++            if (structured) want += SampleSchema.OnnxContract.NEIGHBOR_INPUT_NAMES
+             val have = session.inputNames
+             val missing = want.filter { it !in have }
+-            check(missing.isEmpty()) { "OnnxPolicy: rich (v2) model missing expected inputs $missing (model has $have)" }
++            check(missing.isEmpty()) { "OnnxPolicy: model missing expected inputs $missing (model has $have)" }
+         }
+     }
+ 
+@@ -104,7 +112,7 @@ class OnnxPolicy(
+         val cached = memo.get()
+         val m = if (cached != null && cached.key == key) cached else run {
+             val obs = Featurizer(civ.gameInfo, vocab, config).observe(civ)
+-            val (tech, policy) = if (rich) forwardRich(obs)
++            val (tech, policy) = if (rich) forwardRich(obs, if (structured) civ.gameInfo.tileMap else null)
+                                  else forward(obs.block("global") + obs.block("acting_civ"))
+             Memo(key, tech, policy).also { memo.set(it) }
+         }
+@@ -124,13 +132,20 @@ class OnnxPolicy(
+     /** Rich (contract v2) forward: build the SAME multi-tensor input the trainer pads (per-tile
+      *  spatial token set + per-type entity token sets, each with a presence mask), feed onnxruntime,
+      *  read the policy logits. EVERY created [OnnxTensor] is closed (no native leak — council R7). */
+-    private fun forwardRich(obs: Observation): Pair<FloatArray, FloatArray> {
++    private fun forwardRich(obs: Observation, tileMap: TileMap?): Pair<FloatArray, FloatArray> {
+         val inputs = buildRichTensors(env, obs)
++        if (tileMap != null) {  // v3 structured: add the hex-GNN neighbor inputs from the LIVE map
++            val (idx, mask) = buildNeighborTensorsLive(env, tileMap)
++            inputs[SampleSchema.OnnxContract.INPUT_NEIGHBOR_INDEX] = idx
++            inputs[SampleSchema.OnnxContract.INPUT_NEIGHBOR_MASK] = mask
++        }
+         try {
+-            session.run(inputs).use { res ->
+-                val tech = row(res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor)
+-                val policy = row(res.get(SampleSchema.OnnxContract.OUTPUT_POLICY).get() as OnnxTensor)
+-                return tech to policy
++            return Timers.timeThis("onnxForward") {   // D8: ms/decision span (Log-gated, zero-overhead off)
++                session.run(inputs).use { res ->
++                    val tech = row(res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor)
++                    val policy = row(res.get(SampleSchema.OnnxContract.OUTPUT_POLICY).get() as OnnxTensor)
++                    tech to policy
++                }
+             }
+         } finally {
+             for (t in inputs.values) try { t.close() } catch (_: Exception) {}
+@@ -147,8 +162,40 @@ class OnnxPolicy(
+         // Fallback per-token widths if a block is absent from the Observation (a real shard always
+         // emits all six, even empty ones — this just avoids a decision-time crash if a future schema
+         // change drops one; the empty token set is handled by the masked pool).
+-        private val FALLBACK_WIDTH = mapOf("own_units" to 8, "opp_units" to 8,
+-                                           "own_cities" to 16, "opp_cities" to 16, "civ_tokens" to 84)
++        private val FALLBACK_WIDTH = mapOf("own_units" to 9, "opp_units" to 9,
++                                           "own_cities" to 17, "opp_cities" to 17, "civ_tokens" to 84)
++
++        /** v3 clock-direction offsets (dirs 12,2,4,6,8,10) — MUST match Python hexgraph.OFFSETS.
++         *  internal so the adjacency-dump fidelity harness reuses the SAME offsets (no drift). */
++        internal val HEX_OFFSETS = arrayOf(
++            intArrayOf(1, 1), intArrayOf(0, 1), intArrayOf(-1, 0),
++            intArrayOf(-1, -1), intArrayOf(0, -1), intArrayOf(1, 0),
++        )
++
++        /** Build the live hex-GNN adjacency [1,N,6] int64 + [1,N,6] f32 from the real [TileMap] using
++         *  the engine's own world-wrap-correct [TileMap.getIfTileExistsOrNull]. Rows are in
++         *  zeroBasedIndex order (matches the spatial token set); missing neighbor → sentinel index N
++         *  (the model's zero pad row) + mask 0. Caller closes the returned tensors. */
++        fun buildNeighborTensorsLive(env: OrtEnvironment, tileMap: TileMap): Pair<OnnxTensor, OnnxTensor> {
++            val tiles = tileMap.tileList
++            val n = tiles.size
++            val deg = SampleSchema.OnnxContract.HEX_DEGREE
++            val idx = LongArray(n * deg) { n.toLong() }   // sentinel = N
++            val mask = FloatArray(n * deg)
++            for (tile in tiles) {
++                val r = tile.zeroBasedIndex
++                if (r < 0 || r >= n) continue
++                val x = tile.position.x.toInt(); val y = tile.position.y.toInt()
++                for (d in 0 until deg) {
++                    val nb = tileMap.getIfTileExistsOrNull(x + HEX_OFFSETS[d][0], y + HEX_OFFSETS[d][1])
++                    val nr = nb?.zeroBasedIndex ?: -1
++                    if (nr in 0 until n) { idx[r * deg + d] = nr.toLong(); mask[r * deg + d] = 1f }
++                }
++            }
++            val idxT = OnnxTensor.createTensor(env, LongBuffer.wrap(idx), longArrayOf(1, n.toLong(), deg.toLong()))
++            val mskT = OnnxTensor.createTensor(env, FloatBuffer.wrap(mask), longArrayOf(1, n.toLong(), deg.toLong()))
++            return idxT to mskT
++        }
+ 
+         fun buildRichTensors(env: OrtEnvironment, obs: Observation): LinkedHashMap<String, OnnxTensor> {
+             val tokens = SampleSchema.OnnxContract.RICH_TOKEN_NAMES.map { name ->
+diff --git a/desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt b/desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt
+index 83419ee63..7c2a46a7c 100644
+--- a/desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt
++++ b/desktop/src/com/unciv/app/desktop/SelfPlayRunner.kt
+@@ -9,6 +9,7 @@ import com.unciv.logic.GameInfo
+ import com.unciv.logic.GameStarter
+ import com.unciv.logic.civilization.PlayerType
+ import com.unciv.logic.map.MapParameters
++import com.unciv.logic.map.MapShape
+ import com.unciv.logic.map.MapSize
+ import com.unciv.logic.map.MirroringType
+ import com.unciv.logic.simulation.SimStats
+@@ -38,6 +39,7 @@ import com.unciv.models.tilesets.TileSetCache
+ import com.unciv.utils.Log
+ import java.io.File
+ import java.nio.FloatBuffer
++import java.nio.LongBuffer
+ import kotlin.time.ExperimentalTime
+ 
+ /**
+@@ -70,7 +72,9 @@ object SelfPlayRunner {
+             "parity-dump" -> { bootstrap(); parityDump(args) }
+             "parity-run" -> parityRun(args)   // ORT only — no engine bootstrap needed
+             "parity-dump-rich" -> { bootstrap(); parityDumpRich(args) }
+-            "parity-run-rich" -> parityRunRich(args)   // ORT only — multi-tensor v2 contract
++            "parity-run-rich" -> parityRunRich(args)   // ORT only — multi-tensor v2/v3 contract
++            "adjacency-dump" -> { bootstrap(); adjacencyDump(args) }   // v3 FND-0036 fidelity harness
++            "bench-onnx" -> { bootstrap(); benchOnnx(args) }            // D8 throughput guard (70% gate)
+             "trace" -> { bootstrap(); trace(args) }
+             else -> error("unknown mode '$mode'")
+         }
+@@ -200,17 +204,24 @@ object SelfPlayRunner {
+             statTurns = listOf(), dataPlane = DataPlaneContext(config, vocab, policy, fingerprint),
+             scoreLeaderOnTimeout = true, seedBase = seed,
+         )
++        val t0 = System.nanoTime()
+         sim.start()
++        val wallS = (System.nanoTime() - t0) / 1e9
+         val games = sim.steps.size
++        val turns = sim.steps.sumOf { it.turns }
+         val wins = sim.steps.count { it.winner == LEARNER }
+         val winrate = if (games > 0) wins.toDouble() / games else 0.0
+         val pval = if (games > 0) SimStats.binomialTest(wins.toDouble(), games.toDouble(), 0.5, "greater") else 1.0
+         val decisions = onnx.decisionCount()
+         onnx.close()
++        // D8 throughput fields: turns/s (data-gen rate) + ms/decision (ONNX forward cost proxy).
++        val turnsPerSec = if (wallS > 0) turns / wallS else 0.0
++        val msPerDecision = if (decisions > 0) wallS * 1000.0 / decisions else -1.0
+         println(
+             "EVAL_RESULT {" +
+                 "\"games\":$games,\"wins\":$wins,\"winrate\":$winrate,\"pval\":$pval," +
+-                "\"learner\":\"$LEARNER\",\"seed\":$seed,\"onnx_decisions\":$decisions}"
++                "\"learner\":\"$LEARNER\",\"seed\":$seed,\"onnx_decisions\":$decisions," +
++                "\"turns\":$turns,\"wall_clock_s\":$wallS,\"turns_per_sec\":$turnsPerSec,\"ms_per_decision\":$msPerDecision}"
+         )
+     }
+ 
+@@ -356,6 +367,10 @@ object SelfPlayRunner {
+         var global = FloatArray(0)
+         var acting = FloatArray(0)
+         val tokens = ArrayList<Triple<String, FloatArray, Int>>()
++        var neighborIdx: LongArray? = null   // v3 structured: hex-GNN neighbor inputs from the fixture
++        var neighborMask: FloatArray? = null
++        var neighborN = 0
++        var neighborDeg = SampleSchema.OnnxContract.HEX_DEGREE
+         for (raw in File(obsIn).readLines()) {
+             val line = raw.trim()
+             if (line.isEmpty()) continue
+@@ -371,6 +386,14 @@ object SelfPlayRunner {
+                     val v = FloatArray(count * width) { t[it + 4].toFloat() }
+                     tokens.add(Triple(name, v, width))
+                 }
++                "adj" -> {   // <name> adj <N> <deg> <N*deg ints/floats> — neighbor_index (int64) / neighbor_mask
++                    val nn = t[2].toInt(); val deg = t[3].toInt()
++                    neighborN = nn; neighborDeg = deg
++                    if (name == SampleSchema.OnnxContract.INPUT_NEIGHBOR_INDEX)
++                        neighborIdx = LongArray(nn * deg) { t[it + 4].toFloat().toLong() }
++                    else if (name == SampleSchema.OnnxContract.INPUT_NEIGHBOR_MASK)
++                        neighborMask = FloatArray(nn * deg) { t[it + 4].toFloat() }
++                }
+             }
+         }
+         val env = OrtEnvironment.getEnvironment()
+@@ -379,6 +402,13 @@ object SelfPlayRunner {
+         var inputs: LinkedHashMap<String, OnnxTensor>? = null
+         try {
+             inputs = OnnxPolicy.richTensorsFromArrays(env, global, acting, tokens)
++            val nIdx = neighborIdx; val nMask = neighborMask
++            if (nIdx != null && nMask != null) {   // v3 structured: feed fixture-built neighbor tensors
++                inputs[SampleSchema.OnnxContract.INPUT_NEIGHBOR_INDEX] =
++                    OnnxTensor.createTensor(env, LongBuffer.wrap(nIdx), longArrayOf(1, neighborN.toLong(), neighborDeg.toLong()))
++                inputs[SampleSchema.OnnxContract.INPUT_NEIGHBOR_MASK] =
++                    OnnxTensor.createTensor(env, FloatBuffer.wrap(nMask), longArrayOf(1, neighborN.toLong(), neighborDeg.toLong()))
++            }
+             session.run(inputs).use { res ->
+                 @Suppress("UNCHECKED_CAST")
+                 val tech = (res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor).value as Array<FloatArray>
+@@ -394,4 +424,89 @@ object SelfPlayRunner {
+         }
+         println("PARITY_RUN_RICH -> $logitsOut")
+     }
++
++    /** v3 FND-0036 fidelity dump: emit per-tile (x,y) + the LIVE engine's degree-6 neighbor
++     *  zeroBasedIndices (getIfTileExistsOrNull + the SAME [OnnxPolicy.HEX_OFFSETS] used at inference)
++     *  on a WORLD-WRAP map, so a Python test can assert hexgraph.build_neighbor_graph reproduces it. */
++    @ExperimentalTime
++    private fun adjacencyDump(args: Array<String>) {
++        val seed = args.getOrNull(1)?.toLongOrNull() ?: 4242L
++        val out = args.getOrNull(2) ?: "adjacency-dump.json"
++        val mapSizeName = args.getOrNull(3) ?: "Tiny"
++        val ruleset = setupRuleset()
++        val mp = mapParameters(seed, mapSizeName).apply { worldWrap = true }  // exercise the wrap branch
++        val game = GameStarter.startNewGame(GameSetupInfo(gameParameters(ruleset), mp))
++        UncivGame.Current.gameInfo = game
++        val tm = game.tileMap
++        val n = tm.tileList.size
++        val deg = SampleSchema.OnnxContract.HEX_DEGREE
++        val coords = Array(n) { intArrayOf(0, 0) }
++        val live = Array(n) { IntArray(deg) { -1 } }
++        for (tile in tm.tileList) {
++            val r = tile.zeroBasedIndex
++            if (r < 0 || r >= n) continue
++            val x = tile.position.x.toInt(); val y = tile.position.y.toInt()
++            coords[r] = intArrayOf(x, y)
++            for (d in 0 until deg) {
++                val nb = tm.getIfTileExistsOrNull(x + OnnxPolicy.HEX_OFFSETS[d][0], y + OnnxPolicy.HEX_OFFSETS[d][1])
++                live[r][d] = nb?.zeroBasedIndex ?: -1
++            }
++        }
++        val effWrapRadius = if (mp.shape == MapShape.rectangular) mp.mapSize.width / 2 else mp.mapSize.radius
++        val shapeOrd = when (mp.shape) { MapShape.rectangular -> 0; MapShape.flatEarth -> 2; else -> 1 }
++        val sb = StringBuilder("{")
++        sb.append("\"nTiles\":$n,\"effWrapRadius\":$effWrapRadius,")
++        sb.append("\"worldWrap\":${if (mp.worldWrap) 1 else 0},\"shape\":$shapeOrd,")
++        sb.append("\"coords\":[").append((0 until n).joinToString(",") { "[${coords[it][0]},${coords[it][1]}]" }).append("],")
++        sb.append("\"live\":[").append((0 until n).joinToString(",") { live[it].joinToString(",", "[", "]") }).append("]}")
++        File(out).writeText(sb.toString())
++        println("ADJACENCY_DUMP nTiles=$n worldWrap=${mp.worldWrap} -> $out")
++    }
++
++    /** D8 throughput guard: measure data-gen turns/s on the SAME 2-civ training config (correct
++     *  ruleset fingerprint — NOT SimBenchmark's 6-major BenchCiv config which would fail the OnnxPolicy
++     *  gate) for a heuristic baseline (RandomPolicy) vs the ONNX rung, and emit a PASS/REJECT verdict
++     *  (REJECT if onnx turns/s < 70% of baseline). The ladder parses the "BENCH| RUNG ... verdict=" line. */
++    @ExperimentalTime
++    private fun benchOnnx(args: Array<String>) {
++        val modelArg = args.getOrNull(1) ?: error("bench-onnx: model path required")
++        val turns = args.getOrNull(2)?.toIntOrNull() ?: 200
++        val mapSizeName = args.getOrNull(3) ?: "Medium"
++        val threads = args.getOrNull(4)?.toIntOrNull() ?: 1
++        val seed = args.getOrNull(5)?.toLongOrNull() ?: 777_000L
++        val ruleset = setupRuleset()
++        val fingerprint = RulesetFingerprint.compute(ruleset)
++        val vocab = Vocab(ruleset)
++        val config = SampleConfig(enabled = false, deterministicShuffle = true, caps = SampleCaps.DEFAULT)
++        val base = buildBaseGameInfo(ruleset, mapSizeName)
++
++        fun runWith(policy: PolicyProvider): Triple<Double, Int, Double> {  // (turns/s, turns, wallS)
++            val sim = Simulation(
++                base, simulationsPerThread = 1, threadsNumber = threads, maxTurns = turns,
++                statTurns = listOf(), dataPlane = DataPlaneContext(config, vocab, policy, fingerprint),
++                scoreLeaderOnTimeout = true, seedBase = seed,
++            )
++            val t0 = System.nanoTime(); sim.start(); val s = (System.nanoTime() - t0) / 1e9
++            val tt = sim.steps.sumOf { it.turns }
++            return Triple(if (s > 0) tt / s else 0.0, tt, s)
++        }
++
++        // Heuristic baseline (no ONNX) — both sides RandomPolicy on the same config.
++        val (baselineTps, _, _) = runWith(
++            RoutingPolicy(LEARNER, RandomPolicy(DataPlaneHooks.defaultRngFor()), RandomPolicy(DataPlaneHooks.defaultRngFor())))
++        // ONNX rung — learner routed to the net.
++        val onnx = OnnxPolicy(modelArg, vocab, config, DataPlaneHooks.defaultRngFor(), eval = true, SampleSchema.VERSION, fingerprint)
++        try {
++            val (onnxTps, _, onnxWallS) = runWith(RoutingPolicy(LEARNER, onnx, RandomPolicy(DataPlaneHooks.defaultRngFor())))
++            val decisions = onnx.decisionCount()
++            val msPerDecision = if (decisions > 0) onnxWallS * 1000.0 / decisions else -1.0
++            val ratio = if (baselineTps > 0) onnxTps / baselineTps else 0.0
++            val verdict = if (ratio >= 0.70) "PASS" else "REJECT"
++            println("BENCH| RUNG model=$modelArg map=$mapSizeName baseline_tps=${"%.2f".format(baselineTps)} " +
++                "onnx_tps=${"%.2f".format(onnxTps)} ratio=${"%.3f".format(ratio)} " +
++                "ms_per_decision=${"%.3f".format(msPerDecision)} onnx_decisions=$decisions verdict=$verdict")
++        } finally {
++            onnx.close()   // closes the OrtSession (no native leak across rungs — FND-0048)
++        }
++    }
+ }
+diff --git a/python/tests/test_contract_failloud.py b/python/tests/test_contract_failloud.py
+new file mode 100644
+index 000000000..689366ba8
+--- /dev/null
++++ b/python/tests/test_contract_failloud.py
+@@ -0,0 +1,62 @@
++"""Contract fail-loud + version tests (FND-0007/0011/0022 + the plural→singular seam).
++
++Schema-driven widths/cardinalities MUST come from the schema; a missing field RAISES rather than
++silently using a stale fallback (which would drift the Kotlin↔Python contract). Fast, no JVM.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from unciv_train import contract
++
++
++def _write(tmp_path, obj) -> str:
++    p = tmp_path / "schema.json"
++    p.write_text(json.dumps(obj))
++    return str(p)
++
++
++def test_contract_versions_distinct():
++    assert contract.CONTRACT_VERSION_RICH == 2
++    assert contract.CONTRACT_VERSION_STRUCTURED == 3
++    assert contract.NEIGHBOR_INPUT_NAMES == ["neighbor_index", "neighbor_mask"]
++
++
++def test_vocab_counts_missing_raises(tmp_path):
++    path = _write(tmp_path, {"schemaVersion": 3, "spatialChannels": ["a", "b"]})  # no vocabCounts
++    with pytest.raises(ValueError, match="vocabCounts"):
++        contract.vocab_counts_from_schema(path)
++
++
++def test_vocab_counts_plural_keys_map_to_singular(tmp_path):
++    # The Kotlin header emits PLURAL keys; the model embeds off SINGULAR names. The reader bridges.
++    path = _write(tmp_path, {"vocabCounts": {
++        "terrains": 6, "resources": 5, "improvements": 4, "religions": 3, "eras": 4,
++        "buildings": 7, "units": 8, "promotions": 3, "nations": 2,
++    }})
++    vc = contract.vocab_counts_from_schema(path)
++    for singular, expected in [("terrain", 6), ("resource", 5), ("improvement", 4),
++                               ("religion", 3), ("era", 4), ("building", 7), ("unit", 8),
++                               ("promotion", 3), ("nation", 2)]:
++        assert vc[singular] == expected, f"{singular} not bridged from plural key"
++
++
++def test_token_specs_failloud_missing_perItem(tmp_path):
++    # spatialChannels present but an entity perItem missing → RAISE (no silent stale-width fallback).
++    path = _write(tmp_path, {
++        "spatialChannels": ["c"] * 13,
++        "layout": [{"name": "own_units", "perItem": 9}],  # opp_units/... missing
++    })
++    with pytest.raises(ValueError, match="perItem"):
++        contract.token_specs_from_schema(path)
++
++
++def test_token_specs_failloud_missing_spatialchannels(tmp_path):
++    path = _write(tmp_path, {"layout": [
++        {"name": n, "perItem": w} for n, w in
++        [("own_units", 9), ("opp_units", 9), ("own_cities", 17), ("opp_cities", 17), ("civ_tokens", 84)]
++    ]})  # no spatialChannels
++    with pytest.raises((ValueError, KeyError)):
++        contract.token_specs_from_schema(path)
+diff --git a/python/tests/test_hexgraph.py b/python/tests/test_hexgraph.py
+new file mode 100644
+index 000000000..bddc92151
+--- /dev/null
++++ b/python/tests/test_hexgraph.py
+@@ -0,0 +1,67 @@
++"""RED-first test for the v4 hex adjacency builder (D3).
++
++Captures the load-bearing new behavior: build_neighbor_graph turns per-tile (x,y) coords into a
++fixed degree-6 neighbor_index [N,6] + neighbor_mask [N,6], using the SAME 6 clock-direction
++offsets and world-wrap rule as the JVM engine (HexMath.clockPositionToHexcoordMap +
++TileMap.getIfTileExistsOrNull). Until python/unciv_train/hexgraph.py exists this is RED (import error).
++
++Clock direction order (FROZEN — must match Kotlin emit + inference + parity):
++    [ (+1,+1), (0,+1), (-1,0), (-1,-1), (0,-1), (+1,0) ]   # dirs 12,2,4,6,8,10
++Missing neighbor (off-map, no world-wrap) -> index 0 (sentinel) AND mask 0.
++"""
++import numpy as np
++
++# RED-first: direct import so pytest reports a hard failure (collection error) until
++# python/unciv_train/hexgraph.py is implemented by D3 — NOT a skip.
++from unciv_train import hexgraph
++
++OFFSETS = [(1, 1), (0, 1), (-1, 0), (-1, -1), (0, -1), (1, 0)]
++SHAPE_HEX = 1  # MapShape ordinal: 0 rectangular, 1 hexagonal, 2 flatEarth
++
++
++def _center_patch():
++    # row 0 = center (0,0); rows 1..6 = its 6 neighbors in clock order.
++    coords = [(0, 0)] + [(0 + dx, 0 + dy) for (dx, dy) in OFFSETS]
++    return np.asarray(coords, dtype=np.float32)
++
++
++def test_returns_correct_shapes_and_dtype():
++    coords = _center_patch()
++    idx, mask = hexgraph.build_neighbor_graph(coords, eff_wrap_radius=0, world_wrap=False, shape=SHAPE_HEX)
++    n = coords.shape[0]
++    assert idx.shape == (n, 6)
++    assert mask.shape == (n, 6)
++    assert np.issubdtype(np.asarray(idx).dtype, np.integer)
++    # every index in [0, N]: N is the sentinel/pad row the model appends; no OOB Gather (FND-0025/0035)
++    assert idx.min() >= 0 and idx.max() <= n
++
++
++def test_interior_tile_has_all_six_neighbors_in_clock_order():
++    coords = _center_patch()
++    idx, mask = hexgraph.build_neighbor_graph(coords, eff_wrap_radius=0, world_wrap=False, shape=SHAPE_HEX)
++    # center is row 0; rows 1..6 were placed in exactly clock order.
++    assert mask[0].tolist() == [1, 1, 1, 1, 1, 1]
++    assert idx[0].tolist() == [1, 2, 3, 4, 5, 6]
++
++
++def test_edge_tile_masks_absent_neighbors():
++    # row 1 is (1,1); within the patch only 3 of its 6 clock-neighbors exist:
++    #   dir4 (-1,0)->(0,1)=row2, dir6 (-1,-1)->(0,0)=row0, dir8 (0,-1)->(1,0)=row6.
++    coords = _center_patch()
++    idx, mask = hexgraph.build_neighbor_graph(coords, eff_wrap_radius=0, world_wrap=False, shape=SHAPE_HEX)
++    assert mask[1].tolist() == [0, 0, 1, 1, 1, 0]
++    present = [(i, v) for i, (m, v) in enumerate(zip(mask[1].tolist(), idx[1].tolist())) if m == 1]
++    assert present == [(2, 2), (3, 0), (4, 6)]
++
++
++def test_world_wrap_resolves_off_map_neighbor():
++    # row0=(2,2); its dir10 (+1,0) neighbor (3,2) is off-map but wrap-retry D (nx-R, ny+R)=(0,5)=row1.
++    # (getIfTileExistsOrNull: direct miss -> (nx+R,ny-R)=(6,-1) miss -> (nx-R,ny+R)=(0,5) hit.)
++    R = 3
++    coords = np.asarray([(2, 2), (0, 5)], dtype=np.float32)
++    DIR10 = 5  # OFFSETS index of (+1,0)
++    idx, mask = hexgraph.build_neighbor_graph(coords, eff_wrap_radius=R, world_wrap=True, shape=SHAPE_HEX)
++    assert mask[0, DIR10] == 1 and idx[0, DIR10] == 1, "wrap must find row1 as row0's +1,0 neighbor"
++    idx_nw, mask_nw = hexgraph.build_neighbor_graph(coords, eff_wrap_radius=R, world_wrap=False, shape=SHAPE_HEX)
++    assert mask_nw[0, DIR10] == 0, "without world wrap that neighbor is off-map (absent)"
++    assert mask.sum() > mask_nw.sum(), "world wrap must find strictly more neighbors here"
+diff --git a/python/tests/test_parity.py b/python/tests/test_parity.py
+index 7acc1d224..f674011af 100644
+--- a/python/tests/test_parity.py
++++ b/python/tests/test_parity.py
+@@ -129,3 +129,116 @@ def test_jvm_python_rich_logits_match(tmp_path):
+ 
+     assert np.allclose(py_tech, jvm_tech, atol=ATOL), f"rich tech drift > {ATOL}: {py_tech} vs {jvm_tech}"
+     assert np.allclose(py_policy, jvm_policy, atol=ATOL), f"rich policy drift > {ATOL}: {py_policy} vs {jvm_policy}"
++
++
++def _fixture_line_adj(name: str, arr: np.ndarray) -> str:
++    """<name> adj <N> <deg> <N*deg values> — v3 hex-GNN neighbor_index/neighbor_mask."""
++    return f"{name} adj {arr.shape[0]} {arr.shape[1]} " + " ".join(repr(float(x)) for x in arr.reshape(-1))
++
++
++@pytest.mark.skipif(not _toolchain_ok(), reason="JVM toolchain (gradlew + JDK) not available")
++def test_jvm_python_structured_logits_match(tmp_path):
++    """AC4 over contract v3 (structured): JVM-built tensors + the hex-GNN neighbor inputs must match
++    the Python reference (atol 1e-4). Exercises the wider entity tokens (9/17), the int64
++    neighbor_index path, an empty entity set (NaN-guard), and the 255 slot reindex."""
++    from unciv_train.export_onnx import export_rich
++    from unciv_train.features import build_rich_single
++    from unciv_train.model import RUNGS, StructuredPolicyValueNet, _SPATIAL_FIELD_PLAN
++
++    spatial_w = len(_SPATIAL_FIELD_PLAN)  # 13
++    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
++    token_specs = {"spatial": spatial_w, "own_units": 9, "opp_units": 9,
++                   "own_cities": 17, "opp_cities": 17, "civ_tokens": 84}
++    vocab_counts = {"terrain": 6, "resource": 5, "improvement": 4, "religion": 3,
++                    "era": 4, "building": 7, "unit": 8, "nation": 2, "promotion": 3}
++    torch.manual_seed(7)
++    net = StructuredPolicyValueNet(dims, token_specs, vocab_counts, **RUNGS["small"]).eval()
++    model = tmp_path / "parity_structured.onnx"
++    export_rich(net, dims, token_specs, model, schema_version=3, ruleset_fingerprint="paritytest",
++                neighbors=True, contract_version=contract.CONTRACT_VERSION_STRUCTURED)
++
++    # A small consistent hex patch: row 0 center (0,0) + its 6 clock-neighbors; no world wrap.
++    coords = np.array([(0, 0), (1, 1), (0, 1), (-1, 0), (-1, -1), (0, -1), (1, 0)], dtype=np.float32)
++    n = coords.shape[0]
++    rng = np.random.default_rng(0)
++    spatial = rng.integers(0, 4, size=(n, spatial_w)).astype(np.float32)
++    spatial[:, 7] = 255.0    # owner_slot self sentinel → exercises the 255 reindex in parity too
++    spatial[:, 10] = 255.0   # unit_owner_slot self sentinel
++    g = rng.standard_normal(8).astype(np.float32)
++    g[contract.GLOBAL_MAPDIM_OFFSET] = 0.0       # effWrapRadius
++    g[contract.GLOBAL_MAPDIM_OFFSET + 1] = 0.0   # worldWrap
++    g[contract.GLOBAL_MAPDIM_OFFSET + 2] = 1.0   # shape (hex)
++    blocks = {
++        "global": g,
++        "acting_civ": rng.standard_normal(6).astype(np.float32),
++        "spatial": spatial,
++        "spatial_coords": coords,
++        "own_units": rng.standard_normal((2, 9)).astype(np.float32),
++        "opp_units": np.zeros((0, 9), np.float32),    # empty set → masked-pool / NaN-guard path
++        "own_cities": rng.standard_normal((1, 17)).astype(np.float32),
++        "opp_cities": np.zeros((0, 17), np.float32),
++        "civ_tokens": rng.standard_normal((2, 84)).astype(np.float32),
++    }
++
++    # Python reference: same multi-tensor input (incl. derived neighbor tensors) → ORT.
++    built = {k: (v.numpy() if hasattr(v, "numpy") else np.asarray(v))
++             for k, v in build_rich_single(blocks, token_specs).items()}
++    sess = ort.InferenceSession(str(model))
++    feed = {i.name: (built[i.name].astype(np.int64) if "int64" in i.type else built[i.name].astype(np.float32))
++            for i in sess.get_inputs()}
++    py = sess.run([contract.OUTPUT_TECH, contract.OUTPUT_POLICY], feed)
++    py_tech, py_policy = py[0][0], py[1][0]
++
++    # JVM side: vec global/acting, set the 6 token sets, adj the SAME neighbor tensors Python derived.
++    lines = [_fixture_line_vec("global", blocks["global"]),
++             _fixture_line_vec("acting_civ", blocks["acting_civ"])]
++    for name in ["spatial", "own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"]:
++        arr = np.asarray(blocks[name], np.float32).reshape(-1, token_specs[name])
++        lines.append(_fixture_line_set(name, arr, token_specs[name]))
++    lines.append(_fixture_line_adj("neighbor_index", feed["neighbor_index"][0]))
++    lines.append(_fixture_line_adj("neighbor_mask", feed["neighbor_mask"][0]))
++    obs_file = tmp_path / "obs_structured.txt"
++    obs_file.write_text("\n".join(lines) + "\n")
++
++    out_file = tmp_path / "jvm_structured.json"
++    env = dict(os.environ, JAVA_HOME=JAVA_HOME)
++    cmd = [str(GRADLEW), "selfPlay", "--console=plain",
++           "--args=" + f"parity-run-rich {model} {obs_file} {out_file}"]
++    p = subprocess.run(cmd, cwd=str(REPO), env=env, capture_output=True, text=True, timeout=900)
++    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
++    assert out_file.is_file(), "JVM parity-run-rich produced no logits file"
++    jvm = json.loads(out_file.read_text())
++    jvm_tech, jvm_policy = np.array(jvm["tech"], np.float32), np.array(jvm["policy"], np.float32)
++
++    assert np.allclose(py_tech, jvm_tech, atol=ATOL), f"structured tech drift > {ATOL}: {py_tech} vs {jvm_tech}"
++    assert np.allclose(py_policy, jvm_policy, atol=ATOL), f"structured policy drift > {ATOL}: {py_policy} vs {jvm_policy}"
++
++
++@pytest.mark.skipif(not _toolchain_ok(), reason="JVM toolchain (gradlew + JDK) not available")
++def test_hexgraph_matches_live_engine(tmp_path):
++    """FND-0036: the Python adjacency builder (used at TRAIN time) must reproduce the LIVE engine's
++    neighbor graph (used at INFERENCE via OnnxPolicy.buildNeighborTensorsLive) EXACTLY — incl.
++    world-wrap edges — on a real generated map. This is the train↔inference adjacency-agreement guard."""
++    from unciv_train.hexgraph import build_neighbor_graph
++    out_file = tmp_path / "adj.json"
++    env = dict(os.environ, JAVA_HOME=JAVA_HOME)
++    cmd = [str(GRADLEW), "selfPlay", "--console=plain",
++           "--args=" + f"adjacency-dump 4242 {out_file} Tiny"]
++    p = subprocess.run(cmd, cwd=str(REPO), env=env, capture_output=True, text=True, timeout=900)
++    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
++    d = json.loads(out_file.read_text())
++    n = int(d["nTiles"])
++    assert d["worldWrap"] == 1, "fidelity test must run on a world-wrap map to exercise the wrap branch"
++    coords = np.array(d["coords"], dtype=np.float32)
++    idx, mask = build_neighbor_graph(coords, d["effWrapRadius"], bool(d["worldWrap"]), d["shape"])
++    live = np.array(d["live"], dtype=np.int64)  # [n,6]; -1 = no neighbor in that direction
++    mismatches = []
++    for i in range(n):
++        for dd in range(6):
++            if live[i, dd] == -1:
++                if mask[i, dd] != 0:
++                    mismatches.append(f"tile{i} dir{dd}: live=none, hexgraph idx={idx[i,dd]} mask=1")
++            elif not (mask[i, dd] == 1 and idx[i, dd] == live[i, dd]):
++                mismatches.append(f"tile{i} dir{dd}: live={live[i,dd]} hexgraph idx={idx[i,dd]} mask={mask[i,dd]}")
++    assert not mismatches, f"hexgraph != live engine ({len(mismatches)} mismatches): {mismatches[:8]}"
++    assert mask.sum() > 0, "expected at least one resolved neighbor"
+diff --git a/python/tests/test_structured_attn.py b/python/tests/test_structured_attn.py
+new file mode 100644
+index 000000000..1ca213235
+--- /dev/null
++++ b/python/tests/test_structured_attn.py
+@@ -0,0 +1,169 @@
++"""Phase-B attention gate for the v4 StructuredPolicyValueNet (D4 self-attn + entity↔node join +
++D5 single-query cross-attn), exercised on the MEDIUM rung (attn_layers>0).
++
++Covers:
++- medium-rung forward: shapes + no NaN (attention path is live).
++- fully-masked entity set + all-isolated nodes (and the all-entities-masked extreme) → no NaN
++  (the masked-softmax NaN guard, FND-0025).
++- export medium rung to ONNX opset 17, assert op types contain NO Scatter*/Attention/
++  MultiHeadAttention (hand-rolled attention only), reload in onnxruntime, ORT≈torch atol 1e-4 with
++  N differing between trace and run (proves the n_spatial / entity dynamic axes survive attention).
++
++Phase A (small rung, GNN-only) is gated by test_structured_smoke.py and must stay green — this file
++only adds the attention coverage and never touches the GNN-only path.
++"""
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++torch = pytest.importorskip("torch")
++ort = pytest.importorskip("onnxruntime")
++
++import onnx  # noqa: E402
++
++from unciv_train import contract  # noqa: E402
++from unciv_train.contract import Dims  # noqa: E402
++from unciv_train.export_onnx import export_rich  # noqa: E402
++from unciv_train.model import (  # noqa: E402
++    RUNGS,
++    StructuredPolicyValueNet,
++    _ENTITY_TILE_FIELD,
++    _SPATIAL_FIELD_PLAN,
++)
++
++ATOL = 1e-4
++SPATIAL_W = len(_SPATIAL_FIELD_PLAN)  # 13
++RUNG = "medium"  # attn_layers>0 → Phase-B path
++
++
++def _tiny_setup():
++    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
++    token_specs = {"spatial": SPATIAL_W, "own_units": 9, "opp_units": 9,
++                   "own_cities": 17, "opp_cities": 17, "civ_tokens": 84}
++    vocab_counts = {"terrain": 6, "resource": 5, "improvement": 4,
++                    "religion": 3, "era": 4, "building": 7, "unit": 8,
++                    "nation": 2, "promotion": 3}
++    return dims, token_specs, vocab_counts
++
++
++def _random_inputs(dims, token_specs, *, n_spatial=4, batch=1, seed=0):
++    """Like the smoke test, but writes VALID in-range tile indices into the entity join columns
++    (own/opp_units field 8, own/opp_cities field 12) so the entity↔node gather is exercised."""
++    rng = np.random.default_rng(seed)
++    inputs: dict[str, torch.Tensor] = {
++        "global": torch.tensor(rng.standard_normal((batch, dims.global_w)).astype(np.float32)),
++        "acting_civ": torch.tensor(rng.standard_normal((batch, dims.acting_w)).astype(np.float32)),
++    }
++    sp = rng.integers(0, 4, size=(batch, n_spatial, token_specs["spatial"])).astype(np.float32)
++    sp[..., 7] = 255.0   # owner_slot self sentinel
++    sp[..., 10] = 255.0  # unit_owner_slot self sentinel
++    inputs["spatial"] = torch.tensor(sp)
++    inputs["spatial_mask"] = torch.ones(batch, n_spatial)
++    for name in ("own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"):
++        m = int(rng.integers(1, 4))
++        tok = rng.standard_normal((batch, m, token_specs[name])).astype(np.float32)
++        fld = _ENTITY_TILE_FIELD.get(name)
++        if fld is not None:
++            # valid tile indices into [0, n_spatial) for the join gather
++            tok[..., fld] = rng.integers(0, n_spatial, size=(batch, m))
++        inputs[name] = torch.tensor(tok)
++        inputs[name + "_mask"] = torch.ones(batch, m)
++    nbr = rng.integers(0, n_spatial + 1, size=(batch, n_spatial, 6)).astype(np.int64)
++    inputs["neighbor_index"] = torch.tensor(nbr)
++    inputs["neighbor_mask"] = torch.tensor(
++        rng.integers(0, 2, size=(batch, n_spatial, 6)).astype(np.float32))
++    return inputs
++
++
++def _net(seed=7):
++    dims, token_specs, vocab_counts = _tiny_setup()
++    torch.manual_seed(seed)
++    net = StructuredPolicyValueNet(dims, token_specs, vocab_counts, **RUNGS[RUNG]).eval()
++    return dims, token_specs, vocab_counts, net
++
++
++def test_medium_rung_uses_attention():
++    _, _, _, net = _net()
++    assert net.attn_layers > 0, "medium rung must turn attention ON"
++    assert net.use_attn is True
++
++
++def test_medium_forward_shapes_and_no_nan():
++    dims, token_specs, _, net = _net(seed=11)
++    inputs = _random_inputs(dims, token_specs, n_spatial=5, seed=1)
++    with torch.no_grad():
++        tech, policy, value = net(inputs)
++    assert tech.shape == (1, dims.tech_w)
++    assert policy.shape == (1, dims.policy_w)
++    assert value.shape == (1, 1)
++    for t in (tech, policy, value):
++        assert torch.isfinite(t).all(), "attention forward produced NaN/Inf"
++    assert (value >= -1).all() and (value <= 1).all(), "tanh value must be in [-1,1]"
++
++
++def test_fully_masked_entity_set_and_isolated_nodes_nan_safe():
++    """A fully-masked entity SELF-attention set can be all −inf after masked_fill → NaN after
++    softmax. The guard must force ZEROS. Also all-isolated GNN nodes (deg 0) must not NaN."""
++    dims, token_specs, _, net = _net(seed=3)
++    inputs = _random_inputs(dims, token_specs, n_spatial=4, seed=2)
++    inputs["opp_units_mask"] = torch.zeros_like(inputs["opp_units_mask"])  # fully-masked self-attn set
++    inputs["neighbor_mask"] = torch.zeros_like(inputs["neighbor_mask"])    # all-isolated nodes
++    with torch.no_grad():
++        out = net(inputs)
++    for t in out:
++        assert torch.isfinite(t).all(), "NaN guard failed (masked self-attn set / isolated nodes)"
++
++
++def test_all_entity_sets_masked_nan_safe():
++    """Every entity set fully masked: only the GNN nodes remain as cross-attn keys (always ≥1), and
++    every per-entity self-attention set is fully empty → all must produce ZEROS, never NaN."""
++    dims, token_specs, _, net = _net(seed=4)
++    inputs = _random_inputs(dims, token_specs, n_spatial=4, seed=5)
++    for name in ("own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"):
++        inputs[name + "_mask"] = torch.zeros_like(inputs[name + "_mask"])
++    with torch.no_grad():
++        out = net(inputs)
++    for t in out:
++        assert torch.isfinite(t).all(), "NaN guard failed when ALL entity sets are masked"
++
++
++def test_export_onnx_opset17_no_scatter_or_attention_and_ort_matches(tmp_path):
++    dims, token_specs, _, net = _net(seed=7)
++
++    # Trace with n=6, run with n=8 (DIFFERENT N) → proves the n_spatial / entity dynamic axes work
++    # through the attention path.
++    inputs = _random_inputs(dims, token_specs, n_spatial=6, seed=5)
++
++    model = tmp_path / "structured_medium.onnx"
++    sample = {k: (v.numpy() if hasattr(v, "numpy") else np.asarray(v)) for k, v in inputs.items()}
++    export_rich(net, dims, token_specs, model, schema_version=3, ruleset_fingerprint="attntest",
++                sample_inputs=sample, opset=17, neighbors=True,
++                contract_version=contract.CONTRACT_VERSION_STRUCTURED)
++
++    # Op-type audit: hand-rolled attention only — NO Scatter*/Attention/MultiHeadAttention.
++    m = onnx.load(str(model))
++    op_types = sorted({n.op_type for n in m.graph.node})
++    forbidden = [o for o in op_types
++                 if o.startswith("Scatter") or "Attention" in o or "MultiHeadAttention" in o]
++    assert not forbidden, f"forbidden ops in exported graph: {forbidden} (all ops: {op_types})"
++    # Softmax + LayerNormalization must be present (proves the attention is actually realized).
++    assert "Softmax" in op_types, op_types
++    assert "LayerNormalization" in op_types, op_types
++
++    # ORT ≈ torch at a DIFFERENT N than the trace.
++    run_inputs = _random_inputs(dims, token_specs, n_spatial=8, seed=99)
++    with torch.no_grad():
++        t_tech, t_policy, _ = net(run_inputs)
++    sess = ort.InferenceSession(str(model))
++    feed = {}
++    for i in sess.get_inputs():
++        v = run_inputs[i.name]
++        arr = v.numpy() if hasattr(v, "numpy") else np.asarray(v)
++        feed[i.name] = arr.astype(np.int64) if "int64" in i.type else arr.astype(np.float32)
++    ort_tech, ort_policy = sess.run([contract.OUTPUT_TECH, contract.OUTPUT_POLICY], feed)
++
++    assert np.allclose(t_tech.numpy(), ort_tech, atol=ATOL), \
++        f"tech logits drift > {ATOL}:\n{t_tech.numpy()}\nvs\n{ort_tech}"
++    assert np.allclose(t_policy.numpy(), ort_policy, atol=ATOL), \
++        f"policy logits drift > {ATOL}:\n{t_policy.numpy()}\nvs\n{ort_policy}"
+diff --git a/python/tests/test_structured_smoke.py b/python/tests/test_structured_smoke.py
+new file mode 100644
+index 000000000..8d2def7a1
+--- /dev/null
++++ b/python/tests/test_structured_smoke.py
+@@ -0,0 +1,143 @@
++"""Phase-A smoke test for the v4 StructuredPolicyValueNet (embeddings + hex-GNN, attn off).
++
++Gates the load-bearing export risk EARLY (FND-0008/0023): build a tiny structured net on the SMALL
++rung, run a forward pass (shape + NaN asserts), export to ONNX opset 17 with the two NEW int64/f32
++neighbor graph tensors, reload in onnxruntime, and assert ORT logits ≈ torch logits (atol 1e-4).
++
++All ops must be opset-17 core (Gather/Mul/ReduceSum/MatMul/LayerNorm/Softmax/tanh) — no scatter, no
++nn.MultiheadAttention/SDPA. The export round-trip proves the gather-GNN graph is export-safe.
++"""
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++torch = pytest.importorskip("torch")
++ort = pytest.importorskip("onnxruntime")
++
++from unciv_train import contract  # noqa: E402
++from unciv_train.contract import Dims  # noqa: E402
++from unciv_train.export_onnx import export_rich  # noqa: E402
++from unciv_train.model import RUNGS, StructuredPolicyValueNet, _SPATIAL_FIELD_PLAN  # noqa: E402
++
++ATOL = 1e-4
++SPATIAL_W = len(_SPATIAL_FIELD_PLAN)  # 13
++
++
++def _tiny_setup():
++    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
++    token_specs = {"spatial": SPATIAL_W, "own_units": 9, "opp_units": 9,
++                   "own_cities": 17, "opp_cities": 17, "civ_tokens": 84}
++    # Small synthetic vocab cardinalities (counts; +1 sentinel applied inside the model).
++    vocab_counts = {"terrain": 6, "resource": 5, "improvement": 4,
++                    "religion": 3, "era": 4, "building": 7, "unit": 8,
++                    "nation": 2, "promotion": 3}
++    return dims, token_specs, vocab_counts
++
++
++def _random_inputs(dims, token_specs, *, n_spatial=4, batch=1, seed=0):
++    rng = np.random.default_rng(seed)
++    inputs: dict[str, torch.Tensor] = {
++        "global": torch.tensor(rng.standard_normal((batch, dims.global_w)).astype(np.float32)),
++        "acting_civ": torch.tensor(rng.standard_normal((batch, dims.acting_w)).astype(np.float32)),
++    }
++    # Spatial: numeric channels random-ish; categorical channels small non-negative ints incl. the
++    # 255 self-slot sentinel to exercise the reindex path.
++    sp = rng.integers(0, 4, size=(batch, n_spatial, token_specs["spatial"])).astype(np.float32)
++    sp[..., 7] = 255.0   # owner_slot self sentinel
++    sp[..., 10] = 255.0  # unit_owner_slot self sentinel
++    inputs["spatial"] = torch.tensor(sp)
++    inputs["spatial_mask"] = torch.ones(batch, n_spatial)
++    for name in ("own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"):
++        m = int(rng.integers(1, 4))
++        inputs[name] = torch.tensor(rng.standard_normal((batch, m, token_specs[name])).astype(np.float32))
++        inputs[name + "_mask"] = torch.ones(batch, m)
++    # Degree-6 neighbor graph: indices in [0, n_spatial] (n_spatial == the model's zero pad row).
++    nbr = rng.integers(0, n_spatial + 1, size=(batch, n_spatial, 6)).astype(np.int64)
++    inputs["neighbor_index"] = torch.tensor(nbr)
++    inputs["neighbor_mask"] = torch.tensor(
++        rng.integers(0, 2, size=(batch, n_spatial, 6)).astype(np.float32))
++    return inputs
++
++
++def test_forward_shapes_and_no_nan():
++    dims, token_specs, vocab_counts = _tiny_setup()
++    torch.manual_seed(11)
++    net = StructuredPolicyValueNet(dims, token_specs, vocab_counts, **RUNGS["small"])
++    assert net.attn_layers == 0, "Phase A must be GNN-only (attn_layers=0)"
++    inputs = _random_inputs(dims, token_specs, n_spatial=5)
++    net.eval()
++    with torch.no_grad():
++        tech, policy, value = net(inputs)
++    assert tech.shape == (1, dims.tech_w)
++    assert policy.shape == (1, dims.policy_w)
++    assert value.shape == (1, 1)
++    for t in (tech, policy, value):
++        assert torch.isfinite(t).all(), "structured forward produced NaN/Inf"
++    assert (value >= -1).all() and (value <= 1).all(), "tanh value must be in [-1,1]"
++
++
++def test_all_padding_entity_set_is_nan_safe():
++    """A fully-masked entity set must yield zeros (mirror masked_pool), never NaN."""
++    dims, token_specs, vocab_counts = _tiny_setup()
++    torch.manual_seed(3)
++    net = StructuredPolicyValueNet(dims, token_specs, vocab_counts, **RUNGS["small"]).eval()
++    inputs = _random_inputs(dims, token_specs, n_spatial=4)
++    inputs["opp_units_mask"] = torch.zeros_like(inputs["opp_units_mask"])  # all padding
++    inputs["neighbor_mask"] = torch.zeros_like(inputs["neighbor_mask"])    # all isolated nodes
++    with torch.no_grad():
++        tech, policy, value = net(inputs)
++    for t in (tech, policy, value):
++        assert torch.isfinite(t).all(), "NaN guard failed on fully-masked set / isolated nodes"
++
++
++def test_export_onnx_opset17_and_ort_matches_torch(tmp_path):
++    dims, token_specs, vocab_counts = _tiny_setup()
++    torch.manual_seed(7)
++    net = StructuredPolicyValueNet(dims, token_specs, vocab_counts, **RUNGS["small"]).eval()
++
++    # Trace/export dummy uses n0=2 spatial rows; the run-time feed below uses a DIFFERENT N to prove
++    # the n_spatial dynamic axis works.
++    inputs = _random_inputs(dims, token_specs, n_spatial=6, seed=5)
++    with torch.no_grad():
++        t_tech, t_policy, _ = net(inputs)
++
++    model = tmp_path / "structured_small.onnx"
++    sample = {k: (v.numpy() if hasattr(v, "numpy") else np.asarray(v)) for k, v in inputs.items()}
++    export_rich(net, dims, token_specs, model, schema_version=3, ruleset_fingerprint="smoketest",
++                sample_inputs=sample, opset=17, neighbors=True,
++                contract_version=contract.CONTRACT_VERSION_STRUCTURED)
++
++    sess = ort.InferenceSession(str(model))
++    in_names = [i.name for i in sess.get_inputs()]
++    # The two new graph tensors are present, neighbor_index is int64.
++    assert "neighbor_index" in in_names and "neighbor_mask" in in_names
++    ni_type = next(i.type for i in sess.get_inputs() if i.name == "neighbor_index")
++    assert "int64" in ni_type, f"neighbor_index must export as int64, got {ni_type}"
++
++    feed = {}
++    for i in sess.get_inputs():
++        v = inputs[i.name]
++        arr = v.numpy() if hasattr(v, "numpy") else np.asarray(v)
++        feed[i.name] = arr.astype(np.int64) if "int64" in i.type else arr.astype(np.float32)
++    ort_tech, ort_policy = sess.run([contract.OUTPUT_TECH, contract.OUTPUT_POLICY], feed)
++
++    assert np.allclose(t_tech.numpy(), ort_tech, atol=ATOL), \
++        f"tech logits drift > {ATOL}:\n{t_tech.numpy()}\nvs\n{ort_tech}"
++    assert np.allclose(t_policy.numpy(), ort_policy, atol=ATOL), \
++        f"policy logits drift > {ATOL}:\n{t_policy.numpy()}\nvs\n{ort_policy}"
++
++
++def test_export_input_names_order(tmp_path):
++    """Document/freeze the ONNX input order: global, acting_civ, spatial(+mask), neighbor_index,
++    neighbor_mask, then the remaining entity sets (+masks)."""
++    dims, token_specs, vocab_counts = _tiny_setup()
++    torch.manual_seed(1)
++    net = StructuredPolicyValueNet(dims, token_specs, vocab_counts, **RUNGS["small"]).eval()
++    model = tmp_path / "structured_names.onnx"
++    export_rich(net, dims, token_specs, model, schema_version=3, ruleset_fingerprint="smoketest",
++                neighbors=True, contract_version=contract.CONTRACT_VERSION_STRUCTURED)
++    sess = ort.InferenceSession(str(model))
++    in_names = [i.name for i in sess.get_inputs()]
++    head = ["global", "acting_civ", "spatial", "spatial_mask", "neighbor_index", "neighbor_mask"]
++    assert in_names[:len(head)] == head, in_names
+diff --git a/python/tests/test_structured_train.py b/python/tests/test_structured_train.py
+new file mode 100644
+index 000000000..b0085d5c9
+--- /dev/null
++++ b/python/tests/test_structured_train.py
+@@ -0,0 +1,53 @@
++"""D7 integration smoke: train_actor_critic_structured runs end-to-end (model + build_rich_batch
++with derived neighbor tensors + the FROZEN _optimize_actor_critic core) for both a GNN-only rung
++and an attention rung — no gradle, no NaN/divergence."""
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++pytest.importorskip("torch")
++
++from unciv_train.contract import Dims  # noqa: E402
++from unciv_train.dataset import TrainTrajectory  # noqa: E402
++from unciv_train.model import RUNGS, _SPATIAL_FIELD_PLAN  # noqa: E402
++from unciv_train.train import train_actor_critic_structured  # noqa: E402
++
++
++def _tiny_trajectory(dims, token_specs):
++    rng = np.random.default_rng(0)
++    coords = np.array([(0, 0), (1, 1), (0, 1), (-1, 0)], np.float32)
++    n = coords.shape[0]
++    g = np.zeros(dims.global_w, np.float32)
++    g[5], g[6], g[7] = 0.0, 0.0, 1.0   # effWrapRadius, worldWrap, shape (map dims)
++    step = {
++        "global": g, "acting_civ": np.zeros(dims.acting_w, np.float32),
++        "spatial": rng.integers(0, 4, size=(n, token_specs["spatial"])).astype(np.float32),
++        "spatial_coords": coords,
++        "own_units": rng.standard_normal((2, 9)).astype(np.float32),
++        "opp_units": np.zeros((0, 9), np.float32),       # empty → NaN-guard path
++        "own_cities": rng.standard_normal((1, 17)).astype(np.float32),
++        "opp_cities": np.zeros((0, 17), np.float32),
++        "civ_tokens": rng.standard_normal((2, 84)).astype(np.float32),
++    }
++    return TrainTrajectory(
++        np.zeros((1, dims.input_w), np.float32), np.array([0]), np.array([0]),
++        np.ones((1, dims.tech_w), np.float32), np.ones((1, dims.policy_w), np.float32),
++        np.array([1.0], np.float32), [step],
++    )
++
++
++@pytest.mark.parametrize("rung", ["small", "medium"])  # GNN-only + attention
++def test_structured_trainer_runs(rung):
++    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
++    token_specs = {"spatial": len(_SPATIAL_FIELD_PLAN), "own_units": 9, "opp_units": 9,
++                   "own_cities": 17, "opp_cities": 17, "civ_tokens": 84}
++    vocab_counts = {"terrain": 6, "resource": 5, "improvement": 4, "religion": 3, "era": 4,
++                    "building": 7, "unit": 8, "nation": 2, "promotion": 3}
++    tj = _tiny_trajectory(dims, token_specs)
++    net, stats = train_actor_critic_structured(
++        [tj], dims, token_specs, vocab_counts, RUNGS[rung], epochs=2, lr=1e-3, seed=0)
++    assert net is not None
++    assert np.isfinite(float(stats.get("loss", 0.0))), f"{rung} loss not finite"
++    assert not stats.get("diverged", False), f"{rung} diverged (NaN guard tripped)"
++    assert stats.get("n", 0) >= 1
+diff --git a/python/tests/test_v2_units.py b/python/tests/test_v2_units.py
+index 2b9278727..5d90fd19a 100644
+--- a/python/tests/test_v2_units.py
++++ b/python/tests/test_v2_units.py
+@@ -76,7 +76,8 @@ def test_load_trajectories_keeps_noaction_and_terminal_only_reward(tmp_path):
+ def test_load_trajectories_rich_blocks_present(tmp_path):
+     p = tmp_path / "traj.bin"
+     p.write_bytes(_shard_with_steps([(2, 1)]))
+-    trajs = dataset.load_trajectories([p], expected_version=2, expected_fingerprint="deadbeef", rich=True)
++    trajs = dataset.load_trajectories([p], expected_version=2, expected_fingerprint="deadbeef",
++                                      rich=True, expected_spatial_channels=13)
+     assert trajs[0].rich is not None and "spatial" in trajs[0].rich[0]
+ 
+ 
+diff --git a/python/unciv_dataplane/schema.py b/python/unciv_dataplane/schema.py
+index f2ac51943..b69a7cca2 100644
+--- a/python/unciv_dataplane/schema.py
++++ b/python/unciv_dataplane/schema.py
+@@ -13,10 +13,9 @@ from pathlib import Path
+ from typing import Any
+ 
+ # Mirror of com.unciv.logic.simulation.dataplane.SampleSchema.VERSION — keep in lockstep.
+-# v2: shards now carry a real terminal reward + an end-of-game terminal step per civ, and the
+-# recorded civ-level action is applied to the game (the policy drives tech+policy). v1 shards
+-# (label-only, reward=0) are not training-compatible — the reader refuses them.
+-SCHEMA_VERSION = 2
++# v3 (v4 structured encoder): adds the per-tile spatial_coords (f32 x,y) block, map dims in global,
++# per-entity tile-index, and the construction-namespace fix. v2/v1 shards are not layout-compatible.
++SCHEMA_VERSION = 3
+ 
+ 
+ class SchemaError(Exception):
+diff --git a/python/unciv_train/contract.py b/python/unciv_train/contract.py
+index b1589262c..5bc56c211 100644
+--- a/python/unciv_train/contract.py
++++ b/python/unciv_train/contract.py
+@@ -16,6 +16,10 @@ from pathlib import Path
+ # META_CONTRACT_VERSION and selects the single- vs multi-tensor build path, so both coexist.
+ CONTRACT_VERSION = 1
+ CONTRACT_VERSION_RICH = 2
++# Contract v3 = structured encoder (embeddings + hex-GNN). Same multi-tensor base as v2 PLUS two
++# NEW graph tensors (neighbor_index/neighbor_mask) that drive the GNN gather. Bumped in lockstep
++# with Kotlin SampleSchema.OnnxContract.CONTRACT_VERSION_RICH / SampleSchema.VERSION (2→3).
++CONTRACT_VERSION_STRUCTURED = 3
+ 
+ INPUT_NAME = "obs"                 # contract v1 single input
+ OUTPUT_TECH = "tech_logits"
+@@ -28,6 +32,23 @@ INPUT_ACTING = "acting_civ"
+ # Token sets (name -> perItem width is runtime-derived from schema via token_specs_from_schema).
+ RICH_TOKEN_NAMES = ["spatial", "own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"]
+ 
++# Contract v3 (structured) NEW graph tensors. They are NOT token sets (no "<name>_mask" loop entry)
++# and are NOT folded into spatial — they index the spatial node axis (a different shape [B,N,6]) and
++# are derived from coords+map-dims, not a per-channel value. They share spatial's "n_spatial"
++# dynamic axis; the degree axis is the static hex degree. neighbor_index is int64 (ORT Gather index
++# dtype); neighbor_mask is float32. Mirrored Kotlin↔Python (SampleSchema.OnnxContract).
++INPUT_NEIGHBOR_INDEX = "neighbor_index"   # [batch, n_spatial, 6] int64
++INPUT_NEIGHBOR_MASK = "neighbor_mask"     # [batch, n_spatial, 6] float32
++NEIGHBOR_INPUT_NAMES = [INPUT_NEIGHBOR_INDEX, INPUT_NEIGHBOR_MASK]
++NEIGHBOR_DEGREE = 6                        # hex degree-6 (== hexgraph.HEX_DEGREE / OFFSETS length)
++
++# Global head map-dim slots: buildGlobal appends the 3 pre-resolved map-dim scalars right after the
++# 5 fixed head scalars (turns, era, tileCount, knownMajors, aliveMajors) and BEFORE the demographics
++# agg block, at head slots 5,6,7 — read positionally by the Python adjacency builder. (Kotlin C1
++# also surfaces them as named schema fields; this positional offset is the lockstep with buildGlobal.)
++GLOBAL_MAPDIM_OFFSET = 5
++MAPDIM_SLOTS = ("eff_wrap_radius", "world_wrap", "shape")
++
+ # ONNX metadata_props keys (provenance — read back on the JVM via session.getMetadata()).
+ META_SCHEMA_VERSION = "schema_version"
+ META_RULESET_FINGERPRINT = "ruleset_fingerprint"
+@@ -77,26 +98,63 @@ def schema_version_from_schema(schema_path: str | Path) -> int:
+     return int(_schema(schema_path)["schemaVersion"])
+ 
+ 
+-# Hardcoded fallbacks if a schema layout omits perItem (matches the v1 Featurizer widths).
+-_TOKEN_WIDTH_FALLBACK = {"spatial": 13, "own_units": 8, "opp_units": 8,
+-                         "own_cities": 16, "opp_cities": 16, "civ_tokens": 84}
++def spatial_channels_from_schema(schema_path: str | Path) -> int:
++    """Number of spatial (per-tile) channels — the v4 god-constant. FAIL-LOUD (FND-0007/0011): the
++    SSOT is Kotlin `SampleSchema.SPATIAL_CHANNELS`; if the schema omits it we RAISE rather than
++    silently reverting to a stale hardcoded width (which would mis-shape every shard)."""
++    sch = _schema(schema_path)
++    chans = sch.get("spatial_channels") or sch.get("spatialChannels")
++    if not chans:
++        raise ValueError(
++            f"{schema_path}: schema omits 'spatial_channels'/'spatialChannels' — refusing silent "
++            "fallback (spatial channel count is the v4 god-constant; SSOT is Kotlin SampleSchema)"
++        )
++    return len(chans)
+ 
+ 
+ def token_specs_from_schema(schema_path: str | Path) -> dict:
+-    """Per-token feature widths for the rich variant, derived from the generated schema.
++    """Per-token feature widths for the rich/structured variant, derived from the generated schema.
+ 
+     spatial → number of spatial channels (per-tile width); entity blocks → their layout perItem.
+-    Falls back to the known v1 Featurizer widths if the schema omits a field.
++    FAIL-LOUD (FND-0007/0011): if the schema omits spatial_channels or an entity perItem we RAISE
++    instead of silently using a stale fallback width (which `features._pad_token_set`'s min(width)
++    would then silently truncate — exactly the drift the council flagged).
+     """
+     sch = _schema(schema_path)
+     layout = {b["name"]: b for b in sch.get("layout", [])}
+-    specs: dict[str, int] = {}
+-    chans = sch.get("spatial_channels") or sch.get("spatialChannels")
+-    specs["spatial"] = len(chans) if chans else _TOKEN_WIDTH_FALLBACK["spatial"]
++    specs: dict[str, int] = {"spatial": spatial_channels_from_schema(schema_path)}
+     for name in ("own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"):
+         entry = layout.get(name)
+-        if entry and entry.get("perItem"):
+-            specs[name] = int(entry["perItem"])
+-        else:
+-            specs[name] = _TOKEN_WIDTH_FALLBACK[name]
++        if not (entry and entry.get("perItem")):
++            raise ValueError(
++                f"{schema_path}: layout[{name!r}] missing 'perItem' — refusing silent fallback "
++                "(entity token width is schema-driven; SSOT is Kotlin SampleSchema)"
++            )
++        specs[name] = int(entry["perItem"])
+     return specs
++
++
++def vocab_counts_from_schema(schema_path: str | Path) -> dict:
++    """Categorical vocabulary cardinalities (terrain/resource/improvement/religion/era/building/
++    unit/nation/promotion), emitted in schema.json's `vocabCounts` object by the Kotlin header.
++
++    Embedding `num_embeddings` is derived from these (count + 1 sentinel row) — NEVER hardcoded.
++    FAIL-LOUD (FND-0007/0011): raise if the schema omits the block (regenerate shards on contract v3).
++    """
++    sch = _schema(schema_path)
++    vc = sch.get("vocabCounts") or sch.get("vocab_counts")
++    if not vc:
++        raise ValueError(
++            f"{schema_path}: schema missing 'vocabCounts' — regenerate shards on contract v3 "
++            "(embedding cardinalities must come from the schema, never hardcoded)"
++        )
++    # The Kotlin header emits PLURAL keys (terrains/resources/...); the model's embedding tables key
++    # off SINGULAR names (terrain/resource/...). Normalize so the Kotlin↔Python seam lines up — this
++    # is the integration seam the unit smoke (hardcoded singular keys) can't catch.
++    _ALIASES = {
++        "terrains": "terrain", "resources": "resource", "improvements": "improvement",
++        "religions": "religion", "eras": "era", "buildings": "building", "units": "unit",
++        "promotions": "promotion", "nations": "nation", "policies": "policy",
++        "policyBranches": "policyBranch",
++    }
++    return {_ALIASES.get(str(k), str(k)): int(v) for k, v in vc.items()}
+diff --git a/python/unciv_train/dataset.py b/python/unciv_train/dataset.py
+index bd55a47c8..466f0e9e6 100644
+--- a/python/unciv_train/dataset.py
++++ b/python/unciv_train/dataset.py
+@@ -33,8 +33,12 @@ class TrainStep:
+ 
+ 
+ # Per-type entity/spatial token blocks consumed by the rich variant (perItem widths come from the
+-# generated schema; spatial is FIXED nTiles*13 and reshaped to [nTiles, 13]).
++# generated schema; spatial is nTiles*n_channels (schema-driven) and reshaped to [nTiles, n_channels]).
+ RICH_TOKEN_BLOCKS = ("spatial", "own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens")
++# Contract-v3 (structured) shard-only block: per-tile (x,y) coords as f32 [nTiles*2]. Consumed by
++# the Python hex-adjacency builder (hexgraph) to derive neighbor_index/neighbor_mask — it is NOT an
++# ONNX model input and is absent on contract-v2 shards (handled gracefully: returns None).
++SPATIAL_COORDS_BLOCK = "spatial_coords"
+ 
+ 
+ @dataclass
+@@ -103,15 +107,32 @@ def load_training_steps(
+     return out
+ 
+ 
+-def _rich_step_blocks(blocks: dict) -> dict:
+-    """Extract the per-step rich token blocks. spatial (FIXED nTiles*13) → [nTiles, 13];
+-    entity blocks (VARIABLE) are already [count, perItem]; an absent/empty block → [0, perItem]."""
++def _rich_step_blocks(blocks: dict, n_channels: int) -> dict:
++    """Extract the per-step rich token blocks. spatial (nTiles*n_channels, schema-driven) →
++    [nTiles, n_channels]; entity blocks (VARIABLE) are already [count, perItem]; an absent/empty
++    block → [0, perItem]. The contract-v3 `spatial_coords` block (nTiles*2 f32), when present, is
++    reshaped to [nTiles, 2] and returned for the Python adjacency builder (None on v2 shards).
++
++    `n_channels` is the schema's spatial channel count (FAIL-LOUD god-constant, no hardcoded 13)."""
+     out = {
+         "global": np.asarray(blocks["global"], dtype=np.float32),
+         "acting_civ": np.asarray(blocks["acting_civ"], dtype=np.float32),
+     }
+-    spatial = np.asarray(blocks["spatial"], dtype=np.float32).reshape(-1, 13)
+-    out["spatial"] = spatial
++    spatial = np.asarray(blocks["spatial"], dtype=np.float32)
++    if spatial.size % n_channels != 0:
++        raise ValueError(
++            f"spatial block size {spatial.size} not divisible by n_channels {n_channels} "
++            "(schema/shard channel-count drift)"
++        )
++    out["spatial"] = spatial.reshape(-1, n_channels)
++    coords = blocks.get(SPATIAL_COORDS_BLOCK)
++    if coords is not None:
++        coords = np.asarray(coords, dtype=np.float32)
++        if coords.size % 2 != 0:
++            raise ValueError(f"spatial_coords block size {coords.size} not divisible by 2")
++        out[SPATIAL_COORDS_BLOCK] = coords.reshape(-1, 2)
++    else:
++        out[SPATIAL_COORDS_BLOCK] = None
+     for name in ("own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"):
+         b = blocks.get(name)
+         arr = np.asarray(b, dtype=np.float32) if b is not None else np.zeros((0, 0), np.float32)
+@@ -128,10 +149,16 @@ def load_trajectories(
+     expected_version: int,
+     expected_fingerprint: str,
+     rich: bool = False,
++    expected_spatial_channels: int | None = None,
+ ) -> list[TrainTrajectory]:
+     """Ordered per-game learner-step trajectories for actor-critic + GAE. Same provenance gates as
+-    `load_training_steps`. `rich=True` also attaches per-step token blocks for the rich variant.
++    `load_training_steps`. `rich=True` also attaches per-step token blocks for the rich/structured
++    variant; `expected_spatial_channels` is the schema-driven spatial channel count (REQUIRED when
++    rich — no hardcoded 13, FND-0007).
+     """
++    if rich and expected_spatial_channels is None:
++        raise ValueError("load_trajectories(rich=True) requires expected_spatial_channels "
++                         "(schema-driven spatial channel count; SSOT is Kotlin SampleSchema)")
+     out: list[TrainTrajectory] = []
+     for p in sorted(str(x) for x in paths):
+         shard = reader.load(p)
+@@ -160,6 +187,7 @@ def load_trajectories(
+         mask_policy = np.stack([s.blocks["mask_policy"] for s in steps]).astype(np.float32)
+         rewards = np.zeros(t, dtype=np.float32)
+         rewards[-1] = term_r                              # terminal-only ±1
+-        rich_blocks = [_rich_step_blocks(s.blocks) for s in steps] if rich else None
++        rich_blocks = ([_rich_step_blocks(s.blocks, expected_spatial_channels) for s in steps]
++                       if rich else None)
+         out.append(TrainTrajectory(obs, a_tech, a_policy, mask_tech, mask_policy, rewards, rich_blocks))
+     return out
+diff --git a/python/unciv_train/export_onnx.py b/python/unciv_train/export_onnx.py
+index 02b815cbc..205901f3a 100644
+--- a/python/unciv_train/export_onnx.py
++++ b/python/unciv_train/export_onnx.py
+@@ -5,6 +5,8 @@ JVM via `session.getMetadata().getCustomMetadata()` so EVAL refuses a contract-m
+ """
+ from __future__ import annotations
+ 
++import os
++import tempfile
+ from pathlib import Path
+ 
+ import onnx
+@@ -16,6 +18,20 @@ from .contract import Dims
+ from .model import PolicyNet
+ 
+ 
++def _atomic_save(model, out_path: str) -> None:
++    """Atomic ONNX write: serialize to a sibling .tmp then os.replace (mirrors ShardFormat's atomic
++    finalize — a crash mid-write never leaves a half-written model the JVM might load)."""
++    out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
++    fd, tmp = tempfile.mkstemp(dir=out_dir, suffix=".onnx.tmp")
++    os.close(fd)
++    try:
++        onnx.save(model, tmp)
++        os.replace(tmp, out_path)
++    finally:
++        if os.path.exists(tmp):
++            os.remove(tmp)
++
++
+ class _PolicyOnly(nn.Module):
+     """Export wrapper for the BLIND net (single obs tensor): drops the value head so the play
+     ONNX has exactly two outputs (tech_logits, policy_logits)."""
+@@ -89,16 +105,28 @@ def export_rich(
+     ruleset_fingerprint: str,
+     sample_inputs: dict | None = None,
+     opset: int = 17,
++    neighbors: bool = False,
++    contract_version: int | None = None,
+ ) -> None:
+-    """Rich/contract-v2 export: MULTI-TENSOR named input (global, acting_civ, each token set +
+-    its presence mask) with dynamic axes; policy-only outputs (value dropped). Stamps
+-    CONTRACT_VERSION_RICH so the JVM bridge selects the multi-tensor path."""
++    """Rich/contract-v2(+v3) export: MULTI-TENSOR named input (global, acting_civ, each token set +
++    its presence mask) with dynamic axes; policy-only outputs (value dropped).
++
++    Stamps CONTRACT_VERSION_RICH (=2) by default so the JVM bridge selects the multi-tensor path.
++    When `neighbors=True` (v4 structured encoder), also appends the degree-6 graph tensors
++    `neighbor_index` (int64) + `neighbor_mask` (f32) — built OUTSIDE the float32 sample coercion so
++    the int64 index dtype survives — both sharing spatial's `n_spatial` dynamic axis (degree axis
++    static 6), and the caller should pass `contract_version=CONTRACT_VERSION_STRUCTURED`. Atomic write.
++    """
+     import numpy as np
+ 
+     out_path = str(out_path)
+     net.eval()
++    if contract_version is None:
++        contract_version = contract.CONTRACT_VERSION_RICH
+ 
+-    # Ordered tensor names: global, acting_civ, then each token set + its presence mask.
++    # Ordered tensor names: global, acting_civ, then each token set + its presence mask. The two
++    # neighbor tensors (when present) are appended immediately after the spatial pair so the
++    # positional export order is unambiguous and documents the coupling to spatial's node axis.
+     names = [contract.INPUT_GLOBAL, contract.INPUT_ACTING]
+     dummy: dict[str, torch.Tensor] = {
+         contract.INPUT_GLOBAL: torch.zeros(1, dims.global_w),
+@@ -106,15 +134,31 @@ def export_rich(
+     }
+     dyn = {contract.INPUT_GLOBAL: {0: "batch"}, contract.INPUT_ACTING: {0: "batch"},
+            contract.OUTPUT_TECH: {0: "batch"}, contract.OUTPUT_POLICY: {0: "batch"}}
++    n0 = 2
+     for name, width in token_specs.items():
+-        n0 = 2
+         dummy[name] = torch.zeros(1, n0, width)
+         dummy[name + "_mask"] = torch.ones(1, n0)
+         names += [name, name + "_mask"]
+         dyn[name] = {0: "batch", 1: "n_" + name}
+         dyn[name + "_mask"] = {0: "batch", 1: "n_" + name}
++        if neighbors and name == "spatial":
++            # Reuse spatial's dummy row count (n0) AND its dynamic label so the neighbor node axis is
++            # byte-identically bound to spatial's "n_spatial" — values 0..n0-1 are valid Gather rows.
++            n_sp = int(dummy["spatial"].shape[1])
++            ni, nm = contract.INPUT_NEIGHBOR_INDEX, contract.INPUT_NEIGHBOR_MASK
++            dummy[ni] = torch.zeros(1, n_sp, contract.NEIGHBOR_DEGREE, dtype=torch.int64)
++            dummy[nm] = torch.ones(1, n_sp, contract.NEIGHBOR_DEGREE)
++            names += [ni, nm]
++            dyn[ni] = {0: "batch", 1: "n_spatial"}
++            dyn[nm] = {0: "batch", 1: "n_spatial"}
+     if sample_inputs is not None:
+-        dummy.update({k: torch.as_tensor(np.asarray(v, dtype=np.float32)) for k, v in sample_inputs.items()})
++        # Coerce float32 for every override EXCEPT neighbor_index, which must stay int64 (ORT Gather
++        # index dtype) — handle it OUTSIDE the float32 dict so it is never down-cast to float.
++        for k, v in sample_inputs.items():
++            if k == contract.INPUT_NEIGHBOR_INDEX:
++                dummy[k] = torch.as_tensor(np.asarray(v)).long()
++            else:
++                dummy[k] = torch.as_tensor(np.asarray(v, dtype=np.float32))
+ 
+     wrapped = _RichPolicyOnly(net, names)
+     args = tuple(dummy[n] for n in names)  # POSITIONAL tensors in name order (ONNX-traceable)
+@@ -129,10 +173,10 @@ def export_rich(
+     onnx.helper.set_model_props(model, {
+         contract.META_SCHEMA_VERSION: str(schema_version),
+         contract.META_RULESET_FINGERPRINT: ruleset_fingerprint,
+-        contract.META_CONTRACT_VERSION: str(contract.CONTRACT_VERSION_RICH),
++        contract.META_CONTRACT_VERSION: str(contract_version),
+         contract.META_INPUT_WIDTH: str(dims.input_w),
+         contract.META_TECH_WIDTH: str(dims.tech_w),
+         contract.META_POLICY_WIDTH: str(dims.policy_w),
+         contract.META_INPUT_NAMES: ",".join(names),
+     })
+-    onnx.save(model, out_path)
++    _atomic_save(model, out_path)
+diff --git a/python/unciv_train/features.py b/python/unciv_train/features.py
+index 9d7687939..3223cbe30 100644
+--- a/python/unciv_train/features.py
++++ b/python/unciv_train/features.py
+@@ -1,17 +1,25 @@
+-"""Assemble the rich multi-tensor input from per-step observation blocks.
++"""Assemble the rich/structured multi-tensor input from per-step observation blocks.
+ 
+-The spatial block (FIXED nTiles*13) becomes a per-tile token SET; each entity block
++The spatial block (nTiles*n_channels, schema-driven) becomes a per-tile token SET; each entity block
+ (own_units/opp_units/own_cities/opp_cities/civ_tokens) is a present-only token set. All are padded
+ to the batch-max count with a presence mask (1 = real token, 0 = padding) so the model's masked
+-pool ignores padding. This is the SAME layout the JVM builds at decision time — the parity test
++pool/GNN ignores padding. This is the SAME layout the JVM builds at decision time — the parity test
+ guards that the two agree.
++
++For the v4 structured encoder this also derives the degree-6 hex-adjacency tensors the gather-GNN
++needs — ``neighbor_index`` [B,N,6] int64 + ``neighbor_mask`` [B,N,6] f32 — from the shard-only
++``spatial_coords`` block (per-tile (x,y)) plus the global head's map-dim scalars (effWrapRadius,
++worldWrap, shape) via ``hexgraph.build_neighbor_graph``. These are NEW ONNX inputs (not token sets,
++not folded into spatial). They are emitted only when coords are available (contract v3); on v2 shards
++the neighbor tensors are simply absent and the rich (pool) net does not consume them.
+ """
+ from __future__ import annotations
+ 
+ import numpy as np
+ import torch
+ 
+-from .contract import Dims
++from .contract import Dims, GLOBAL_MAPDIM_OFFSET, INPUT_NEIGHBOR_INDEX, INPUT_NEIGHBOR_MASK
++from .hexgraph import HEX_DEGREE, build_neighbor_graph
+ 
+ 
+ def _pad_token_set(arrays: list[np.ndarray], width: int) -> tuple[np.ndarray, np.ndarray]:
+@@ -30,40 +38,110 @@ def _pad_token_set(arrays: list[np.ndarray], width: int) -> tuple[np.ndarray, np
+     return padded, mask
+ 
+ 
++def _read_mapdims(global_vec: np.ndarray) -> tuple[int, bool, int]:
++    """Read (eff_wrap_radius, world_wrap, shape) from the global head's map-dim slots.
++
++    Global head layout (positional, frozen with Kotlin buildGlobal):
++        [turns, era, tileCount, knownMajors, aliveMajors, effWrapRadius, worldWrap, shape, ...demog]
++    so the 3 map-dim scalars sit at slots GLOBAL_MAPDIM_OFFSET, +1, +2 (BEFORE the demographics agg).
++    """
++    g = np.asarray(global_vec, dtype=np.float32).reshape(-1)
++    o = GLOBAL_MAPDIM_OFFSET
++    eff_wrap_radius = int(round(float(g[o])))
++    ww_raw = float(g[o + 1])
++    ww_round = round(ww_raw)
++    assert ww_round in (0, 1), (
++        f"worldWrap global slot {o + 1} = {ww_raw!r} is not in {{0,1}} "
++        "(global head map-dim offset drift? check GLOBAL_MAPDIM_OFFSET vs Kotlin buildGlobal)"
++    )
++    world_wrap = bool(ww_round)
++    shape = int(round(float(g[o + 2])))
++    return eff_wrap_radius, world_wrap, shape
++
++
++def _neighbor_graph_for(coords: np.ndarray, global_vec: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++    """Degree-6 (idx [N,6] int64, mask [N,6] f32) for one step from its coords + global map-dims."""
++    eff_wrap_radius, world_wrap, shape = _read_mapdims(global_vec)
++    return build_neighbor_graph(coords, eff_wrap_radius=eff_wrap_radius,
++                                world_wrap=world_wrap, shape=shape)
++
++
+ def build_rich_batch(trajectories, dims: Dims, token_specs: dict[str, int]) -> dict:
+     """Flatten all trajectories' per-step rich blocks into one padded multi-tensor batch.
+-    Returns {name: tensor, name+"_mask": tensor, "global": tensor, "acting_civ": tensor}.
++    Returns {name: tensor, name+"_mask": tensor, "global": tensor, "acting_civ": tensor} and, when
++    per-step `spatial_coords` are present, the structured graph tensors neighbor_index/neighbor_mask
++    (padded to the SAME max-N as the spatial token set — degree axis static 6).
+     """
+     steps = [blk for t in trajectories for blk in (t.rich or [])]
+     n = len(steps)
++    assert n > 0, "build_rich_batch called with no steps"
+     out: dict[str, torch.Tensor] = {
+         "global": torch.tensor(np.stack([s["global"] for s in steps]).astype(np.float32)),
+         "acting_civ": torch.tensor(np.stack([s["acting_civ"] for s in steps]).astype(np.float32)),
+     }
+-    assert n > 0, "build_rich_batch called with no steps"
++    # Build the padded spatial token set first so the neighbor tensors share its max-N exactly.
++    spatial_arrays = [np.asarray(s["spatial"], np.float32) for s in steps]
++    maxn = max(1, max(int(a.shape[0]) for a in spatial_arrays))
++
++    have_coords = all(s.get("spatial_coords") is not None for s in steps)
++    if have_coords:
++        nbr_idx = np.zeros((n, maxn, HEX_DEGREE), dtype=np.int64)
++        nbr_mask = np.zeros((n, maxn, HEX_DEGREE), dtype=np.float32)
++        for i, s in enumerate(steps):
++            coords = np.asarray(s["spatial_coords"], np.float32)
++            ni = int(coords.shape[0])
++            if ni:
++                gi, gm = _neighbor_graph_for(coords, s["global"])
++                # Reindex this step's sentinel (== ni, the per-step pad row) to the batch pad row
++                # (== maxn): the model appends ONE zero pad row at the padded node count maxn, so a
++                # missing neighbor must point at maxn, not at the per-step ni (a real padded row).
++                gi = np.where(gi == ni, maxn, gi)
++                nbr_idx[i, :ni] = gi
++                nbr_mask[i, :ni] = gm
++        out[INPUT_NEIGHBOR_INDEX] = torch.tensor(nbr_idx)
++        out[INPUT_NEIGHBOR_MASK] = torch.tensor(nbr_mask)
++
+     for name, width in token_specs.items():
+         padded, mask = _pad_token_set([s[name] for s in steps], width)
+         out[name] = torch.tensor(padded)
+         out[name + "_mask"] = torch.tensor(mask)
++    # Padding-consistency invariant: neighbor tensors share spatial's padded node axis exactly.
++    assert out["spatial"].shape[1] == maxn
++    if have_coords:
++        assert out[INPUT_NEIGHBOR_INDEX].shape[1] == out["spatial"].shape[1]
+     return out
+ 
+ 
+ def build_rich_single(step_blocks: dict, token_specs: dict[str, int]) -> dict:
+     """Batch-of-1 multi-tensor input from ONE step's raw blocks (the parity / inference reference).
+ 
+-    `step_blocks` holds: global, acting_civ (1D), spatial (nTiles*13 flat OR [nTiles,13]), and each
+-    entity block as [count, perItem] (possibly empty). Mirrors exactly what the JVM builds.
++    `step_blocks` holds: global, acting_civ (1D), spatial (nTiles*n_channels flat OR [nTiles,n_ch]),
++    each entity block as [count, perItem] (possibly empty), and optionally `spatial_coords`
++    (nTiles*2 flat OR [nTiles,2]) — when present the degree-6 neighbor tensors are derived and added.
++    Mirrors exactly what the JVM builds.
+     """
+     g = np.asarray(step_blocks["global"], dtype=np.float32).reshape(1, -1)
+     a = np.asarray(step_blocks["acting_civ"], dtype=np.float32).reshape(1, -1)
+     out: dict[str, torch.Tensor] = {"global": torch.tensor(g), "acting_civ": torch.tensor(a)}
++    n_spatial = 0
+     for name, width in token_specs.items():
+         arr = np.asarray(step_blocks[name], dtype=np.float32)
+         if name == "spatial":
+             arr = arr.reshape(-1, width)
++            n_spatial = int(arr.shape[0])
+         elif arr.ndim == 1:
+             arr = arr.reshape(0, width) if arr.size == 0 else arr.reshape(-1, width)
+         padded, mask = _pad_token_set([arr], width)
+         out[name] = torch.tensor(padded)
+         out[name + "_mask"] = torch.tensor(mask)
++
++    coords = step_blocks.get("spatial_coords")
++    if coords is not None:
++        coords = np.asarray(coords, dtype=np.float32).reshape(-1, 2)
++        gi, gm = _neighbor_graph_for(coords, g[0])
++        # batch-of-1: padded node count == n_spatial, so the per-step sentinel (== n_spatial) already
++        # equals the model's pad row index — no reindex needed.
++        out[INPUT_NEIGHBOR_INDEX] = torch.tensor(gi[None, ...])     # [1,N,6] int64
++        out[INPUT_NEIGHBOR_MASK] = torch.tensor(gm[None, ...])      # [1,N,6] f32
++        assert out[INPUT_NEIGHBOR_INDEX].shape[1] == out["spatial"].shape[1] == n_spatial
+     return out
+diff --git a/python/unciv_train/hexgraph.py b/python/unciv_train/hexgraph.py
+new file mode 100644
+index 000000000..56cd35d7a
+--- /dev/null
++++ b/python/unciv_train/hexgraph.py
+@@ -0,0 +1,71 @@
++"""v4 hex adjacency builder (D3) — pure, mirrors the JVM engine exactly.
++
++Turns per-tile (x,y) coords into a fixed degree-6 ``neighbor_index [N,6]`` + ``neighbor_mask [N,6]``
++for the ONNX-safe gather-GNN (gather neighbors → masked-reduce over the degree axis; NO scatter).
++A missing neighbor (off-map, no world-wrap) → **sentinel index N** (the model appends a zero pad row
++at index N) + mask 0, so even a forgotten mask contributes zero (council FND-0035). All lookups are
++exact integer dict hits; world-wrap replicates ``TileMap.getIfTileExistsOrNull`` branch C then D.
++
++Used at TRAIN time (Python, from the shard's ``spatial_coords`` block). At INFERENCE the JVM builds
++the same tensors from the live ``TileMap``; an engine-fidelity test + a Python↔Kotlin adjacency-parity
++test guard that the two agree (FND-0036). This function and the Kotlin pure builder are the SSOT.
++"""
++from __future__ import annotations
++
++import numpy as np
++
++# FROZEN clock-direction order (dirs 12,2,4,6,8,10) — identical in Kotlin emit/inference/parity.
++# HexMath.clockPositionToHexcoordMap: 12=(1,1) 2=(0,1) 4=(-1,0) 6=(-1,-1) 8=(0,-1) 10=(1,0).
++OFFSETS: tuple[tuple[int, int], ...] = ((1, 1), (0, 1), (-1, 0), (-1, -1), (0, -1), (1, 0))
++HEX_DEGREE = len(OFFSETS)  # 6
++
++
++def build_neighbor_graph(coords, eff_wrap_radius, world_wrap, shape=1):
++    """Build the degree-6 hex adjacency for one observation.
++
++    Args:
++        coords: [N,2] per-tile (x,y). Must be integer-exact (they come from integer hex positions
++            via the f32 ``spatial_coords`` block; a fractional value signals storage/decode drift).
++        eff_wrap_radius: PRE-RESOLVED wrap radius emitted by Kotlin (rectangular = width/2, else
++            mapSize.radius) — so Python never needs map width.
++        world_wrap: bool — whether the map wraps.
++        shape: map-shape ordinal (kept for signature symmetry; the wrap rule is fully captured by
++            ``eff_wrap_radius``, identical for hex/rectangular given R).
++
++    Returns:
++        (neighbor_index [N,6] int64, neighbor_mask [N,6] float32). Missing slot → index N + mask 0.
++    """
++    coords = np.asarray(coords)
++    n = int(coords.shape[0])
++    if n == 0:
++        return np.zeros((0, HEX_DEGREE), dtype=np.int64), np.zeros((0, HEX_DEGREE), dtype=np.float32)
++
++    xs = np.rint(coords[:, 0]).astype(np.int64)
++    ys = np.rint(coords[:, 1]).astype(np.int64)
++    if not (np.array_equal(xs, coords[:, 0]) and np.array_equal(ys, coords[:, 1])):
++        raise ValueError("hexgraph: tile coords are not integer-exact (storage/decode drift?)")
++
++    pos_to_row: dict[tuple[int, int], int] = {(int(x), int(y)): i for i, (x, y) in enumerate(zip(xs, ys))}
++    wrap = bool(world_wrap)
++    r = int(round(float(eff_wrap_radius)))
++
++    sentinel = n  # the model pads node features with a zero row at index N
++    idx = np.full((n, HEX_DEGREE), sentinel, dtype=np.int64)
++    mask = np.zeros((n, HEX_DEGREE), dtype=np.float32)
++
++    for i in range(n):
++        x, y = int(xs[i]), int(ys[i])
++        for d, (dx, dy) in enumerate(OFFSETS):
++            nx, ny = x + dx, y + dy
++            row = pos_to_row.get((nx, ny))
++            if row is None and wrap:                       # mirror getIfTileExistsOrNull C then D
++                row = pos_to_row.get((nx + r, ny - r))
++                if row is None:
++                    row = pos_to_row.get((nx - r, ny + r))
++            if row is not None:
++                idx[i, d] = row
++                mask[i, d] = 1.0
++
++    # bounds: every index in [0, N]; the N sentinel is the pad row — no OOB Gather (FND-0025)
++    assert int(idx.min()) >= 0 and int(idx.max()) <= n, "neighbor index out of bounds"
++    return idx, mask
+diff --git a/python/unciv_train/model.py b/python/unciv_train/model.py
+index e8434ee12..0f1211f06 100644
+--- a/python/unciv_train/model.py
++++ b/python/unciv_train/model.py
+@@ -111,3 +111,410 @@ class RichPolicyValueNet(nn.Module):
+             parts.append(self.encoders[name](inputs[name], inputs[name + "_mask"]))
+         h = self.trunk(torch.cat(parts, dim=1))
+         return self.tech_head(h), self.policy_head(h), torch.tanh(self.value_head(h))
++
++
++# --------------------------------------------------------------------------------------------------
++# v4 STRUCTURED encoder (D2 embeddings + D3 hex-GNN). Phase A is GNN-only (attn_layers default 0);
++# entity/cross attention is Phase B. The FROZEN seam is preserved exactly:
++#   forward(inputs:dict) -> (tech_logits, policy_logits, torch.tanh(value)); INPUT_GLOBAL/INPUT_ACTING.
++# All ops are opset-17 core: Gather/index, Mul, ReduceSum/ReduceMean, MatMul/Linear, LayerNorm,
++# Softmax, tanh — NO scatter_add/index_add, NO nn.MultiheadAttention/F.scaled_dot_product_attention.
++# --------------------------------------------------------------------------------------------------
++
++# Spatial channel field plan for the FIXED 13-channel v3 spatial block (SSOT order is Kotlin
++# Featurizer.buildSpatial). Each entry is either ("num",) for a raw scalar channel or ("emb", table)
++# for a categorical channel looked up in the named shared embedding table. Channel indices:
++#   0 visibility(num) 1 terrain_base(emb terrain) 2 terrain_feature(emb terrain SHARED)
++#   3 resource(emb resource) 4 road(emb road) 5 river(num) 6 is_city_center(num)
++#   7 owner_slot(emb slot) 8 improvement(emb improvement) 9 unit_present(num)
++#   10 unit_owner_slot(emb slot SHARED) 11 unit_type_cat(emb unit_type) 12 unit_health_bucket(num)
++_SPATIAL_FIELD_PLAN = (
++    ("num",),               # 0 visibility (raw 0/1/2)
++    ("emb", "terrain"),     # 1 terrain_base
++    ("emb", "terrain"),     # 2 terrain_feature (SHARED terrain table)
++    ("emb", "resource"),    # 3 resource
++    ("emb", "road"),        # 4 road status (ordinal 0..2)
++    ("num",),               # 5 river
++    ("num",),               # 6 is_city_center
++    ("emb", "slot"),        # 7 owner_slot (255 -> reindex)
++    ("emb", "improvement"), # 8 improvement
++    ("num",),               # 9 unit_present
++    ("emb", "slot"),        # 10 unit_owner_slot (SHARED slot table; 255 -> reindex)
++    ("emb", "unit_type"),   # 11 unit_type_cat (0..4)
++    ("num",),               # 12 unit_health_bucket
++)
++SLOT_SENTINEL_RAW = 255            # Featurizer emits 255 for "self" in owner-slot fields
++UNIT_TYPE_TABLE = 5                # unit_type_cat is 0..4; 0 == real "none" (no +1 sentinel)
++ROAD_TABLE = 3                     # roadStatus ordinal 0..2 (None/Road/Railroad); no sentinel
++
++RUNGS = {
++    # small stays Phase-A GNN-only (attn_layers=0) — the GNN-only baseline must remain intact.
++    "small":  dict(embed_dim=8,  gnn_layers=1, gnn_channels=32, attn_layers=0, attn_heads=2,
++                   attn_dim=32,  trunk_w=128),
++    # medium/large turn on Phase-B attention (D4 self-attn + entity↔node join + D5 cross-attn).
++    "medium": dict(embed_dim=16, gnn_layers=2, gnn_channels=64, attn_layers=2, attn_heads=4,
++                   attn_dim=64,  trunk_w=256),
++    "large":  dict(embed_dim=24, gnn_layers=3, gnn_channels=96, attn_layers=3, attn_heads=8,
++                   attn_dim=96,  trunk_w=384),
++}
++
++# D4 entity↔node join (FND-0036): each entity token carries a tile index naming its co-located GNN
++# node. own_units/opp_units → field index 8 (currentTile.zeroBasedIndex), own_cities/opp_cities →
++# field index 12 (centerTile.zeroBasedIndex). civ_tokens have NO tile index → no join. The tile index
++# is a JOIN KEY (used to gather the post-GNN node embedding), NOT a learned scalar feature.
++_ENTITY_TILE_FIELD = {
++    "own_units": 8,
++    "opp_units": 8,
++    "own_cities": 12,
++    "opp_cities": 12,
++    # civ_tokens: absent → no entity↔node join (no tile index).
++}
++
++
++def _masked_mean(tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
++    """Masked mean over [B,N,F] with mask [B,N] (1 present / 0 pad). NaN-guarded: divide by
++    clamp(count,1) so an all-padding row → zero vector (mirrors masked_pool, model.py:58)."""
++    m = mask.unsqueeze(-1)                                       # [B,N,1]
++    safe = mask.sum(dim=1, keepdim=True).clamp(min=1.0)         # [B,1]
++    return (tokens * m).sum(dim=1) / safe                       # [B,F]
++
++
++class _SpatialEmbed(nn.Module):
++    """Embed the 13-channel spatial token: categorical channels → shared embedding tables, numeric
++    channels → raw scalars; concat → per-node feature [B,N,proj_w]. Counts are read from the schema
++    `vocabCounts` (num_embeddings = count + 1 sentinel row), NEVER hardcoded (D2)."""
++
++    def __init__(self, vocab_counts: dict, embed_dim: int, max_civ_tokens: int):
++        super().__init__()
++        E = embed_dim
++        self.slot_table = max_civ_tokens + 2          # 0 none/unknown, 1..mct civ, mct+1 self
++        self.slot_self = max_civ_tokens + 1           # reindex 255 -> this row
++        self.tables = nn.ModuleDict({
++            # terrain_base + terrain_feature SHARE this table (both index Vocab.TERRAINS).
++            "terrain": nn.Embedding(vocab_counts["terrain"] + 1, E),
++            "resource": nn.Embedding(vocab_counts["resource"] + 1, E),
++            "improvement": nn.Embedding(vocab_counts["improvement"] + 1, E),
++            # owner_slot + unit_owner_slot SHARE this slot table.
++            "slot": nn.Embedding(self.slot_table, E),
++            "unit_type": nn.Embedding(UNIT_TYPE_TABLE, E),    # 0..4, 0 real "none" (no +1)
++            "road": nn.Embedding(ROAD_TABLE, E),              # 0..2 ordinal (no +1)
++        })
++        self.plan = _SPATIAL_FIELD_PLAN
++        n_num = sum(1 for s in self.plan if s[0] == "num")
++        n_emb = sum(1 for s in self.plan if s[0] == "emb")
++        self.proj_w = n_num + n_emb * E
++
++    def forward(self, spatial: torch.Tensor) -> torch.Tensor:  # spatial: [B,N,13] float
++        cols = []
++        for j, s in enumerate(self.plan):
++            v = spatial[..., j]                                # [B,N]
++            if s[0] == "num":
++                cols.append(v.unsqueeze(-1))                   # [B,N,1]
++            else:
++                table = s[1]
++                if table == "slot":
++                    v = torch.where(v == float(SLOT_SENTINEL_RAW),
++                                    torch.full_like(v, float(self.slot_self)), v)
++                idx = v.clamp(0, self.tables[table].num_embeddings - 1).long()
++                cols.append(self.tables[table](idx))          # [B,N,E]
++        return torch.cat(cols, dim=-1)                         # [B,N,proj_w]
++
++
++class _GatherGNNLayer(nn.Module):
++    """One degree-6 gather-GNN layer (opset-17 safe: Gather + Mul + ReduceSum + Linear + LayerNorm).
++    Node features carry a ZERO pad row at index N so a sentinel-index-N neighbor gathers zeros."""
++
++    def __init__(self, channels: int):
++        super().__init__()
++        self.msg = nn.Linear(channels, channels)
++        self.upd = nn.Linear(2 * channels, channels)
++        self.norm = nn.LayerNorm(channels)
++
++    def forward(self, h: torch.Tensor, nbr_idx: torch.Tensor, nbr_mask: torch.Tensor) -> torch.Tensor:
++        # h: [B,N,C]; nbr_idx: [B,N,6] int64 in [0,N]; nbr_mask: [B,N,6] f32.
++        B, N, C = h.shape
++        h_pad = torch.cat([h, torch.zeros(B, 1, C, dtype=h.dtype, device=h.device)], dim=1)  # [B,N+1,C]
++        deg = nbr_idx.shape[2]
++        flat = nbr_idx.reshape(B, N * deg)                                       # [B,N*6]
++        gathered = torch.gather(h_pad, 1, flat.unsqueeze(-1).expand(-1, -1, C))  # [B,N*6,C]
++        nbr = gathered.reshape(B, N, deg, C)                                     # [B,N,6,C]
++        m = self.msg(nbr) * nbr_mask.unsqueeze(-1)                               # mask padding edges
++        denom = nbr_mask.sum(dim=2, keepdim=True).clamp(min=1.0)                 # [B,N,1] NaN-guard
++        agg = m.sum(dim=2) / denom                                              # masked mean -> [B,N,C]
++        out = torch.relu(self.upd(torch.cat([h, agg], dim=-1)))                  # [B,N,C]
++        return self.norm(h + out)                                               # residual + LN
++
++
++class _EntityEncoder(nn.Module):
++    """Phase-A entity token encoder: per-token Linear → masked-mean pool. Clean seam for the
++    Phase-B upgrade to embeddings + self-attention (just swap the body, keep the masked pool)."""
++
++    def __init__(self, in_dim: int, out_dim: int):
++        super().__init__()
++        self.proj = nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU())
++        self.out_w = out_dim
++
++    def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
++        return _masked_mean(self.proj(tokens), mask)
++
++
++# --------------------------------------------------------------------------------------------------
++# Phase B (D4/D5) hand-rolled attention. ONLY Linear Q/K/V + matmul + scale(1/√dk) + masked softmax
++# (masked_fill(-inf) → softmax) + matmul + out-proj, pre-LN, multi-head via reshape. NO
++# nn.MultiheadAttention / F.scaled_dot_product_attention / scatter — every op is opset-17 core.
++# --------------------------------------------------------------------------------------------------
++
++
++def _masked_softmax_attend(scores: torch.Tensor, kv_mask: torch.Tensor,
++                           v: torch.Tensor) -> torch.Tensor:
++    """NaN-safe masked attention readout (FND-0025).
++
++    `scores`: [B,H,Lq,Lk] raw QKᵀ/√dk. `kv_mask`: [B,Lk] (1 keep / 0 pad). `v`: [B,H,Lk,dk].
++    Masks padded keys with −inf then softmax. A row whose keys are ALL masked yields NaN after
++    softmax (−inf − (−inf)); we detect it and force the context to ZEROS (never NaN), mirroring the
++    max-over-empty → 0 guard in masked_pool (model.py:62). Returns context [B,H,Lq,dk]."""
++    m = kv_mask[:, None, None, :]                                   # [B,1,1,Lk] broadcast over H,Lq
++    scores = scores.masked_fill(m == 0, float("-inf"))             # padded keys → −inf
++    w = torch.softmax(scores, dim=-1)                              # all-masked row → NaN here
++    # all-masked detector: a query row has NO live key iff every kv_mask entry is 0.
++    any_key = (kv_mask.sum(dim=-1) > 0)                            # [B] True if ≥1 live key
++    w = torch.where(any_key[:, None, None, None], w, torch.zeros_like(w))  # dead row → 0 weights
++    ctx = torch.matmul(w, v)                                       # [B,H,Lq,dk]; dead row → 0 ctx
++    return ctx
++
++
++class _MHA(nn.Module):
++    """Hand-rolled multi-head attention: Linear Q/K/V → reshape to heads → scaled QKᵀ → masked
++    softmax (NaN-safe) → ·V → merge heads → out-proj. q and kv may differ (cross-attention)."""
++
++    def __init__(self, dim: int, heads: int):
++        super().__init__()
++        if dim % heads != 0:
++            raise ValueError(f"_MHA: attn_dim {dim} not divisible by heads {heads}")
++        self.h = heads
++        self.dk = dim // heads
++        self.scale = self.dk ** -0.5
++        self.q = nn.Linear(dim, dim)
++        self.k = nn.Linear(dim, dim)
++        self.v = nn.Linear(dim, dim)
++        self.o = nn.Linear(dim, dim)
++
++    def _split(self, x: torch.Tensor) -> torch.Tensor:            # [B,L,dim] → [B,H,L,dk]
++        B, L, _ = x.shape
++        return x.reshape(B, L, self.h, self.dk).transpose(1, 2)
++
++    def forward(self, q_in: torch.Tensor, kv_in: torch.Tensor,
++                kv_mask: torch.Tensor) -> torch.Tensor:
++        q = self._split(self.q(q_in))                             # [B,H,Lq,dk]
++        k = self._split(self.k(kv_in))                            # [B,H,Lk,dk]
++        v = self._split(self.v(kv_in))                            # [B,H,Lk,dk]
++        scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # [B,H,Lq,Lk]
++        ctx = _masked_softmax_attend(scores, kv_mask, v)         # [B,H,Lq,dk]; NaN-safe
++        B, Lq = q_in.shape[0], q_in.shape[1]
++        ctx = ctx.transpose(1, 2).reshape(B, Lq, self.h * self.dk)  # merge heads [B,Lq,dim]
++        return self.o(ctx)
++
++
++class _AttnBlock(nn.Module):
++    """Pre-LN attention residual block: x = x + MHA(LN(x_q), LN(x_kv), mask), then a small FFN
++    residual. For self-attention q_in is kv_in; for cross-attention they differ (separate LN)."""
++
++    def __init__(self, dim: int, heads: int):
++        super().__init__()
++        self.ln_q = nn.LayerNorm(dim)
++        self.ln_kv = nn.LayerNorm(dim)
++        self.mha = _MHA(dim, heads)
++        self.ln_ff = nn.LayerNorm(dim)
++        self.ff = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))
++
++    def forward(self, q_in: torch.Tensor, kv_in: torch.Tensor,
++                kv_mask: torch.Tensor) -> torch.Tensor:
++        # When q and kv are the same tensor (self-attn) both LNs see it; for cross-attn they differ.
++        q_n = self.ln_q(q_in)
++        kv_n = self.ln_kv(kv_in)
++        x = q_in + self.mha(q_n, kv_n, kv_mask)
++        x = x + self.ff(self.ln_ff(x))
++        return x
++
++
++class StructuredPolicyValueNet(nn.Module):
++    """v4 structured encoder: categorical embeddings + a hex-aware gather-GNN over the spatial tile
++    graph. FROZEN seam: forward(inputs:dict) → (tech, policy, tanh(value)).
++
++    Two paths, switched on `attn_layers`:
++    - **attn_layers == 0 (Phase A, GNN-only):** entity sets are projected + masked-mean-pooled, the
++      GNN nodes are masked-mean-pooled to a board vector, all concatenated with global+acting_civ →
++      split trunk. This is the untouched Phase-A baseline (the `small` rung).
++    - **attn_layers > 0 (Phase B):** D4 per-entity-set self-attention (with the FND-0036 entity↔node
++      join: each entity token is fused with its co-located post-GNN node embedding via its tile
++      index before self-attention) + D5 single-query cross-attention over [GNN nodes ⊕ refined
++      entity tokens] → a fixed context vector that replaces the masked-mean pooling as the trunk
++      input. The `medium`/`large` rungs use this path.
++
++    The model never sees raw coords — 2D locality comes entirely from the GNN over the
++    externally-built `neighbor_index`/`neighbor_mask` graph tensors. The tile index in each entity
++    token is a JOIN KEY into the node axis, not a learned feature.
++    """
++
++    INPUT_GLOBAL = "global"
++    INPUT_ACTING = "acting_civ"
++    INPUT_NEIGHBOR_INDEX = "neighbor_index"
++    INPUT_NEIGHBOR_MASK = "neighbor_mask"
++    SPATIAL = "spatial"
++    ENTITY_NAMES = ("own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens")
++
++    def __init__(self, dims: Dims, token_specs: dict[str, int], vocab_counts: dict, *,
++                 embed_dim: int = 8, gnn_layers: int = 2, gnn_channels: int = 32,
++                 attn_layers: int = 0, attn_heads: int = 2, attn_dim: int = 32,
++                 trunk_w: int = 128, max_civ_tokens: int = 40):
++        super().__init__()
++        if int(token_specs.get("spatial", 0)) != len(_SPATIAL_FIELD_PLAN):
++            raise ValueError(
++                f"StructuredPolicyValueNet: spatial width {token_specs.get('spatial')} != field-plan "
++                f"length {len(_SPATIAL_FIELD_PLAN)} (Phase-A targets the 13-channel v3 spatial block)"
++            )
++        self.attn_layers = attn_layers
++        self.attn_dim = attn_dim
++        self.gnn_channels = gnn_channels
++        self.use_attn = attn_layers > 0
++
++        # D2 embeddings + per-node input projection -> gnn_channels.
++        self.spatial_embed = _SpatialEmbed(vocab_counts, embed_dim, max_civ_tokens)
++        self.spatial_in = nn.Linear(self.spatial_embed.proj_w, gnn_channels)
++
++        # D3 GNN stack.
++        self.gnn = nn.ModuleList(_GatherGNNLayer(gnn_channels) for _ in range(gnn_layers))
++
++        if not self.use_attn:
++            # ---- Phase A: project + masked-mean pool entity sets; mean-pool the board. ----
++            self.entity_enc = nn.ModuleDict({
++                name: _EntityEncoder(int(token_specs[name]), gnn_channels)
++                for name in self.ENTITY_NAMES
++            })
++            agg_w = gnn_channels + sum(e.out_w for e in self.entity_enc.values())
++        else:
++            # ---- Phase B: self-attention + entity↔node join + single-query cross-attention. ----
++            # Per-entity-set token projection raw_width -> attn_dim.
++            self.entity_in = nn.ModuleDict({
++                name: nn.Linear(int(token_specs[name]), attn_dim) for name in self.ENTITY_NAMES
++            })
++            # Static 0/1 feature masks that zero each entity's tile-index column (join key, not a
++            # feature). Registered as buffers (move with .to(device), constant-folded in ONNX).
++            self._entity_feat_mask = {}
++            for name, fld in _ENTITY_TILE_FIELD.items():
++                mask = torch.ones(1, 1, int(token_specs[name]))
++                mask[..., fld] = 0.0
++                buf = f"_featmask_{name}"
++                self.register_buffer(buf, mask)
++                self._entity_feat_mask[name] = getattr(self, buf)
++            # FND-0036 join: project the gathered post-GNN node embedding (C) -> attn_dim, then ADD
++            # it into the entity token. Reused as the cross-attn node-key projection (same node space).
++            self.node_to_attn = nn.Linear(gnn_channels, attn_dim)
++            # D4 per-entity-set self-attention stacks (only entity sets WITH a join get the node fuse;
++            # civ_tokens still get self-attention, just no join).
++            self.self_attn = nn.ModuleDict({
++                name: nn.ModuleList(_AttnBlock(attn_dim, attn_heads) for _ in range(attn_layers))
++                for name in self.ENTITY_NAMES
++            })
++            # D5 single-query cross-attention: query from [global ⊕ acting] -> attn_dim.
++            self.q_proj = nn.Linear(dims.global_w + dims.acting_w, attn_dim)
++            self.cross = nn.ModuleList(_AttnBlock(attn_dim, attn_heads) for _ in range(attn_layers))
++            agg_w = attn_dim                      # the cross-attn context vector replaces pooling
++
++        # Aggregate -> split trunk (D6). (Phase A) board ⊕ entities OR (Phase B) cross-ctx, then
++        # ⊕ global ⊕ acting_civ. Unchanged heads.
++        trunk_in = agg_w + dims.global_w + dims.acting_w
++        self.shared = nn.Sequential(nn.Linear(trunk_in, trunk_w), nn.ReLU(),
++                                    nn.Linear(trunk_w, trunk_w), nn.ReLU())
++        self.policy_body = nn.Sequential(nn.Linear(trunk_w, trunk_w), nn.ReLU())
++        self.value_body = nn.Sequential(nn.Linear(trunk_w, trunk_w), nn.ReLU())
++        self.tech_head = nn.Linear(trunk_w, dims.tech_w)
++        self.policy_head = nn.Linear(trunk_w, dims.policy_w)
++        self.value_head = nn.Linear(trunk_w, 1)
++        _small_init_value_head(self.value_head)
++
++    def _gather_node_by_tile(self, h_pad: torch.Tensor, tile_idx: torch.Tensor,
++                             N: int) -> torch.Tensor:
++        """Gather each entity's co-located GNN node embedding (FND-0036 entity↔node join).
++
++        `h_pad`: [B,N+1,C] post-GNN node features with a ZERO pad row at index N (so an OOB/clamped
++        index gathers zeros). `tile_idx`: [B,M] float tile indices (currentTile/centerTile
++        zeroBasedIndex). Returns [B,M,C]. Indices are clamped to [0, N] — anything outside the real
++        node range (including the −1/absent sentinel after clamp) lands on the zero pad row."""
++        idx = tile_idx.clamp(0, N).long()                            # [B,M] in [0,N] (pad row safe)
++        B, M = idx.shape
++        C = h_pad.shape[2]
++        gathered = torch.gather(h_pad, 1, idx.unsqueeze(-1).expand(B, M, C))  # [B,M,C]
++        return gathered
++
++    def forward(self, inputs: dict[str, torch.Tensor]):
++        g = inputs[self.INPUT_GLOBAL]
++        a = inputs[self.INPUT_ACTING]
++        spatial = inputs[self.SPATIAL]                       # [B,N,13] float
++        spatial_mask = inputs[self.SPATIAL + "_mask"]        # [B,N]
++        nbr_idx = inputs[self.INPUT_NEIGHBOR_INDEX]          # [B,N,6] int64
++        nbr_mask = inputs[self.INPUT_NEIGHBOR_MASK]          # [B,N,6] f32
++
++        # D2 embeddings -> per-node projection -> D3 GNN.
++        h = self.spatial_in(self.spatial_embed(spatial))     # [B,N,C]
++        for layer in self.gnn:
++            h = layer(h, nbr_idx, nbr_mask)                  # [B,N,C]
++
++        if not self.use_attn:
++            # ---- Phase A path (GNN-only) — unchanged. ----
++            board = _masked_mean(h, spatial_mask)            # [B,C] board vector
++            parts = [board]
++            for name in self.ENTITY_NAMES:
++                parts.append(self.entity_enc[name](inputs[name], inputs[name + "_mask"]))
++            parts += [g, a]
++            body = self.shared(torch.cat(parts, dim=1))
++            ph = self.policy_body(body)
++            vh = self.value_body(body)
++            return self.tech_head(ph), self.policy_head(ph), torch.tanh(self.value_head(vh))
++
++        # ---- Phase B path (attention). ----
++        B, N, C = h.shape
++        # Zero pad row at index N so a clamped/absent tile index gathers zeros (mirrors the GNN pad).
++        h_pad = torch.cat([h, torch.zeros(B, 1, C, dtype=h.dtype, device=h.device)], dim=1)  # [B,N+1,C]
++        gnn_kv = self.node_to_attn(h)                        # [B,N,attn_dim] cross-attn node keys
++
++        # D4 per-entity-set self-attention (with the FND-0036 entity↔node join where a tile index
++        # exists). Refined tokens + masks are kept for the cross-attention union.
++        ent_tok, ent_mask = [], []
++        for name in self.ENTITY_NAMES:
++            tok = inputs[name]                               # [B,M,raw_width]
++            m = inputs[name + "_mask"]                       # [B,M]
++            tile_field = _ENTITY_TILE_FIELD.get(name)
++            feat = tok
++            if tile_field is not None:
++                # The tile index is a JOIN KEY only — NOT a learned scalar. Zero its column out of the
++                # projected token (via a static 0/1 column mask — Mul only, no scatter) so the model
++                # can't read it as a feature; its only use is the gather below.
++                feat = tok * self._entity_feat_mask[name].to(tok.dtype)
++            t = self.entity_in[name](feat)                   # [B,M,attn_dim]
++            if tile_field is not None:
++                # JOIN (FND-0036): gather the co-located post-GNN node embedding (by the tile index)
++                # and fuse (add) it into the entity token BEFORE self-attention.
++                node = self._gather_node_by_tile(h_pad, tok[..., tile_field], N)  # [B,M,C]
++                t = t + self.node_to_attn(node)              # [B,M,attn_dim] fused
++            for blk in self.self_attn[name]:
++                t = blk(t, t, m)                             # self-attn: q=kv=t, presence mask
++            # zero out padded tokens so they contribute nothing as cross-attn keys/values.
++            t = t * m.unsqueeze(-1)
++            ent_tok.append(t)
++            ent_mask.append(m)
++
++        # D5 single-query cross-attention over [GNN nodes ⊕ refined entity tokens].
++        keys = torch.cat([gnn_kv] + ent_tok, dim=1)          # [B, N+ΣM, attn_dim]
++        # GNN nodes always present per spatial_mask; union with entity masks. The union always has
++        # ≥1 live node (board non-empty) so the cross-attn key set is never fully masked.
++        kmask = torch.cat([spatial_mask] + ent_mask, dim=1)  # [B, N+ΣM]
++        q = self.q_proj(torch.cat([g, a], dim=1)).unsqueeze(1)  # [B,1,attn_dim] single query
++        for blk in self.cross:
++            q = blk(q, keys, kmask)                          # [B,1,attn_dim]
++        cross_ctx = q[:, 0, :]                               # [B,attn_dim] fixed context vector
++
++        body = self.shared(torch.cat([cross_ctx, g, a], dim=1))
++        ph = self.policy_body(body)
++        vh = self.value_body(body)
++        return self.tech_head(ph), self.policy_head(ph), torch.tanh(self.value_head(vh))
+diff --git a/python/unciv_train/run_loop.py b/python/unciv_train/run_loop.py
+index 35454376b..fe3ea7fde 100644
+--- a/python/unciv_train/run_loop.py
++++ b/python/unciv_train/run_loop.py
+@@ -21,10 +21,6 @@ import sys
+ import time
+ from pathlib import Path
+ 
+-import matplotlib
+-matplotlib.use("Agg")
+-import matplotlib.pyplot as plt  # noqa: E402
+-
+ from . import contract, dataset as ds, export_onnx as ex, train as tr  # noqa: E402
+ 
+ REPO = Path(__file__).resolve().parents[2]
+@@ -91,6 +87,16 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
+             gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
+             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps)
+         return net, stats, ("rich", token_specs)
++    if variant == "structured":
++        from .model import RUNGS
++        token_specs = contract.token_specs_from_schema(schema_path)
++        vocab_counts = contract.vocab_counts_from_schema(schema_path)
++        rung = RUNGS[args.rung]
++        net, stats = tr.train_actor_critic_structured(
++            trajectories_or_steps, dims, token_specs, vocab_counts, rung, epochs=args.epochs,
++            lr=args.lr, seed=seed, gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
++            entropy_coef=args.entropy_coef, clip_eps=args.clip_eps)
++        return net, stats, ("structured", token_specs)
+     raise ValueError(f"unknown variant {variant!r}")
+ 
+ 
+@@ -111,6 +117,13 @@ CURVE_COLS = ["round", "games", "winrate", "pval", "n_steps", "loss", "value_los
+ 
+ 
+ def plot(rows: list[dict], png: Path, variant: str, map_size: str) -> None:
++    try:  # best-effort: a curve PNG is nice-to-have, not required for the run
++        import matplotlib
++        matplotlib.use("Agg")
++        import matplotlib.pyplot as plt
++    except ImportError:
++        print("[plot] matplotlib not installed — skipping curve PNG (run unaffected)")
++        return
+     rounds = [r["round"] for r in rows]
+     wr = [r["winrate"] * 100 for r in rows]
+     plt.figure(figsize=(7, 4))
+@@ -139,7 +152,9 @@ def _read_existing_rows(curve_csv: Path) -> list[dict]:
+ 
+ def main(argv=None) -> int:
+     ap = argparse.ArgumentParser(description="Self-play round loop → learning curve")
+-    ap.add_argument("--variant", choices=["v1-reinforce", "blind-critic", "rich-critic"],
++    ap.add_argument("--rung", choices=["small", "medium", "large"], default="small",
++                    help="v4 structured-encoder capacity rung (D7 ladder)")
++    ap.add_argument("--variant", choices=["v1-reinforce", "blind-critic", "rich-critic", "structured", "rich-v2"],
+                     default="blind-critic", help="algorithm + representation (attributable axis)")
+     ap.add_argument("--map-size", default="Tiny", help="Tiny (comparability) or Medium (ceiling test)")
+     ap.add_argument("--rounds", type=int, default=12)
+@@ -163,6 +178,8 @@ def main(argv=None) -> int:
+     ap.add_argument("--resume", action="store_true", help="skip rounds already in curve.csv")
+     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
+     args = ap.parse_args(argv)
++    if args.variant == "rich-v2":   # alias for the v4 structured encoder
++        args.variant = "structured"
+ 
+     import torch  # local import: keep CLI help fast
+ 
+@@ -201,8 +218,11 @@ def main(argv=None) -> int:
+         if args.variant == "v1-reinforce":
+             data = ds.load_training_steps(shards, expected_version=ver, expected_fingerprint=fp)
+         else:
+-            data = ds.load_trajectories(shards, expected_version=ver, expected_fingerprint=fp,
+-                                        rich=(args.variant == "rich-critic"))
++            is_rich = args.variant in ("rich-critic", "structured")
++            data = ds.load_trajectories(
++                shards, expected_version=ver, expected_fingerprint=fp, rich=is_rich,
++                expected_spatial_channels=(contract.spatial_channels_from_schema(schema)
++                                           if is_rich else None))
+         net, stats, mode = train_round(args.variant, data, dims, schema, args, seed=r)
+ 
+         # checkpoint (state_dict only; loaded with weights_only=True on resume — R7)
+@@ -211,15 +231,20 @@ def main(argv=None) -> int:
+         model_path = out / f"policy_round_{r}.onnx"
+         if mode == "blind":
+             ex.export(net, dims, model_path, schema_version=ver, ruleset_fingerprint=fp)
+-        else:  # ("rich", token_specs)
+-            _, token_specs = mode
++        else:  # ("rich"|"structured", token_specs)
++            kind, token_specs = mode
+             from .features import build_rich_batch
+             sample = None
+             if data:
+                 sample = {k: v[:1] for k, v in build_rich_batch(data[:1], dims, token_specs).items()}
+                 sample = {k: (v.numpy() if hasattr(v, "numpy") else v) for k, v in sample.items()}
+-            ex.export_rich(net, dims, token_specs, model_path, schema_version=ver,
+-                           ruleset_fingerprint=fp, sample_inputs=sample)
++            if kind == "structured":   # v3: emit the int64 neighbor inputs + stamp contract_version=3
++                ex.export_rich(net, dims, token_specs, model_path, schema_version=ver,
++                               ruleset_fingerprint=fp, sample_inputs=sample, neighbors=True,
++                               contract_version=contract.CONTRACT_VERSION_STRUCTURED)
++            else:
++                ex.export_rich(net, dims, token_specs, model_path, schema_version=ver,
++                               ruleset_fingerprint=fp, sample_inputs=sample)
+ 
+         ev = evaluate(model_path, args.eval_games, args.turn_cap, args.threads, args.eval_seed,
+                       args.gradle_timeout, args.map_size)
+@@ -235,6 +260,9 @@ def main(argv=None) -> int:
+                                     for c in CURVE_COLS])
+         with open(metrics_jsonl, "a") as f:
+             f.write(json.dumps({**row, "variant": args.variant, "map_size": args.map_size,
++                                "rung": args.rung,
++                                "turns_per_sec": ev.get("turns_per_sec"),
++                                "ms_per_decision": ev.get("ms_per_decision"),
+                                 "mean_adv": stats.get("mean_adv", 0.0)}) + "\n")
+         plot(rows, curve_png, args.variant, args.map_size)
+         print(f"[{args.variant} r{r}] gen={n_games} steps={row['n_steps']} "
+diff --git a/python/unciv_train/train.py b/python/unciv_train/train.py
+index c5f5a4b2e..c356cdbf5 100644
+--- a/python/unciv_train/train.py
++++ b/python/unciv_train/train.py
+@@ -273,3 +273,45 @@ def train_actor_critic_rich(
+         gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
+         clip_eps=clip_eps, norm_adv=norm_adv,
+     )
++
++
++def train_actor_critic_structured(
++    trajectories: list[TrainTrajectory],
++    dims: Dims,
++    token_specs: dict[str, int],
++    vocab_counts: dict,
++    rung: dict,
++    *,
++    epochs: int = 8,
++    lr: float = 1e-3,
++    seed: int = 0,
++    gamma: float = 0.99,
++    lam: float = 0.95,
++    value_coef: float = 0.5,
++    entropy_coef: float = 0.01,
++    clip_eps: float | None = None,
++    norm_adv: bool = True,
++) -> tuple[object, dict]:
++    """v4 STRUCTURED variant: same encoder-AGNOSTIC core (_optimize_actor_critic) + same rich
++    batch/stacking as train_actor_critic_rich — ONLY the nn.Module is swapped for
++    StructuredPolicyValueNet (embeddings + hex-GNN + attention, sized by `rung`). The trainer core +
++    train_actor_critic_rich stay UNTOUCHED (the FROZEN seam)."""
++    from .features import build_rich_batch
++    from .model import StructuredPolicyValueNet
++
++    torch.manual_seed(seed)
++    net = StructuredPolicyValueNet(dims, token_specs, vocab_counts, **rung)
++    if not trajectories:
++        return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}
++    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos = _stack_traj(trajectories)
++    inputs = build_rich_batch(trajectories, dims, token_specs)
++
++    def forward_fn():
++        return net(inputs)
++
++    return _optimize_actor_critic(
++        net, forward_fn, a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
++        rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
++        gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
++        clip_eps=clip_eps, norm_adv=norm_adv,
++    )

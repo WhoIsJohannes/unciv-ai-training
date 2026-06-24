@@ -37,6 +37,37 @@ def _tiny_trajectory(dims, token_specs):
     )
 
 
+def test_attention_backward_finite_on_fully_masked_set():
+    """FND-0009/0021: a fully-masked entity set + isolated nodes must yield FINITE gradients, not just
+    a finite forward. The −inf masked-softmax trap zeros the forward (via torch.where) but NaNs the
+    backward through the softmax jacobian — poisoning training. Forward-only tests miss it; this
+    backprops and checks every param grad. (Would FAIL against the old masked_fill(−inf).)"""
+    import torch
+    from unciv_train.model import RUNGS, StructuredPolicyValueNet
+    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    token_specs = {"spatial": len(_SPATIAL_FIELD_PLAN), "own_units": 9, "opp_units": 9,
+                   "own_cities": 17, "opp_cities": 17, "civ_tokens": 84}
+    vocab_counts = {"terrain": 6, "resource": 5, "improvement": 4, "religion": 3, "era": 4,
+                    "building": 7, "unit": 8, "nation": 2, "promotion": 3}
+    torch.manual_seed(0)
+    net = StructuredPolicyValueNet(dims, token_specs, vocab_counts, **RUNGS["medium"])  # attention on
+    rng = np.random.default_rng(0)
+    n = 5
+    inp = {"global": torch.tensor(rng.standard_normal((1, 8)).astype(np.float32)),
+           "acting_civ": torch.tensor(rng.standard_normal((1, 6)).astype(np.float32)),
+           "spatial": torch.tensor(rng.integers(0, 4, (1, n, token_specs["spatial"])).astype(np.float32)),
+           "spatial_mask": torch.ones(1, n),
+           "neighbor_index": torch.tensor(rng.integers(0, n + 1, (1, n, 6)).astype(np.int64)),
+           "neighbor_mask": torch.zeros(1, n, 6)}  # all nodes isolated → exercises GNN empty-reduce too
+    for name in ("own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"):
+        inp[name] = torch.tensor(rng.standard_normal((1, 1, token_specs[name])).astype(np.float32))
+        inp[name + "_mask"] = torch.zeros(1, 1)  # EVERY entity set fully masked
+    tech, policy, value = net(inp)
+    (tech.sum() + policy.sum() + value.sum()).backward()
+    bad = [nm for nm, p in net.named_parameters() if p.grad is not None and not torch.isfinite(p.grad).all()]
+    assert not bad, f"non-finite gradients (masked-softmax NaN-grad trap) in: {bad}"
+
+
 @pytest.mark.parametrize("rung", ["small", "medium"])  # GNN-only + attention
 def test_structured_trainer_runs(rung):
     dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)

@@ -18,3 +18,4 @@
 {"step": 11, "phase": 2, "event": "gate_approved", "ts": "2026-06-24T15:45:00Z", "council_rounds": 2, "test": "RED"}
 {"step": 11, "phase": 2, "event": "end", "ts": "2026-06-24T15:45:00Z"}
 {"step": 12, "phase": 3, "event": "start", "ts": "2026-06-24T15:45:00Z"}
+{"event": "consolidation", "round": 1, "mode": "python", "raw_in": 28, "consolidated_out": 28, "ts": "2026-06-24T22:37:06Z"}
