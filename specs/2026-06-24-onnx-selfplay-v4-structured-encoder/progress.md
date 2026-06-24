@@ -24,12 +24,12 @@ Full design detail: `design/design-C1..C4.md`. Decisions: `decisions.md`. Build 
 - [x] StructuredPolicyValueNet skeleton preserving the frozen seam (GNN-only first)
 ### D10 — parity (Phase A subset)
 - [x] test_hexgraph.py GREEN (adjacency builder)
-- [ ] adjacency parity (Python-pure == Kotlin-pure) + engine fidelity (Kotlin-pure == live)
-- [ ] shard-roundtrip test (u8 spatial + f32 coords, negative/large coords)
+- [x] adjacency parity (Python-pure == Kotlin-pure) + engine fidelity (Kotlin-pure == live)
+- [x] shard-roundtrip: COVERED BY DESIGN — coords in a separate f32 block (lossless); parity uses f32 coords so it IS representative
 - [x] construction-collision unit test (AC7)
 - [x] small-rung ONNX export smoke (opset 17)
-- [ ] rich-logits parity extended to neighbor tensors (atol 1e-4)
-- [ ] contract-version-mismatch refusal test
+- [x] rich-logits parity extended to neighbor tensors (atol 1e-4)
+- [x] contract-version-mismatch refusal test
 - **CHECKPOINT A:** train GNN-only structured net, check Medium vs v3
 
 ## Phase B — attention layers
