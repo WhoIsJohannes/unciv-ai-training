@@ -5,6 +5,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import com.unciv.logic.automation.unit.UnitAutomation
 import com.unciv.logic.civilization.Civilization
+import com.unciv.logic.map.TileMap
 import com.unciv.logic.map.mapunit.MapUnit
 import com.unciv.logic.simulation.dataplane.Featurizer
 import com.unciv.logic.simulation.dataplane.Observation
@@ -13,6 +14,7 @@ import com.unciv.logic.simulation.dataplane.SampleConfig
 import com.unciv.logic.simulation.dataplane.SampleSchema
 import com.unciv.logic.simulation.dataplane.Vocab
 import java.nio.FloatBuffer
+import java.nio.LongBuffer
 import kotlin.random.Random
 
 /**
@@ -40,8 +42,10 @@ class OnnxPolicy(
 
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
     private val session: OrtSession
-    /** True when the loaded model is contract v2 (rich multi-tensor input). */
+    /** True when the loaded model uses the multi-tensor input (contract v2 rich OR v3 structured). */
     private val rich: Boolean
+    /** True when the loaded model is contract v3 (structured: rich + hex-GNN neighbor inputs). */
+    private val structured: Boolean
 
     init {
         val f = java.io.File(modelPath)
@@ -56,21 +60,24 @@ class OnnxPolicy(
         val mContract = req(SampleSchema.OnnxContract.META_CONTRACT_VERSION).toInt()
         val mFingerprint = req(SampleSchema.OnnxContract.META_RULESET_FINGERPRINT)
         check(mSchema == expectedSchemaVersion) { "OnnxPolicy: model schema_version=$mSchema != live $expectedSchemaVersion (regenerate)" }
-        rich = mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_RICH
+        structured = mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_STRUCTURED
+        rich = structured || mContract == SampleSchema.OnnxContract.CONTRACT_VERSION_RICH
         check(mContract == SampleSchema.OnnxContract.CONTRACT_VERSION || rich) {
-            "OnnxPolicy: model contract_version=$mContract not in {${SampleSchema.OnnxContract.CONTRACT_VERSION}, ${SampleSchema.OnnxContract.CONTRACT_VERSION_RICH}}"
+            "OnnxPolicy: model contract_version=$mContract not in {1, 2, 3}"
         }
         check(mFingerprint == expectedRulesetFingerprint) { "OnnxPolicy: model ruleset_fingerprint mismatch (regenerate against the live ruleset)" }
-        // PROVENANCE (council): a v2 model must actually expose the full multi-tensor input inventory —
-        // catches a contract_version=2 model whose token set drifted from the contract.
+        // PROVENANCE (council): a multi-tensor model must expose the full input inventory; a v3
+        // structured model ALSO requires the hex-GNN neighbor inputs — a malformed export that drops
+        // them fails LOUD here, not with an opaque runtime missing-input at the first decision.
         if (rich) {
             val want = mutableListOf(SampleSchema.OnnxContract.INPUT_GLOBAL, SampleSchema.OnnxContract.INPUT_ACTING)
             for (n in SampleSchema.OnnxContract.RICH_TOKEN_NAMES) {
                 want += n; want += n + SampleSchema.OnnxContract.MASK_SUFFIX
             }
+            if (structured) want += SampleSchema.OnnxContract.NEIGHBOR_INPUT_NAMES
             val have = session.inputNames
             val missing = want.filter { it !in have }
-            check(missing.isEmpty()) { "OnnxPolicy: rich (v2) model missing expected inputs $missing (model has $have)" }
+            check(missing.isEmpty()) { "OnnxPolicy: model missing expected inputs $missing (model has $have)" }
         }
     }
 
@@ -104,7 +111,7 @@ class OnnxPolicy(
         val cached = memo.get()
         val m = if (cached != null && cached.key == key) cached else run {
             val obs = Featurizer(civ.gameInfo, vocab, config).observe(civ)
-            val (tech, policy) = if (rich) forwardRich(obs)
+            val (tech, policy) = if (rich) forwardRich(obs, if (structured) civ.gameInfo.tileMap else null)
                                  else forward(obs.block("global") + obs.block("acting_civ"))
             Memo(key, tech, policy).also { memo.set(it) }
         }
@@ -124,8 +131,13 @@ class OnnxPolicy(
     /** Rich (contract v2) forward: build the SAME multi-tensor input the trainer pads (per-tile
      *  spatial token set + per-type entity token sets, each with a presence mask), feed onnxruntime,
      *  read the policy logits. EVERY created [OnnxTensor] is closed (no native leak — council R7). */
-    private fun forwardRich(obs: Observation): Pair<FloatArray, FloatArray> {
+    private fun forwardRich(obs: Observation, tileMap: TileMap?): Pair<FloatArray, FloatArray> {
         val inputs = buildRichTensors(env, obs)
+        if (tileMap != null) {  // v3 structured: add the hex-GNN neighbor inputs from the LIVE map
+            val (idx, mask) = buildNeighborTensorsLive(env, tileMap)
+            inputs[SampleSchema.OnnxContract.INPUT_NEIGHBOR_INDEX] = idx
+            inputs[SampleSchema.OnnxContract.INPUT_NEIGHBOR_MASK] = mask
+        }
         try {
             session.run(inputs).use { res ->
                 val tech = row(res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor)
@@ -147,8 +159,39 @@ class OnnxPolicy(
         // Fallback per-token widths if a block is absent from the Observation (a real shard always
         // emits all six, even empty ones — this just avoids a decision-time crash if a future schema
         // change drops one; the empty token set is handled by the masked pool).
-        private val FALLBACK_WIDTH = mapOf("own_units" to 8, "opp_units" to 8,
-                                           "own_cities" to 16, "opp_cities" to 16, "civ_tokens" to 84)
+        private val FALLBACK_WIDTH = mapOf("own_units" to 9, "opp_units" to 9,
+                                           "own_cities" to 17, "opp_cities" to 17, "civ_tokens" to 84)
+
+        /** v3 clock-direction offsets (dirs 12,2,4,6,8,10) — MUST match Python hexgraph.OFFSETS. */
+        private val HEX_OFFSETS = arrayOf(
+            intArrayOf(1, 1), intArrayOf(0, 1), intArrayOf(-1, 0),
+            intArrayOf(-1, -1), intArrayOf(0, -1), intArrayOf(1, 0),
+        )
+
+        /** Build the live hex-GNN adjacency [1,N,6] int64 + [1,N,6] f32 from the real [TileMap] using
+         *  the engine's own world-wrap-correct [TileMap.getIfTileExistsOrNull]. Rows are in
+         *  zeroBasedIndex order (matches the spatial token set); missing neighbor → sentinel index N
+         *  (the model's zero pad row) + mask 0. Caller closes the returned tensors. */
+        fun buildNeighborTensorsLive(env: OrtEnvironment, tileMap: TileMap): Pair<OnnxTensor, OnnxTensor> {
+            val tiles = tileMap.tileList
+            val n = tiles.size
+            val deg = SampleSchema.OnnxContract.HEX_DEGREE
+            val idx = LongArray(n * deg) { n.toLong() }   // sentinel = N
+            val mask = FloatArray(n * deg)
+            for (tile in tiles) {
+                val r = tile.zeroBasedIndex
+                if (r < 0 || r >= n) continue
+                val x = tile.position.x.toInt(); val y = tile.position.y.toInt()
+                for (d in 0 until deg) {
+                    val nb = tileMap.getIfTileExistsOrNull(x + HEX_OFFSETS[d][0], y + HEX_OFFSETS[d][1])
+                    val nr = nb?.zeroBasedIndex ?: -1
+                    if (nr in 0 until n) { idx[r * deg + d] = nr.toLong(); mask[r * deg + d] = 1f }
+                }
+            }
+            val idxT = OnnxTensor.createTensor(env, LongBuffer.wrap(idx), longArrayOf(1, n.toLong(), deg.toLong()))
+            val mskT = OnnxTensor.createTensor(env, FloatBuffer.wrap(mask), longArrayOf(1, n.toLong(), deg.toLong()))
+            return idxT to mskT
+        }
 
         fun buildRichTensors(env: OrtEnvironment, obs: Observation): LinkedHashMap<String, OnnxTensor> {
             val tokens = SampleSchema.OnnxContract.RICH_TOKEN_NAMES.map { name ->
