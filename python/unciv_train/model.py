@@ -148,12 +148,26 @@ UNIT_TYPE_TABLE = 5                # unit_type_cat is 0..4; 0 == real "none" (no
 ROAD_TABLE = 3                     # roadStatus ordinal 0..2 (None/Road/Railroad); no sentinel
 
 RUNGS = {
+    # small stays Phase-A GNN-only (attn_layers=0) — the GNN-only baseline must remain intact.
     "small":  dict(embed_dim=8,  gnn_layers=1, gnn_channels=32, attn_layers=0, attn_heads=2,
                    attn_dim=32,  trunk_w=128),
-    "medium": dict(embed_dim=16, gnn_layers=2, gnn_channels=64, attn_layers=0, attn_heads=4,
+    # medium/large turn on Phase-B attention (D4 self-attn + entity↔node join + D5 cross-attn).
+    "medium": dict(embed_dim=16, gnn_layers=2, gnn_channels=64, attn_layers=2, attn_heads=4,
                    attn_dim=64,  trunk_w=256),
-    "large":  dict(embed_dim=24, gnn_layers=3, gnn_channels=96, attn_layers=0, attn_heads=4,
-                   attn_dim=128, trunk_w=384),
+    "large":  dict(embed_dim=24, gnn_layers=3, gnn_channels=96, attn_layers=3, attn_heads=8,
+                   attn_dim=96,  trunk_w=384),
+}
+
+# D4 entity↔node join (FND-0036): each entity token carries a tile index naming its co-located GNN
+# node. own_units/opp_units → field index 8 (currentTile.zeroBasedIndex), own_cities/opp_cities →
+# field index 12 (centerTile.zeroBasedIndex). civ_tokens have NO tile index → no join. The tile index
+# is a JOIN KEY (used to gather the post-GNN node embedding), NOT a learned scalar feature.
+_ENTITY_TILE_FIELD = {
+    "own_units": 8,
+    "opp_units": 8,
+    "own_cities": 12,
+    "opp_cities": 12,
+    # civ_tokens: absent → no entity↔node join (no tile index).
 }
 
 
@@ -244,14 +258,102 @@ class _EntityEncoder(nn.Module):
         return _masked_mean(self.proj(tokens), mask)
 
 
+# --------------------------------------------------------------------------------------------------
+# Phase B (D4/D5) hand-rolled attention. ONLY Linear Q/K/V + matmul + scale(1/√dk) + masked softmax
+# (masked_fill(-inf) → softmax) + matmul + out-proj, pre-LN, multi-head via reshape. NO
+# nn.MultiheadAttention / F.scaled_dot_product_attention / scatter — every op is opset-17 core.
+# --------------------------------------------------------------------------------------------------
+
+
+def _masked_softmax_attend(scores: torch.Tensor, kv_mask: torch.Tensor,
+                           v: torch.Tensor) -> torch.Tensor:
+    """NaN-safe masked attention readout (FND-0025).
+
+    `scores`: [B,H,Lq,Lk] raw QKᵀ/√dk. `kv_mask`: [B,Lk] (1 keep / 0 pad). `v`: [B,H,Lk,dk].
+    Masks padded keys with −inf then softmax. A row whose keys are ALL masked yields NaN after
+    softmax (−inf − (−inf)); we detect it and force the context to ZEROS (never NaN), mirroring the
+    max-over-empty → 0 guard in masked_pool (model.py:62). Returns context [B,H,Lq,dk]."""
+    m = kv_mask[:, None, None, :]                                   # [B,1,1,Lk] broadcast over H,Lq
+    scores = scores.masked_fill(m == 0, float("-inf"))             # padded keys → −inf
+    w = torch.softmax(scores, dim=-1)                              # all-masked row → NaN here
+    # all-masked detector: a query row has NO live key iff every kv_mask entry is 0.
+    any_key = (kv_mask.sum(dim=-1) > 0)                            # [B] True if ≥1 live key
+    w = torch.where(any_key[:, None, None, None], w, torch.zeros_like(w))  # dead row → 0 weights
+    ctx = torch.matmul(w, v)                                       # [B,H,Lq,dk]; dead row → 0 ctx
+    return ctx
+
+
+class _MHA(nn.Module):
+    """Hand-rolled multi-head attention: Linear Q/K/V → reshape to heads → scaled QKᵀ → masked
+    softmax (NaN-safe) → ·V → merge heads → out-proj. q and kv may differ (cross-attention)."""
+
+    def __init__(self, dim: int, heads: int):
+        super().__init__()
+        if dim % heads != 0:
+            raise ValueError(f"_MHA: attn_dim {dim} not divisible by heads {heads}")
+        self.h = heads
+        self.dk = dim // heads
+        self.scale = self.dk ** -0.5
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.o = nn.Linear(dim, dim)
+
+    def _split(self, x: torch.Tensor) -> torch.Tensor:            # [B,L,dim] → [B,H,L,dk]
+        B, L, _ = x.shape
+        return x.reshape(B, L, self.h, self.dk).transpose(1, 2)
+
+    def forward(self, q_in: torch.Tensor, kv_in: torch.Tensor,
+                kv_mask: torch.Tensor) -> torch.Tensor:
+        q = self._split(self.q(q_in))                             # [B,H,Lq,dk]
+        k = self._split(self.k(kv_in))                            # [B,H,Lk,dk]
+        v = self._split(self.v(kv_in))                            # [B,H,Lk,dk]
+        scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # [B,H,Lq,Lk]
+        ctx = _masked_softmax_attend(scores, kv_mask, v)         # [B,H,Lq,dk]; NaN-safe
+        B, Lq = q_in.shape[0], q_in.shape[1]
+        ctx = ctx.transpose(1, 2).reshape(B, Lq, self.h * self.dk)  # merge heads [B,Lq,dim]
+        return self.o(ctx)
+
+
+class _AttnBlock(nn.Module):
+    """Pre-LN attention residual block: x = x + MHA(LN(x_q), LN(x_kv), mask), then a small FFN
+    residual. For self-attention q_in is kv_in; for cross-attention they differ (separate LN)."""
+
+    def __init__(self, dim: int, heads: int):
+        super().__init__()
+        self.ln_q = nn.LayerNorm(dim)
+        self.ln_kv = nn.LayerNorm(dim)
+        self.mha = _MHA(dim, heads)
+        self.ln_ff = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))
+
+    def forward(self, q_in: torch.Tensor, kv_in: torch.Tensor,
+                kv_mask: torch.Tensor) -> torch.Tensor:
+        # When q and kv are the same tensor (self-attn) both LNs see it; for cross-attn they differ.
+        q_n = self.ln_q(q_in)
+        kv_n = self.ln_kv(kv_in)
+        x = q_in + self.mha(q_n, kv_n, kv_mask)
+        x = x + self.ff(self.ln_ff(x))
+        return x
+
+
 class StructuredPolicyValueNet(nn.Module):
     """v4 structured encoder: categorical embeddings + a hex-aware gather-GNN over the spatial tile
-    graph, with entity sets projected+masked-mean-pooled (Phase A) and a split trunk → {tech, policy}
-    + (training-only) value. FROZEN seam: forward(inputs:dict) → (tech, policy, tanh(value)).
+    graph. FROZEN seam: forward(inputs:dict) → (tech, policy, tanh(value)).
 
-    Phase A is GNN-only: `attn_layers` defaults to 0 (the param exists for the Phase-B ladder but is
-    not consumed yet). The model never sees raw coords — 2D locality comes entirely from the GNN over
-    the externally-built `neighbor_index`/`neighbor_mask` graph tensors.
+    Two paths, switched on `attn_layers`:
+    - **attn_layers == 0 (Phase A, GNN-only):** entity sets are projected + masked-mean-pooled, the
+      GNN nodes are masked-mean-pooled to a board vector, all concatenated with global+acting_civ →
+      split trunk. This is the untouched Phase-A baseline (the `small` rung).
+    - **attn_layers > 0 (Phase B):** D4 per-entity-set self-attention (with the FND-0036 entity↔node
+      join: each entity token is fused with its co-located post-GNN node embedding via its tile
+      index before self-attention) + D5 single-query cross-attention over [GNN nodes ⊕ refined
+      entity tokens] → a fixed context vector that replaces the masked-mean pooling as the trunk
+      input. The `medium`/`large` rungs use this path.
+
+    The model never sees raw coords — 2D locality comes entirely from the GNN over the
+    externally-built `neighbor_index`/`neighbor_mask` graph tensors. The tile index in each entity
+    token is a JOIN KEY into the node axis, not a learned feature.
     """
 
     INPUT_GLOBAL = "global"
@@ -271,8 +373,10 @@ class StructuredPolicyValueNet(nn.Module):
                 f"StructuredPolicyValueNet: spatial width {token_specs.get('spatial')} != field-plan "
                 f"length {len(_SPATIAL_FIELD_PLAN)} (Phase-A targets the 13-channel v3 spatial block)"
             )
-        self.attn_layers = attn_layers          # Phase-A: param exists, not consumed (GNN-only)
+        self.attn_layers = attn_layers
+        self.attn_dim = attn_dim
         self.gnn_channels = gnn_channels
+        self.use_attn = attn_layers > 0
 
         # D2 embeddings + per-node input projection -> gnn_channels.
         self.spatial_embed = _SpatialEmbed(vocab_counts, embed_dim, max_civ_tokens)
@@ -281,13 +385,44 @@ class StructuredPolicyValueNet(nn.Module):
         # D3 GNN stack.
         self.gnn = nn.ModuleList(_GatherGNNLayer(gnn_channels) for _ in range(gnn_layers))
 
-        # Phase-A entity encoders (project + masked-mean pool).
-        self.entity_enc = nn.ModuleDict({
-            name: _EntityEncoder(int(token_specs[name]), gnn_channels) for name in self.ENTITY_NAMES
-        })
+        if not self.use_attn:
+            # ---- Phase A: project + masked-mean pool entity sets; mean-pool the board. ----
+            self.entity_enc = nn.ModuleDict({
+                name: _EntityEncoder(int(token_specs[name]), gnn_channels)
+                for name in self.ENTITY_NAMES
+            })
+            agg_w = gnn_channels + sum(e.out_w for e in self.entity_enc.values())
+        else:
+            # ---- Phase B: self-attention + entity↔node join + single-query cross-attention. ----
+            # Per-entity-set token projection raw_width -> attn_dim.
+            self.entity_in = nn.ModuleDict({
+                name: nn.Linear(int(token_specs[name]), attn_dim) for name in self.ENTITY_NAMES
+            })
+            # Static 0/1 feature masks that zero each entity's tile-index column (join key, not a
+            # feature). Registered as buffers (move with .to(device), constant-folded in ONNX).
+            self._entity_feat_mask = {}
+            for name, fld in _ENTITY_TILE_FIELD.items():
+                mask = torch.ones(1, 1, int(token_specs[name]))
+                mask[..., fld] = 0.0
+                buf = f"_featmask_{name}"
+                self.register_buffer(buf, mask)
+                self._entity_feat_mask[name] = getattr(self, buf)
+            # FND-0036 join: project the gathered post-GNN node embedding (C) -> attn_dim, then ADD
+            # it into the entity token. Reused as the cross-attn node-key projection (same node space).
+            self.node_to_attn = nn.Linear(gnn_channels, attn_dim)
+            # D4 per-entity-set self-attention stacks (only entity sets WITH a join get the node fuse;
+            # civ_tokens still get self-attention, just no join).
+            self.self_attn = nn.ModuleDict({
+                name: nn.ModuleList(_AttnBlock(attn_dim, attn_heads) for _ in range(attn_layers))
+                for name in self.ENTITY_NAMES
+            })
+            # D5 single-query cross-attention: query from [global ⊕ acting] -> attn_dim.
+            self.q_proj = nn.Linear(dims.global_w + dims.acting_w, attn_dim)
+            self.cross = nn.ModuleList(_AttnBlock(attn_dim, attn_heads) for _ in range(attn_layers))
+            agg_w = attn_dim                      # the cross-attn context vector replaces pooling
 
-        # Aggregate -> split trunk (D6). board (gnn pooled) ⊕ entities ⊕ global ⊕ acting_civ.
-        agg_w = gnn_channels + sum(e.out_w for e in self.entity_enc.values())
+        # Aggregate -> split trunk (D6). (Phase A) board ⊕ entities OR (Phase B) cross-ctx, then
+        # ⊕ global ⊕ acting_civ. Unchanged heads.
         trunk_in = agg_w + dims.global_w + dims.acting_w
         self.shared = nn.Sequential(nn.Linear(trunk_in, trunk_w), nn.ReLU(),
                                     nn.Linear(trunk_w, trunk_w), nn.ReLU())
@@ -297,6 +432,20 @@ class StructuredPolicyValueNet(nn.Module):
         self.policy_head = nn.Linear(trunk_w, dims.policy_w)
         self.value_head = nn.Linear(trunk_w, 1)
         _small_init_value_head(self.value_head)
+
+    def _gather_node_by_tile(self, h_pad: torch.Tensor, tile_idx: torch.Tensor,
+                             N: int) -> torch.Tensor:
+        """Gather each entity's co-located GNN node embedding (FND-0036 entity↔node join).
+
+        `h_pad`: [B,N+1,C] post-GNN node features with a ZERO pad row at index N (so an OOB/clamped
+        index gathers zeros). `tile_idx`: [B,M] float tile indices (currentTile/centerTile
+        zeroBasedIndex). Returns [B,M,C]. Indices are clamped to [0, N] — anything outside the real
+        node range (including the −1/absent sentinel after clamp) lands on the zero pad row."""
+        idx = tile_idx.clamp(0, N).long()                            # [B,M] in [0,N] (pad row safe)
+        B, M = idx.shape
+        C = h_pad.shape[2]
+        gathered = torch.gather(h_pad, 1, idx.unsqueeze(-1).expand(B, M, C))  # [B,M,C]
+        return gathered
 
     def forward(self, inputs: dict[str, torch.Tensor]):
         g = inputs[self.INPUT_GLOBAL]
@@ -310,14 +459,62 @@ class StructuredPolicyValueNet(nn.Module):
         h = self.spatial_in(self.spatial_embed(spatial))     # [B,N,C]
         for layer in self.gnn:
             h = layer(h, nbr_idx, nbr_mask)                  # [B,N,C]
-        board = _masked_mean(h, spatial_mask)                # [B,C] board vector
 
-        parts = [board]
+        if not self.use_attn:
+            # ---- Phase A path (GNN-only) — unchanged. ----
+            board = _masked_mean(h, spatial_mask)            # [B,C] board vector
+            parts = [board]
+            for name in self.ENTITY_NAMES:
+                parts.append(self.entity_enc[name](inputs[name], inputs[name + "_mask"]))
+            parts += [g, a]
+            body = self.shared(torch.cat(parts, dim=1))
+            ph = self.policy_body(body)
+            vh = self.value_body(body)
+            return self.tech_head(ph), self.policy_head(ph), torch.tanh(self.value_head(vh))
+
+        # ---- Phase B path (attention). ----
+        B, N, C = h.shape
+        # Zero pad row at index N so a clamped/absent tile index gathers zeros (mirrors the GNN pad).
+        h_pad = torch.cat([h, torch.zeros(B, 1, C, dtype=h.dtype, device=h.device)], dim=1)  # [B,N+1,C]
+        gnn_kv = self.node_to_attn(h)                        # [B,N,attn_dim] cross-attn node keys
+
+        # D4 per-entity-set self-attention (with the FND-0036 entity↔node join where a tile index
+        # exists). Refined tokens + masks are kept for the cross-attention union.
+        ent_tok, ent_mask = [], []
         for name in self.ENTITY_NAMES:
-            parts.append(self.entity_enc[name](inputs[name], inputs[name + "_mask"]))
-        parts += [g, a]
+            tok = inputs[name]                               # [B,M,raw_width]
+            m = inputs[name + "_mask"]                       # [B,M]
+            tile_field = _ENTITY_TILE_FIELD.get(name)
+            feat = tok
+            if tile_field is not None:
+                # The tile index is a JOIN KEY only — NOT a learned scalar. Zero its column out of the
+                # projected token (via a static 0/1 column mask — Mul only, no scatter) so the model
+                # can't read it as a feature; its only use is the gather below.
+                feat = tok * self._entity_feat_mask[name].to(tok.dtype)
+            t = self.entity_in[name](feat)                   # [B,M,attn_dim]
+            if tile_field is not None:
+                # JOIN (FND-0036): gather the co-located post-GNN node embedding (by the tile index)
+                # and fuse (add) it into the entity token BEFORE self-attention.
+                node = self._gather_node_by_tile(h_pad, tok[..., tile_field], N)  # [B,M,C]
+                t = t + self.node_to_attn(node)              # [B,M,attn_dim] fused
+            for blk in self.self_attn[name]:
+                t = blk(t, t, m)                             # self-attn: q=kv=t, presence mask
+            # zero out padded tokens so they contribute nothing as cross-attn keys/values.
+            t = t * m.unsqueeze(-1)
+            ent_tok.append(t)
+            ent_mask.append(m)
 
-        body = self.shared(torch.cat(parts, dim=1))
+        # D5 single-query cross-attention over [GNN nodes ⊕ refined entity tokens].
+        keys = torch.cat([gnn_kv] + ent_tok, dim=1)          # [B, N+ΣM, attn_dim]
+        # GNN nodes always present per spatial_mask; union with entity masks. The union always has
+        # ≥1 live node (board non-empty) so the cross-attn key set is never fully masked.
+        kmask = torch.cat([spatial_mask] + ent_mask, dim=1)  # [B, N+ΣM]
+        q = self.q_proj(torch.cat([g, a], dim=1)).unsqueeze(1)  # [B,1,attn_dim] single query
+        for blk in self.cross:
+            q = blk(q, keys, kmask)                          # [B,1,attn_dim]
+        cross_ctx = q[:, 0, :]                               # [B,attn_dim] fixed context vector
+
+        body = self.shared(torch.cat([cross_ctx, g, a], dim=1))
         ph = self.policy_body(body)
         vh = self.value_body(body)
         return self.tech_head(ph), self.policy_head(ph), torch.tanh(self.value_head(vh))

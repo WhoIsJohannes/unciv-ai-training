@@ -21,10 +21,6 @@ import sys
 import time
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-
 from . import contract, dataset as ds, export_onnx as ex, train as tr  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
@@ -91,6 +87,16 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps)
         return net, stats, ("rich", token_specs)
+    if variant == "structured":
+        from .model import RUNGS
+        token_specs = contract.token_specs_from_schema(schema_path)
+        vocab_counts = contract.vocab_counts_from_schema(schema_path)
+        rung = RUNGS[args.rung]
+        net, stats = tr.train_actor_critic_structured(
+            trajectories_or_steps, dims, token_specs, vocab_counts, rung, epochs=args.epochs,
+            lr=args.lr, seed=seed, gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
+            entropy_coef=args.entropy_coef, clip_eps=args.clip_eps)
+        return net, stats, ("structured", token_specs)
     raise ValueError(f"unknown variant {variant!r}")
 
 
@@ -111,6 +117,13 @@ CURVE_COLS = ["round", "games", "winrate", "pval", "n_steps", "loss", "value_los
 
 
 def plot(rows: list[dict], png: Path, variant: str, map_size: str) -> None:
+    try:  # best-effort: a curve PNG is nice-to-have, not required for the run
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[plot] matplotlib not installed — skipping curve PNG (run unaffected)")
+        return
     rounds = [r["round"] for r in rows]
     wr = [r["winrate"] * 100 for r in rows]
     plt.figure(figsize=(7, 4))
@@ -139,7 +152,9 @@ def _read_existing_rows(curve_csv: Path) -> list[dict]:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Self-play round loop → learning curve")
-    ap.add_argument("--variant", choices=["v1-reinforce", "blind-critic", "rich-critic"],
+    ap.add_argument("--rung", choices=["small", "medium", "large"], default="small",
+                    help="v4 structured-encoder capacity rung (D7 ladder)")
+    ap.add_argument("--variant", choices=["v1-reinforce", "blind-critic", "rich-critic", "structured", "rich-v2"],
                     default="blind-critic", help="algorithm + representation (attributable axis)")
     ap.add_argument("--map-size", default="Tiny", help="Tiny (comparability) or Medium (ceiling test)")
     ap.add_argument("--rounds", type=int, default=12)
@@ -163,6 +178,8 @@ def main(argv=None) -> int:
     ap.add_argument("--resume", action="store_true", help="skip rounds already in curve.csv")
     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
     args = ap.parse_args(argv)
+    if args.variant == "rich-v2":   # alias for the v4 structured encoder
+        args.variant = "structured"
 
     import torch  # local import: keep CLI help fast
 
@@ -214,15 +231,20 @@ def main(argv=None) -> int:
         model_path = out / f"policy_round_{r}.onnx"
         if mode == "blind":
             ex.export(net, dims, model_path, schema_version=ver, ruleset_fingerprint=fp)
-        else:  # ("rich", token_specs)
-            _, token_specs = mode
+        else:  # ("rich"|"structured", token_specs)
+            kind, token_specs = mode
             from .features import build_rich_batch
             sample = None
             if data:
                 sample = {k: v[:1] for k, v in build_rich_batch(data[:1], dims, token_specs).items()}
                 sample = {k: (v.numpy() if hasattr(v, "numpy") else v) for k, v in sample.items()}
-            ex.export_rich(net, dims, token_specs, model_path, schema_version=ver,
-                           ruleset_fingerprint=fp, sample_inputs=sample)
+            if kind == "structured":   # v3: emit the int64 neighbor inputs + stamp contract_version=3
+                ex.export_rich(net, dims, token_specs, model_path, schema_version=ver,
+                               ruleset_fingerprint=fp, sample_inputs=sample, neighbors=True,
+                               contract_version=contract.CONTRACT_VERSION_STRUCTURED)
+            else:
+                ex.export_rich(net, dims, token_specs, model_path, schema_version=ver,
+                               ruleset_fingerprint=fp, sample_inputs=sample)
 
         ev = evaluate(model_path, args.eval_games, args.turn_cap, args.threads, args.eval_seed,
                       args.gradle_timeout, args.map_size)
@@ -238,6 +260,9 @@ def main(argv=None) -> int:
                                     for c in CURVE_COLS])
         with open(metrics_jsonl, "a") as f:
             f.write(json.dumps({**row, "variant": args.variant, "map_size": args.map_size,
+                                "rung": args.rung,
+                                "turns_per_sec": ev.get("turns_per_sec"),
+                                "ms_per_decision": ev.get("ms_per_decision"),
                                 "mean_adv": stats.get("mean_adv", 0.0)}) + "\n")
         plot(rows, curve_png, args.variant, args.map_size)
         print(f"[{args.variant} r{r}] gen={n_games} steps={row['n_steps']} "

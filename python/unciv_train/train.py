@@ -273,3 +273,45 @@ def train_actor_critic_rich(
         gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
         clip_eps=clip_eps, norm_adv=norm_adv,
     )
+
+
+def train_actor_critic_structured(
+    trajectories: list[TrainTrajectory],
+    dims: Dims,
+    token_specs: dict[str, int],
+    vocab_counts: dict,
+    rung: dict,
+    *,
+    epochs: int = 8,
+    lr: float = 1e-3,
+    seed: int = 0,
+    gamma: float = 0.99,
+    lam: float = 0.95,
+    value_coef: float = 0.5,
+    entropy_coef: float = 0.01,
+    clip_eps: float | None = None,
+    norm_adv: bool = True,
+) -> tuple[object, dict]:
+    """v4 STRUCTURED variant: same encoder-AGNOSTIC core (_optimize_actor_critic) + same rich
+    batch/stacking as train_actor_critic_rich — ONLY the nn.Module is swapped for
+    StructuredPolicyValueNet (embeddings + hex-GNN + attention, sized by `rung`). The trainer core +
+    train_actor_critic_rich stay UNTOUCHED (the FROZEN seam)."""
+    from .features import build_rich_batch
+    from .model import StructuredPolicyValueNet
+
+    torch.manual_seed(seed)
+    net = StructuredPolicyValueNet(dims, token_specs, vocab_counts, **rung)
+    if not trajectories:
+        return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}
+    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos = _stack_traj(trajectories)
+    inputs = build_rich_batch(trajectories, dims, token_specs)
+
+    def forward_fn():
+        return net(inputs)
+
+    return _optimize_actor_critic(
+        net, forward_fn, a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
+        rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
+        gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
+        clip_eps=clip_eps, norm_adv=norm_adv,
+    )
