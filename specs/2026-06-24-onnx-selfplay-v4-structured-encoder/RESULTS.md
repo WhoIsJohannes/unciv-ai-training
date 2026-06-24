@@ -38,10 +38,20 @@ was never the bottleneck; the training regime is. The accepted confound (v4 left
 untouched) is the ceiling. **Recommended next unlock: weight carryover / continual training across
 rounds** — then re-test whether the GNN (and the medium/large attention rungs) can clear blind.
 
+## Tiny non-regression (AC1 second clause) — rung-dependent
+The **small/GNN-only** rung on Tiny: per-round 15,56,50,51,65,30,46,33,35,44,54,60 → last-4 mean
+**48.3%** vs v3 rich-critic's **57.0%** (≈−8.7pp, ≈z−2.5: a significant shortfall), `diverged=0`,
+last round 59.8%. This is the *expected* shape of the demand-driven trade-off: the small rung is
+sized for **Medium** (scarce per-tile data, where the pool collapsed); **Tiny is data-rich (331 tiles)
+and the full pool already excelled there**, so a GNN-only rung is *under*-capacity for Tiny. The
+demand-driven rule (D7) responds to "data-rich + not matching" by **scaling up** — so the spec-faithful
+Tiny non-regression check uses the medium (attention) rung, which is OOM-safe on Tiny's 331 tiles
+(unlike Medium's 1261). **Medium-rung Tiny re-check is running** (also AC2's sweep). [pending]
+
 ## Acceptance criteria
 | AC | Verdict |
 |---|---|
-| **AC1** structured beats v3 rich-pool on Medium p<0.05 | ✅ **23.0% vs 14.7%, z=+2.20, p=0.014**. Tiny non-regression: ⏳ running |
+| **AC1** structured beats v3 rich-pool on Medium p<0.05 | ✅ **23.0% vs 14.7%, z=+2.20, p=0.014**. Tiny: small/GNN rung **regressed** (48.3% vs v3 57%, last-4) — under-capacity for data-rich Tiny; **medium rung (attention) re-check running** (demand-driven scale-up; OOM-safe on Tiny's 331 tiles) |
 | AC2 capacity sweep per rung + throughput; rung by demand-driven rule | 🟡 small rung (the rule's START) reported with win-rate + throughput; it already PASSES AC1. Medium/large sweep is the remaining secondary run (rule: scale up only if it improves AND fits the budget — medium-rung OOM-safety on the gen-16 dense batch is the gate) |
 | AC3 parity over the richer multi-tensor input (atol 1e-4, logits) | ✅ v3 JVM↔Python logits parity + adjacency-fidelity (hexgraph == live engine) green |
 | AC4 throughput ≥70% of heuristic baseline | ✅ `bench-onnx` verdict=PASS; eval ms/decision ≈ 24 ms, ≈ 128 turns/s |
