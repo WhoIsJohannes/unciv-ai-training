@@ -3,6 +3,7 @@ package com.unciv.app.desktop
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
+import com.unciv.logic.automation.Timers
 import com.unciv.logic.automation.unit.UnitAutomation
 import com.unciv.logic.civilization.Civilization
 import com.unciv.logic.map.TileMap
@@ -139,10 +140,12 @@ class OnnxPolicy(
             inputs[SampleSchema.OnnxContract.INPUT_NEIGHBOR_MASK] = mask
         }
         try {
-            session.run(inputs).use { res ->
-                val tech = row(res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor)
-                val policy = row(res.get(SampleSchema.OnnxContract.OUTPUT_POLICY).get() as OnnxTensor)
-                return tech to policy
+            return Timers.timeThis("onnxForward") {   // D8: ms/decision span (Log-gated, zero-overhead off)
+                session.run(inputs).use { res ->
+                    val tech = row(res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor)
+                    val policy = row(res.get(SampleSchema.OnnxContract.OUTPUT_POLICY).get() as OnnxTensor)
+                    tech to policy
+                }
             }
         } finally {
             for (t in inputs.values) try { t.close() } catch (_: Exception) {}

@@ -74,6 +74,7 @@ object SelfPlayRunner {
             "parity-dump-rich" -> { bootstrap(); parityDumpRich(args) }
             "parity-run-rich" -> parityRunRich(args)   // ORT only — multi-tensor v2/v3 contract
             "adjacency-dump" -> { bootstrap(); adjacencyDump(args) }   // v3 FND-0036 fidelity harness
+            "bench-onnx" -> { bootstrap(); benchOnnx(args) }            // D8 throughput guard (70% gate)
             "trace" -> { bootstrap(); trace(args) }
             else -> error("unknown mode '$mode'")
         }
@@ -203,17 +204,24 @@ object SelfPlayRunner {
             statTurns = listOf(), dataPlane = DataPlaneContext(config, vocab, policy, fingerprint),
             scoreLeaderOnTimeout = true, seedBase = seed,
         )
+        val t0 = System.nanoTime()
         sim.start()
+        val wallS = (System.nanoTime() - t0) / 1e9
         val games = sim.steps.size
+        val turns = sim.steps.sumOf { it.turns }
         val wins = sim.steps.count { it.winner == LEARNER }
         val winrate = if (games > 0) wins.toDouble() / games else 0.0
         val pval = if (games > 0) SimStats.binomialTest(wins.toDouble(), games.toDouble(), 0.5, "greater") else 1.0
         val decisions = onnx.decisionCount()
         onnx.close()
+        // D8 throughput fields: turns/s (data-gen rate) + ms/decision (ONNX forward cost proxy).
+        val turnsPerSec = if (wallS > 0) turns / wallS else 0.0
+        val msPerDecision = if (decisions > 0) wallS * 1000.0 / decisions else -1.0
         println(
             "EVAL_RESULT {" +
                 "\"games\":$games,\"wins\":$wins,\"winrate\":$winrate,\"pval\":$pval," +
-                "\"learner\":\"$LEARNER\",\"seed\":$seed,\"onnx_decisions\":$decisions}"
+                "\"learner\":\"$LEARNER\",\"seed\":$seed,\"onnx_decisions\":$decisions," +
+                "\"turns\":$turns,\"wall_clock_s\":$wallS,\"turns_per_sec\":$turnsPerSec,\"ms_per_decision\":$msPerDecision}"
         )
     }
 
@@ -453,5 +461,52 @@ object SelfPlayRunner {
         sb.append("\"live\":[").append((0 until n).joinToString(",") { live[it].joinToString(",", "[", "]") }).append("]}")
         File(out).writeText(sb.toString())
         println("ADJACENCY_DUMP nTiles=$n worldWrap=${mp.worldWrap} -> $out")
+    }
+
+    /** D8 throughput guard: measure data-gen turns/s on the SAME 2-civ training config (correct
+     *  ruleset fingerprint — NOT SimBenchmark's 6-major BenchCiv config which would fail the OnnxPolicy
+     *  gate) for a heuristic baseline (RandomPolicy) vs the ONNX rung, and emit a PASS/REJECT verdict
+     *  (REJECT if onnx turns/s < 70% of baseline). The ladder parses the "BENCH| RUNG ... verdict=" line. */
+    @ExperimentalTime
+    private fun benchOnnx(args: Array<String>) {
+        val modelArg = args.getOrNull(1) ?: error("bench-onnx: model path required")
+        val turns = args.getOrNull(2)?.toIntOrNull() ?: 200
+        val mapSizeName = args.getOrNull(3) ?: "Medium"
+        val threads = args.getOrNull(4)?.toIntOrNull() ?: 1
+        val seed = args.getOrNull(5)?.toLongOrNull() ?: 777_000L
+        val ruleset = setupRuleset()
+        val fingerprint = RulesetFingerprint.compute(ruleset)
+        val vocab = Vocab(ruleset)
+        val config = SampleConfig(enabled = false, deterministicShuffle = true, caps = SampleCaps.DEFAULT)
+        val base = buildBaseGameInfo(ruleset, mapSizeName)
+
+        fun runWith(policy: PolicyProvider): Triple<Double, Int, Double> {  // (turns/s, turns, wallS)
+            val sim = Simulation(
+                base, simulationsPerThread = 1, threadsNumber = threads, maxTurns = turns,
+                statTurns = listOf(), dataPlane = DataPlaneContext(config, vocab, policy, fingerprint),
+                scoreLeaderOnTimeout = true, seedBase = seed,
+            )
+            val t0 = System.nanoTime(); sim.start(); val s = (System.nanoTime() - t0) / 1e9
+            val tt = sim.steps.sumOf { it.turns }
+            return Triple(if (s > 0) tt / s else 0.0, tt, s)
+        }
+
+        // Heuristic baseline (no ONNX) — both sides RandomPolicy on the same config.
+        val (baselineTps, _, _) = runWith(
+            RoutingPolicy(LEARNER, RandomPolicy(DataPlaneHooks.defaultRngFor()), RandomPolicy(DataPlaneHooks.defaultRngFor())))
+        // ONNX rung — learner routed to the net.
+        val onnx = OnnxPolicy(modelArg, vocab, config, DataPlaneHooks.defaultRngFor(), eval = true, SampleSchema.VERSION, fingerprint)
+        try {
+            val (onnxTps, _, onnxWallS) = runWith(RoutingPolicy(LEARNER, onnx, RandomPolicy(DataPlaneHooks.defaultRngFor())))
+            val decisions = onnx.decisionCount()
+            val msPerDecision = if (decisions > 0) onnxWallS * 1000.0 / decisions else -1.0
+            val ratio = if (baselineTps > 0) onnxTps / baselineTps else 0.0
+            val verdict = if (ratio >= 0.70) "PASS" else "REJECT"
+            println("BENCH| RUNG model=$modelArg map=$mapSizeName baseline_tps=${"%.2f".format(baselineTps)} " +
+                "onnx_tps=${"%.2f".format(onnxTps)} ratio=${"%.3f".format(ratio)} " +
+                "ms_per_decision=${"%.3f".format(msPerDecision)} onnx_decisions=$decisions verdict=$verdict")
+        } finally {
+            onnx.close()   // closes the OrtSession (no native leak across rungs — FND-0048)
+        }
     }
 }
