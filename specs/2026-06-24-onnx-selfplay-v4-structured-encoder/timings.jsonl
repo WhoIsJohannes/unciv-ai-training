@@ -4,3 +4,17 @@
 {"step": 1, "phase": 1, "event": "end", "ts": "2026-06-24T14:15:00Z"}
 {"step": 2, "phase": 1, "event": "start", "ts": "2026-06-24T14:15:00Z"}
 {"step": 2, "phase": 1, "event": "end", "ts": "2026-06-24T14:25:00Z"}
+{"step": 4, "phase": 2, "event": "start", "ts": "2026-06-24T14:30:00Z"}
+{"step": 5, "phase": 2, "event": "start", "ts": "2026-06-24T14:30:00Z"}
+{"step": 7, "phase": 2, "event": "start", "ts": "2026-06-24T14:30:00Z"}
+{"step": 4, "phase": 2, "event": "end", "ts": "2026-06-24T14:45:00Z"}
+{"event": "consolidation", "round": 1, "mode": "python", "raw_in": 37, "consolidated_out": 37, "ts": "2026-06-24T12:42:14Z"}
+{"step": 5, "phase": 2, "event": "end", "ts": "2026-06-24T14:50:00Z", "findings": 37, "merge_mode": "python"}
+{"step": 7, "phase": 2, "event": "end", "ts": "2026-06-24T15:05:00Z"}
+{"step": 6, "phase": 2, "event": "skip", "ts": "2026-06-24T15:05:00Z", "reason": "confident; shard-dtype resolved; all council criticals Claude-resolvable"}
+{"step": 8, "phase": 2, "event": "start", "ts": "2026-06-24T15:05:00Z"}
+{"event": "consolidation", "round": 1, "mode": "python", "raw_in": 37, "consolidated_out": 37, "ts": "2026-06-24T13:19:48Z"}
+{"event": "consolidation", "round": 2, "mode": "python", "raw_in": 37, "consolidated_out": 74, "ts": "2026-06-24T13:27:04Z"}
+{"step": 11, "phase": 2, "event": "gate_approved", "ts": "2026-06-24T15:45:00Z", "council_rounds": 2, "test": "RED"}
+{"step": 11, "phase": 2, "event": "end", "ts": "2026-06-24T15:45:00Z"}
+{"step": 12, "phase": 3, "event": "start", "ts": "2026-06-24T15:45:00Z"}

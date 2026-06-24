@@ -1,0 +1,1472 @@
+[
+  {
+    "title": "D7 capacity ladder is orchestration bloat for a first v4",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder + demand-driven scaling",
+    "description": "The automatic rung ladder adds trend detection, train/eval-gap heuristics, subprocess OOM interpretation, benchmark parsing, and stop rules before the team has one working structured encoder. This is a lot of control-plane code for a model experiment whose core risk is still export/correctness.",
+    "rationale": "This is classic YAGNI: build the smallest thing that can answer AC1, not an auto-tuner. Future maintainers will inherit brittle run-loop logic that is harder to trust than simply running `small`, then `medium`, then stopping manually based on recorded metrics.",
+    "suggested_addition": "Simplify D7 for v4: implement fixed `--rung small|medium|large` constructor presets and make the experiment script run only the preselected rung(s). Record eval trend, value loss, OOM, and benchmark verdict as metrics, but do not use them to drive automatic scale-up/stop decisions in this feature. Defer demand-driven ladder automation until at least two manual structured runs prove the signals are stable.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "START small; SCALE UP only when BOTH eval win-rate rising over last K rounds AND train/eval gap small; STOP when a rung doesn't beat the previous, violates D8, or OOMs",
+      "Train/eval-gap signal: calibrated value_loss-trend proxy ... optionally an added train-batch argmax pass. Record signals/rung."
+    ]
+  },
+  {
+    "title": "Entity self-attention changes more than the stated problem",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "D4 \u2014 Self-attention over entity sets",
+    "description": "The brief says the failure is spatial pooling discarding 2D locality, but D4 also replaces the entity-set encoder with hand-rolled self-attention. That is another nontrivial encoder change, another ONNX/masking surface, and another confound if Medium improves or regresses.",
+    "rationale": "If the hypothesis is spatial locality, keep entity handling boring. Adding attention everywhere makes the PR harder to review and makes experiment results harder to interpret.",
+    "suggested_addition": "For the first v4 implementation, keep the existing entity token MLP + `masked_pool` path for `own_units`, `opp_units`, `own_cities`, `opp_cities`, and `civ_tokens`. Limit the new structured work to categorical spatial embeddings, hex GNN, and single-query cross-attention over board/entity summaries. Add entity self-attention only in a follow-up if the spatial-only structured encoder passes export/parity and leaves a measured need.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "its spatial encoder is a masked mean+max pool \u2014 permutation-invariant, zero positional signal",
+      "D4 \u2014 Self-attention over entity sets ... Per entity set. O(M\u00b2), M small."
+    ]
+  },
+  {
+    "title": "D6 trunk split is an unrelated architecture change",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "D6 \u2014 Trunk split",
+    "description": "Splitting policy and value bodies is not tied to the spatial-locality diagnosis, and it changes the training dynamics while the brief explicitly wants the training core frozen. It also weakens the headline comparison because v4 is no longer just replacing the encoder.",
+    "rationale": "This is an abstraction/architecture tax without evidence. The existing shared trunk is simple and already matches the frozen seam; keep it until there is a demonstrated policy/value interference problem.",
+    "suggested_addition": "Keep the v3 shared trunk shape for v4 unless a separate acceptance criterion requires policy/value decoupling. `StructuredPolicyValueNet` should produce the new encoder context, concatenate with `global` and `acting_civ`, feed the existing-style shared MLP, and attach the same tech/policy/value heads with `_small_init_value_head`. Move separate policy/value bodies to an explicit follow-up ablation.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "The frozen training core (`_optimize_actor_critic`/`compute_gae`/terminal-reward+critic) is untouched \u2014 only the `nn.Module` is swapped.",
+      "Shared body `[cross_ctx \u2295 global \u2295 acting_civ] \u2192 MLP(trunk_w)`; SEPARATE `policy_body\u2192{tech_head,policy_head}` and `value_body\u2192value_head`"
+    ]
+  },
+  {
+    "title": "Embedding every categorical field at once is too broad",
+    "severity": "minor",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "D2 \u2014 Embeddings",
+    "description": "D2 converts a long list of categorical fields across spatial, city, unit, and civ tokens into learned embeddings in one pass. Some of those are central to the spatial problem, but others are incidental and increase metadata/schema/test burden immediately.",
+    "rationale": "Learned embeddings are reasonable, but doing every possible categorical table now is future-proofing disguised as model design. Start with the fields that remove obvious ordinal lies in the spatial encoder; leave the rest as scalars until the first structured model works.",
+    "suggested_addition": "Scope D2 to a minimum embedding set for v4: spatial terrain/resource/improvement/owner/unit-type fields plus any construction field required by the D1.4 collision fix. Keep low-cardinality or non-spatial fields such as road, era, and simple booleans as numeric scalars for this iteration unless there is a measured reason to embed them. Document the deferred tables as follow-up ablations, not part of the base contract.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "nn.Embedding tables, `num_embeddings = count+1` ... Shared TERRAINS table ... resource; improvement; owner_slot & unit_owner_slot ... unit_type_cat ... road ... city `majority_religion`, `current_construction` ... civ `era`.",
+      "Numeric fields stay scalars, concatenated pre-projection."
+    ]
+  },
+  {
+    "title": "Dual neighbor-index builders are an unacknowledged correctness coupling",
+    "severity": "critical",
+    "primary_lens": "architecture",
+    "target_file": "brief.md",
+    "target_section": "The v3 contract / D3 / D9",
+    "description": "The adjacency graph that drives all spatial locality is built by TWO independent implementations: a pure Python `build_neighbor_graph` (from spatial_coords) at train time, and a JVM `forwardRich` builder (from live TileMap) at inference. The model's behavior is only correct if these two produce bit-identical neighbor_index/neighbor_mask, yet they consume different inputs (stored f32 coords vs live tile objects) via different code paths.",
+    "rationale": "This is a hidden capability dependency: the entire encoder silently assumes train-adjacency == inference-adjacency, but no single source of truth enforces it \u2014 the parity test chains transitively (Python-pure==Kotlin-pure==live) rather than testing the two ACTUAL production builders against each other. A divergence corrupts the graph silently and degrades inference without any signal.",
+    "suggested_addition": "Add an explicit invariant to the contract section: 'neighbor_index built at train (Python, from spatial_coords) and at inference (JVM, from live TileMap) MUST be byte-identical for the same board.' Add a parity case that feeds the SAME serialized board through both production builders (not just the pure mirrors) and asserts equality, including world-wrap and ragged-edge tiles. Document why the transitive chain (D10 tests 2+3) is insufficient to cover the live-engine inference path directly.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Python train builds neighbor tensors from `spatial_coords` (pure function); JVM **inference builds from the live TileMap in `forwardRich`**",
+      "tests chain Python-pure == Kotlin-pure (adjacency parity) and Kotlin-pure == live-engine (fidelity) so inference (live engine) is transitively covered."
+    ]
+  },
+  {
+    "title": "Capacity ladder STOP/SCALE signals depend on a proxy that may be structurally unmeasurable",
+    "severity": "major",
+    "primary_lens": "architecture",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder + demand-driven scaling",
+    "description": "The ladder's SCALE-UP condition requires 'train/eval gap small,' but decisions.md admits no held-out train win-rate exists, so the signal degrades to a 'calibrated value_loss-trend proxy' that the brief itself flags as tiny/unreliable because the value head is small-init. The decision logic (a core control-flow abstraction) rests on a signal the design concedes may not carry information.",
+    "rationale": "A control loop whose primary input is a documented 'soft signal' that 'is tiny early' is an abstraction that hasn't earned its complexity \u2014 if the proxy is noise, SCALE-UP becomes effectively arbitrary, and the whole demand-driven ladder collapses to 'scale until OOM or no-improve.' That's a far simpler design that should be chosen deliberately, not arrived at by accident.",
+    "suggested_addition": "State the fallback decision rule explicitly: if the value_loss-trend proxy is uninformative (within noise band X over K rounds), the ladder SHALL fall back to 'scale up only on eval-win-rate improvement, stop on first non-improvement' \u2014 and drop the train/eval-gap gate rather than acting on noise. Pre-register what 'gap small' means numerically before the run, so the AND-condition is falsifiable rather than judgment-call.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "SCALE UP only when BOTH eval win-rate rising over last K rounds AND train/eval gap small",
+      "calibrated **value_loss-trend proxy** (documented soft signal; value head is small-init so early value_loss is tiny)"
+    ]
+  },
+  {
+    "title": "Pre-registered success metric is unwinnable under the accepted confound",
+    "severity": "major",
+    "primary_lens": "architecture",
+    "target_file": "brief.md",
+    "target_section": "TL;DR / Confound",
+    "description": "AC1 demands the structured encoder BEAT v3 on Medium at p<0.05, but the brief simultaneously accepts a confound where the recorded root cause (undertraining from from-scratch-per-round training) is left untouched and is warned to possibly make Medium WORSE with added capacity. The headline deliverable's success criterion and the design's own diagnosis are in direct tension.",
+    "rationale": "From a constraint-implementability view this is the classic 'two co-equal non-negotiables that contradict' pattern: the brief ships an encoder upgrade whose stated success metric the brief predicts it will likely fail. The team will spend an L-sized effort to produce a probable null result \u2014 that may be acceptable as a falsification experiment, but the framing should make 'expected negative' a first-class outcome, not a hidden one.",
+    "suggested_addition": "Reframe success explicitly: state that AC1's PRIMARY value is falsification \u2014 'either structured beats v3 (encoder was the bottleneck) OR it does not (confirms the undertraining diagnosis and triggers weight-carryover v5).' Define the decision tree for BOTH outcomes up front so a null result is a planned branch, not a disappointment, and confirm the user has accepted that the most likely outcome is no-win.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "the structured encoder BEATS the v3 rich-pool on **Medium** at **p<0.05**",
+      "warning that *adding capacity could make Medium worse*. The user reviewed this and chose to proceed with v4 as written."
+    ]
+  },
+  {
+    "title": "Whole-round dense batch over 1261 tiles is a data-model conflict the design defers",
+    "severity": "major",
+    "primary_lens": "architecture",
+    "target_file": "brief.md",
+    "target_section": "Risks #7 / D7",
+    "description": "The frozen training core does a whole-round dense batch over ALL tiles (train.py:265), and the GNN/attention encoder materializes [1261,6,C] gathers plus per-node cross-attention K/V \u2014 yet micro-batching is explicitly out of scope and OOM is only handled reactively by rejecting the rung (SIGKILL rc 137). The data-flow shape (dense all-tiles batch) and the new memory-heavy encoder are in tension, and the resolution is 'shrink the model until it fits.'",
+    "rationale": "An architecture that handles its own memory ceiling by abandoning capacity rungs is conceding that the model size is bounded by an unaddressed data-model decision, not by the science. The most capable rung may be unreachable purely because the frozen batch shape can't be touched \u2014 that's a structural ceiling the brief should name, not discover at OOM time.",
+    "suggested_addition": "Add to Risks #7 a stated ceiling: 'the frozen whole-round dense batch caps reachable model capacity; if the small/medium rungs OOM before showing improvement, the experiment is memory-bound and inconclusive, not a negative result.' Distinguish in the result reporting between 'rung lost on win-rate' and 'rung never ran (OOM)' so a memory-bound null isn't misread as a scientific null.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Whole-round dense batch over all tiles at `train.py:265`",
+      "ladder rejects OOM rung (SIGKILL rc 137); micro-batching noted future work"
+    ]
+  },
+  {
+    "title": "Throughput guard benchmarks a different topology than training/eval runs on",
+    "severity": "minor",
+    "primary_lens": "architecture",
+    "target_file": "brief.md",
+    "target_section": "D8 \u2014 Throughput guard",
+    "description": "The 70%-baseline reject gate runs on a 2-civ SimulationCiv1/2 setup (to avoid fingerprint mismatch and fix ms/decision attribution), but the Medium experiment and the 1261-tile OOM risk are about the real eval topology. The guard measures ms/decision on a topology with far fewer entity tokens than the boards the model actually plays, so a rung can PASS the guard yet be too slow or too large in the real run.",
+    "rationale": "An integration-surface mismatch: the gate that decides 'ship this rung' validates against a proxy workload whose entity-set sizes (self-attention is O(M\u00b2) over entities) and tile counts differ from the workload that matters. The guard's verdict is only as good as the representativeness of its benchmark board.",
+    "suggested_addition": "State the benchmark's representativeness assumption explicitly: 'the 2-civ bench board has the same tile count (Medium, 1261 tiles) as eval, so GNN cost is representative; entity-token counts are LOWER, so the bench is optimistic on attention cost.' Either confirm the bench uses a Medium-sized 2-civ map or add a note that the throughput guard is a lower-bound (optimistic) check, not a tight one.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "built from the **training ruleset/2-civ setup (SimulationCiv1/2)** \u2014 NOT the 6-major BenchCiv1..6 (fingerprint mismatch would reject every model; 2-civ also fixes ms/decision attribution)",
+      "**REJECT a rung < 70% of the heuristic baseline** turns/s"
+    ]
+  },
+  {
+    "title": "OS OOM Killer (SIGKILL) used for application control flow",
+    "severity": "critical",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder + demand-driven scaling",
+    "description": "The design relies on the Linux OOM killer (SIGKILL rc 137) to detect when a model rung is too large. This is highly dangerous: the OOM killer is non-deterministic, may kill the parent orchestrator instead of the child, and leaves the system with corrupted file handles and partial state.",
+    "rationale": "Using OS-level catastrophic failure mechanisms for standard application control flow guarantees pipeline instability and host-level alerts.",
+    "suggested_addition": "Implement a soft memory guard in the Python training subprocess (e.g., using `resource.setrlimit` or checking `psutil.virtual_memory().percent` before dense batching) to raise a catchable `MemoryError`. Catch this exception to gracefully abort and reject the rung.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "STOP when a rung doesn't beat the previous, violates D8, or OOMs (detected via train-subprocess SIGKILL rc 137, not a Python exception)."
+    ]
+  },
+  {
+    "title": "Missing wall-clock timeouts on JVM subprocess calls",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "D8 \u2014 Throughput guard",
+    "description": "The orchestrator calls the JVM `simBench` as a subprocess to measure throughput, but there is no mention of a timeout. If the JVM deadlocks or hangs (e.g., due to a thread starvation issue in the new ONNX evaluation path), the entire training pipeline will stall indefinitely.",
+    "rationale": "No external call or subprocess execution should ever be made without a strict wall-clock timeout. Unbounded waits are the leading cause of silent pipeline lockups.",
+    "suggested_addition": "Wrap the `simBench` subprocess call (and all training subprocesses) with a strict wall-clock timeout (e.g., `timeout=300` in `subprocess.run`). Catch `subprocess.TimeoutExpired`, log the hang, and treat it as a hard rejection for that rung.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "EXTEND SimBenchmark with an ONNX-policy rung mode built from the training ruleset",
+      "the ladder parses that line as source of truth, rc only for hard-crash"
+    ]
+  },
+  {
+    "title": "Silent inference fallbacks mask total model outages",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "Out of scope",
+    "description": "The brief explicitly scopes out inference telemetry because the JVM 'already falls back to FairOpponentModel'. If the new v4 model consistently throws exceptions (e.g., tensor shape mismatch on edge-case maps), it will silently fall back 100% of the time. You will have shipped a broken feature without knowing it.",
+    "rationale": "A fallback is a mitigation, not a resolution. If a fallback triggers silently, the primary system's MTTR (Mean Time To Recovery) becomes infinite because nobody knows it's broken.",
+    "suggested_addition": "Remove 'inference telemetry' from Out of Scope. At minimum, the JVM `catch` block that triggers the fallback MUST write a structured error log (e.g., `logger.error(\"ONNX inference failed, falling back\", exc)`) so developers can detect and debug model crashes in local/beta testing.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "inference circuit-breaker/telemetry (offline loop; JVM already falls back to FairOpponentModel)"
+    ]
+  },
+  {
+    "title": "Per-turn tensor allocation causes severe JVM GC pressure",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "D9 \u2014 Contract growth + multi-tensor bridge",
+    "description": "The JVM builds `neighbor_index` and `neighbor_mask` from the live `TileMap` during `forwardRich`. Allocating these large arrays (e.g., 1261 tiles * 6 edges * 8 bytes for int64) from scratch on every single AI turn will cause massive Garbage Collection (GC) pressure, leading to UI stuttering.",
+    "rationale": "Resource management and memory bounds are critical for inference engines. Unbounded per-request allocations in a JVM game loop will destroy client performance.",
+    "suggested_addition": "Map topology is static. Cache the `neighbor_index` and `neighbor_mask` arrays at the `TileMap` or `OnnxPolicy` level upon game load. Only rebuild them if the map dimensions change. Pass the cached arrays into `forwardRich`.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "forwardRich builds neighbor tensors from gameInfo.tileMap via real getIfTileExistsOrNull over the 6 offsets",
+      "The JVM builds neighbor_index at inference from the live TileMap."
+    ]
+  },
+  {
+    "title": "Lack of atomic writes for ONNX model exports",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder + demand-driven scaling",
+    "description": "If a rung fails mid-export (e.g., due to the aforementioned OOM or a timeout), the pipeline may leave behind a corrupted or partially written `.onnx` file. The brief does not specify atomic file operations for the export handoff.",
+    "rationale": "Data pipelines must be idempotent and crash-safe. Reading a partially written model file in a subsequent step or a resumed run will cause cryptic deserialization errors.",
+    "suggested_addition": "Require atomic writes for model exports: export the ONNX model to a temporary file (e.g., `model_rung.onnx.tmp`) and use `os.replace()` to atomically rename it to the final path only after the export and validation succeed.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "run_one_round refactor returns model_path+rung",
+      "STOP when a rung doesn't beat the previous, violates D8, or OOMs"
+    ]
+  },
+  {
+    "title": "No prioritization of deliverables \u2014 all work appears equally launch-blocking",
+    "severity": "critical",
+    "primary_lens": "outcomes",
+    "target_file": "brief.md",
+    "target_section": "Deliverables (corrected)",
+    "description": "The brief lists 10 deliverables (D1\u2013D10) without any Must/Should/Could or P0/P1 ranking. If the build encounters resource constraints, OOM, or export issues, the team has no guidance on which capabilities can be deferred or dropped without killing the success metric.",
+    "rationale": "When every feature is implicitly P0, scope negotiation becomes impossible. A PM needs a clear priority ladder so the team can cut intelligently under pressure.",
+    "suggested_addition": "Add a priority column to the deliverable list: P0 (launch-blocking for AC1), P1 (important but could be deferred one round), P2 (nice-to-have). For example, D7 (capacity ladder) and D8 (throughput guard) might be P1 if a manual single\u2011rung run can still yield a valid result.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "D1 \u2014 Featurizer/contract emit",
+      "D7 \u2014 Capacity ladder + demand-driven scaling"
+    ]
+  },
+  {
+    "title": "Non-negotiable constraints are absent",
+    "severity": "critical",
+    "primary_lens": "outcomes",
+    "target_file": "brief.md",
+    "target_section": "",
+    "description": "The brief has no dedicated 'Non\u2011Negotiable Constraints' section. Critical invariants \u2014 frozen training core, opset-17 compatibility, backward\u2011compatible JVM bridge, Tiny non\u2011regression \u2014 are scattered in the text but never codified as explicit, binding constraints.",
+    "rationale": "Without a single source of truth for what must never be violated, downstream design and implementation risk inadvertently breaking an invariant that would invalidate the entire experiment.",
+    "suggested_addition": "Add a section 'Non\u2011Negotiable Constraints' listing: 1) The encoder\u2011agnostic training core (_optimize_actor_critic / compute_gae) must not be modified. 2) All model ops must be ONNX opset\u201117 safe. 3) Tiny final eval win\u2011rate must stay within X% of baseline (see AC1). 4) The model\u2019s forward(inputs)\u2011>(tech,policy,tanh(value)) signature is frozen. 5) The JVM bridge must accept contract version 3 without changing the tensor naming scheme.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "The frozen training core (_optimize_actor_critic / compute_gae / terminal-reward+critic) is untouched",
+      "Hand-rolled scaled-dot-product (Linear Q/K/V, matmul, /\u221ad, masked softmax, matmul, out-proj)"
+    ]
+  },
+  {
+    "title": "\"Budget held constant\" is ambiguous \u2014 needs a concrete definition",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "brief.md",
+    "target_section": "\u26a0\ufe0f Confound (stated plainly, per the user's accepted decision)",
+    "description": "The confound statement and the experiment description say 'holds budget constant vs v3 rich-critic' but never define what 'budget' means. Is it wall\u2011clock time, number of training rounds, total FLOPs, or something else?",
+    "rationale": "The entire success metric hinges on a fair comparison. An undefined budget makes the claim unfalsifiable and could lead to post\u2011hoc reinterpretation of results.",
+    "suggested_addition": "Define budget precisely: e.g., 'The total number of training rounds per learning epoch will exactly match the v3 rich\u2011critic baseline (N rounds).' If the capacity ladder requires extra rounds to evaluate each rung, clarify how those are accounted for so the headline comparison remains clean.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "The user reviewed this and chose to proceed with v4 as written. Therefore the plan: (a) holds budget constant vs v3 rich-critic for the headline comparison\u2026"
+    ]
+  },
+  {
+    "title": "\"Tiny does not regress\" lacks a falsifiable threshold",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "brief.md",
+    "target_section": "Pre-registered, falsifiable success metric (AC1)",
+    "description": "The success metric states that 'Tiny does not regress' but gives no quantitative threshold (e.g., win\u2011rate within \u00b12%, or not statistically significantly worse). The Medium metric is precise; the Tiny guardrail is unfalsifiable.",
+    "rationale": "A PM needs an equally crisp regression guardrail so the team can objectively decide whether the encoder passes or fails on this dimension.",
+    "suggested_addition": "Add a measurable threshold: 'Tiny final eval win\u2011rate must be within 2 percentage points of the v3 rich\u2011critic Tiny baseline, OR a one\u2011tailed test for inferiority must be non\u2011significant (p > 0.10).' This matches the precision of the Medium metric.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Pre-registered, falsifiable success metric (AC1): the structured encoder BEATS the v3 rich-pool on Medium at p<0.05 (two-proportion z over the final 200-game eval), and Tiny does not regress."
+    ]
+  },
+  {
+    "title": "No exit/pivot criteria given the acknowledged training-regime confound",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "brief.md",
+    "target_section": "\u26a0\ufe0f Confound (stated plainly, per the user's accepted decision)",
+    "description": "The confound acknowledges that v4 may make Medium worse and that weight\u2011carryover is a follow\u2011up. However, there is no decision rule for when to stop v4 and pivot \u2014 e.g., 'if Medium win\u2011rate is worse than v3 after round 3, abandon v4'.",
+    "rationale": "Without a pre\u2011committed stop\u2011loss, the team risks sunk\u2011cost escalation on a path that the recorded diagnosis already warns against. A PM would gate the investment behind a clear decision point.",
+    "suggested_addition": "Add: 'After the small\u2011rung evaluation, if the round\u2011over\u2011round Medium curve shows no upward trend (e.g., win\u2011rate lower than v3 at round 3 or 5), we gate further rungs and re\u2011evaluate weight\u2011carryover as the higher\u2011priority path.' This converts the confound into an actionable pivot rule.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "v4 adds encoder capacity but leaves from-scratch-per-round training untouched \u2014 and the recorded v2 diagnosis \u2026 warns that adding capacity could make Medium worse.",
+      "Weight-carryover remains the recommended follow-up if the result is ambiguous."
+    ]
+  },
+  {
+    "title": "Tiny non-regression is not testable as written",
+    "severity": "critical",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "TL;DR \u2014 how this solves the ask / Verification",
+    "description": "AC1 defines a statistical test for Medium, but only says \u201cTiny does not regress\u201d without defining the Tiny baseline, evaluation sample size, allowed delta, or statistical rule. QA cannot write a pass/fail test for Tiny from the brief alone.",
+    "rationale": "This is part of the pre-registered success metric, so ambiguity here can let the feature ship after an unquantified Tiny degradation. Non-regression must have the same level of falsifiability as the Medium win claim.",
+    "suggested_addition": "Define Tiny non-regression explicitly, e.g. \u201cTiny non-regression passes if structured v4\u2019s final 200-game Tiny eval win rate is no more than X percentage points below the v3 rich-pool Tiny baseline, or if a two-proportion z-test fails to show a statistically significant decrease at p<0.05. Baseline artifact, seeds, ruleset, and evaluation command must be recorded in RESULTS.md.\u201d",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "\u201cPre-registered, falsifiable success metric (AC1): the structured encoder BEATS the v3 rich-pool on Medium at p<0.05 (two-proportion z over the final 200-game eval), and Tiny does not regress.\u201d",
+      "\u201crun_loop --variant structured Tiny+Medium curves; final 200-game Medium z-test (AC1); Tiny non-regression\u201d"
+    ]
+  },
+  {
+    "title": "Capacity ladder gates use undefined thresholds",
+    "severity": "critical",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder + demand-driven scaling",
+    "description": "The ladder\u2019s scale/stop decisions depend on phrases like \u201crising over last K rounds,\u201d \u201cgap small,\u201d \u201cdoesn't beat the previous,\u201d and a \u201ccalibrated value_loss-trend proxy,\u201d but K, thresholds, comparison windows, and tie/variance handling are not specified. This makes the rung-selection behavior impossible to verify deterministically.",
+    "rationale": "D7 is a core control path: it decides which model capacity is trained, benchmarked, and potentially shipped. If QA cannot derive Given/When/Then cases for scale-up, stop, no-improve, OOM, and throughput-reject branches, the ladder can silently encode subjective tuning.",
+    "suggested_addition": "Add a ladder acceptance table: `K=<number> rounds`; \u201ceval win-rate rising\u201d means `<exact formula>`; \u201ctrain/eval gap small\u201d means `<metric> <= <threshold>`; \u201cbeat previous rung\u201d means `<metric/test/sample size>`; stop behavior for ties/noisy results; and required log fields. Include test fixtures for each branch: scale-up, hold, stop-no-improve, stop-throughput-reject, and stop-OOM rc137.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "\u201cSCALE UP only when BOTH eval win-rate rising over last K rounds AND train/eval gap small; STOP when a rung doesn't beat the previous, violates D8, or OOMs\u201d",
+      "\u201cTrain/eval-gap signal: calibrated value_loss-trend proxy (documented soft signal; value head is small-init so early value_loss is tiny) \u2014 optionally an added train-batch argmax pass.\u201d"
+    ]
+  },
+  {
+    "title": "Experiment reproducibility inputs are underspecified",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "D10 \u2014 Parity + experiment",
+    "description": "The brief requires budget held constant vs v3 and final 200-game evals, but does not define the exact training budget, seeds, map generation parameters, ruleset/fingerprint artifact, opponent setup, or baseline model artifact used for the v3 comparison. QA cannot independently recreate the test data or know whether two runs are comparable.",
+    "rationale": "The headline AC1 z-test is only meaningful if the eval population and baseline are fixed. Without pinned eval inputs, a pass/fail result can change due to seed/map/ruleset drift rather than the structured encoder.",
+    "suggested_addition": "Add an \u201cExperiment fixture\u201d section specifying: exact v3 baseline model/path or commit; training budget definition; eval command; random seeds or seed list; map size/settings; ruleset fingerprint; civ/opponent setup; number of rounds; final checkpoint selection rule; and where raw game outcomes are stored. Require the z-test report to include these fixture IDs.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "\u201cholds budget constant vs v3 rich-critic for the headline comparison\u201d",
+      "\u201cExperiment: run_loop --variant structured \u2026 eval curves on Tiny AND Medium at budget held constant vs v3 rich-critic; final 200-game Medium eval + two-proportion z\u201d"
+    ]
+  },
+  {
+    "title": "Throughput guard lacks a stable measurement protocol",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "D8 \u2014 Throughput guard",
+    "description": "The 70% throughput gate is numeric, but the benchmark protocol is not fully testable: no warmup, repetition count, aggregation statistic, variance tolerance, timeout, or baseline capture rule is specified. A rung could pass or fail depending on local machine noise or one-off benchmark variance.",
+    "rationale": "Performance acceptance criteria must be reproducible enough for CI/manual QA to distinguish real regressions from measurement noise. \u201c\u226570% baseline\u201d is testable only after the baseline and sampling method are defined.",
+    "suggested_addition": "Specify benchmark protocol: hardware/CI context if applicable; warmup turns/games; number of measured runs; aggregation statistic such as median turns/s; acceptable variance/retry rule; timeout; exact heuristic-baseline command; and exact `BENCH| RUNG` fields. Example: \u201cPASS if median ONNX turns/s across 5 measured runs is >=70% of median heuristic turns/s from the same process after 1 warmup run.\u201d",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "\u201cREJECT a rung < 70% of the heuristic baseline turns/s. Report turns/s + ms/decision for EVERY rung tried.\u201d",
+      "\u201cMeasure data-gen turns/s + ms/decision; emit a BENCH| RUNG verdict=PASS|REJECT line\u201d"
+    ]
+  },
+  {
+    "title": "Malformed neighbor-input error cases are not covered",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "D9 \u2014 Contract growth + multi-tensor bridge / D10 \u2014 Parity + experiment",
+    "description": "The brief covers happy-path parity and contract-version refusal, but does not specify expected behavior for missing, wrong dtype, wrong rank, wrong N, or mismatched `neighbor_index`/`neighbor_mask` tensors. These are new fail-loud contract surfaces and need explicit negative tests.",
+    "rationale": "The new int64 multi-tensor bridge is a high-risk integration point. If malformed neighbor inputs fail late inside ORT, silently coerce, or produce bad logits, QA will miss a class of contract regressions not covered by version mismatch alone.",
+    "suggested_addition": "Add negative acceptance tests for v3 ONNX inputs: missing `neighbor_index`; `neighbor_index` float32 instead of int64; `neighbor_mask` shape not `[B,N,6]`; neighbor N different from spatial N; degree axis not 6; OOB neighbor index; and absent metadata `NEIGHBOR_INPUT_NAMES`. Expected result: fail-loud before inference with a clear contract/provenance error, except Python adjacency builder OOB should assert before export/train.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "\u201cONNX model inputs \u2026 plus NEW neighbor_index [B,N,6] int64 + neighbor_mask [B,N,6] f32.\u201d",
+      "\u201cTests: \u2026 rich-logits parity extended to the wider multi-tensor input incl. neighbor_index/mask \u2026 contract-version-mismatch refusal test\u201d"
+    ]
+  },
+  {
+    "title": "Hand-rolled attention yields NaN on empty entity sets, causing JVM crash",
+    "severity": "critical",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "D4 \u2014 Self-attention over entity sets",
+    "description": "The brief claims the hand-rolled attention is \"NaN-safe (mirror masked_pool guards)\". However, `masked_fill(mask==0, -inf)` followed by Softmax on an entirely masked entity set (e.g., 0 units, which the JVM pads to N=1 with mask=0) results in `exp(-inf) / sum(exp(-inf)) = 0 / 0 = NaN`. These NaNs will propagate through the cross-attention and trunk, outputting NaN action logits and crashing the JVM's action-selection logic.",
+    "rationale": "Masked pool avoids NaNs by clamping the denominator to 1. Softmax has no such native protection for all-masked inputs. An adversary (or normal gameplay) eliminating all units of a specific type will reliably crash the opponent's client via this unhandled NaN propagation.",
+    "suggested_addition": "Add an explicit bypass in the ONNX graph for all-masked sets (e.g., `torch.where(mask.any(dim=-1, keepdim=True), attention_out, 0.0)`), or inject a permanent unmasked dummy/sentinel token into all entity sets so the denominator is never zero.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Hand-rolled scaled-dot-product... masked softmax... presence-masked, NaN-safe (mirror masked_pool guards).",
+      "empty entity sets: JVM pads N=max(1,count) zero-token+mask0"
+    ]
+  },
+  {
+    "title": "Unbounded dynamic axis M in self-attention enables native JVM OOM (DoS)",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "D4 \u2014 Self-attention over entity sets",
+    "description": "Self-attention requires `O(M^2)` memory where `M` is the number of entities (units/cities). The brief assumes \"M small\". In a maliciously crafted custom map, a modded ruleset, or an extreme late-game scenario, a player could generate thousands of units. The ONNX Runtime will attempt to allocate `M^2` tensors in native memory, causing an uncatchable native OOM.",
+    "rationale": "Unconstrained dynamic axes are a classic resource exhaustion vector. The JVM cannot catch native C++ OOMs originating from the ONNX Runtime; the application will abruptly die, creating a trivial DoS vector in multiplayer games against AI.",
+    "suggested_addition": "Enforce a hard maximum on `M` (e.g., `M_MAX = 256`) in `OnnxPolicy.kt` when building the input tensors. Truncate, sample, or aggregate entities if the limit is exceeded before passing the tensors to the ORT environment.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Per entity set. O(M\u00b2), M small.",
+      "dynamic_axes (batch{0}+ragged{1:\"n_<name>\"})"
+    ]
+  },
+  {
+    "title": "Missing JVM bounds-check on neighbor_index allows native OOB memory read",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "D9 \u2014 Contract growth + multi-tensor bridge",
+    "description": "The Python training code adds a bounds-assert for `neighbor_index` (FND-0025) to prevent OOB `Gather` ops. However, the JVM builds its own `neighbor_index` at inference. If a custom map has sparse/non-contiguous `zeroBasedIndex` values, or if map size exceeds expected bounds, the JVM might pass an index `>= N` to ONNX Runtime.",
+    "rationale": "An out-of-bounds `Gather` operation in ONNX Runtime (C++) will cause a native segfault or arbitrary memory read, crashing the JVM. Python-side training assertions do not protect the JVM inference runtime from malformed map topologies.",
+    "suggested_addition": "In `OnnxPolicy.kt` `forwardRich`, explicitly clamp or assert `neighbor_index < N` (where N is the actual size of the spatial tensor) before passing the tensor to the ORT environment. Fall back to the heuristic AI if the map topology is invalid.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Bounds-assert 0\u2264idx<N (no OOB Gather \u2014 FND-0025).",
+      "JVM inference builds from the live TileMap in forwardRich... via real getIfTileExistsOrNull"
+    ]
+  },
+  {
+    "title": "Untrusted ONNX model loading via mods is an RCE vector",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "Out of scope",
+    "description": "The brief states that fingerprinting is \"not a security boundary\" and assumes no adversary in the data path. However, Unciv has a rich modding ecosystem. If modders can distribute custom ONNX models that the game loads via `OnnxPolicy`, this exposes players to Remote Code Execution (RCE), as ONNX Runtime has a history of vulnerabilities triggered by maliciously crafted models.",
+    "rationale": "Treating model loading as purely an offline/trusted operation ignores the reality of game modding. Loading an untrusted ONNX model is equivalent to executing untrusted native code.",
+    "suggested_addition": "Explicitly document whether mods are allowed to provide custom ONNX models. If yes, add a severe security warning to the user before loading a modded model, or restrict ONNX loading strictly to base-game assets.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "fingerprint \"cryptographic\" hardening (correctness gate, not a security boundary).",
+      "offline loop; JVM already falls back to FairOpponentModel"
+    ]
+  },
+  {
+    "title": "Capacity ladder lacks training-cost guard \u2014 may scale to costly, low-value rungs",
+    "severity": "critical",
+    "primary_lens": "cost",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder + demand-driven scaling",
+    "description": "The ladder scales up based only on win-rate and train/eval gap, with no consideration of the training compute cost increase per rung. A large rung could consume significantly more FLOPs per round, and if gains are marginal, the cost per improvement point could be unacceptable.",
+    "rationale": "From a FinOps perspective, every infrastructure decision must be evaluated for cost-effectiveness. The throughput guard only covers inference cost; training (the dominant cost in an RL loop) has no budget guard at all, risking compute waste.",
+    "suggested_addition": "Add a training-cost signal to the ladder: for each rung, log the estimated total GPU-hours (or wall-clock time \u00d7 instance cost) per round. Define a maximum acceptable cost-per-round increase (e.g., 2\u00d7 the small-rung cost) before stopping the ladder. Alternatively, require human sign-off when the next rung would exceed a cost threshold. At minimum, include cost-per-round in the output signals so the team can make an informed shippability decision.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "START small; SCALE UP only when BOTH eval win-rate rising over last K rounds AND train/eval gap small; STOP when a rung doesn't beat the previous, violates D8, or OOMs",
+      "Compute cost proportional to value, right-sized infrastructure, and cost-per-unit tracking."
+    ]
+  },
+  {
+    "title": "\"Budget constant\" is undefined \u2014 comparison may be misleading",
+    "severity": "critical",
+    "primary_lens": "cost",
+    "target_file": "brief.md",
+    "target_section": "\u26a0\ufe0f Confound",
+    "description": "The plan states \"budget held constant vs v3 rich-critic for the headline comparison\" but never defines what constitutes budget. Without precision, the team could inadvertently give the structured encoder less training time (e.g., same wall-clock but slower per-epoch) and then attribute underperformance to the architecture rather than the training regime.",
+    "rationale": "A FinOps audit would demand that \"apples-to-apples\" cost comparisons are rigorously specified \u2014 total compute, not wall-clock, because wall-clock differences mask true cost efficiency.",
+    "suggested_addition": "Define budget precisely: 'Same total number of environment steps processed (e.g., 5M steps) and same batch size, with both models trained for the same number of gradient updates.' Include a statement that wall-clock time is recorded but not the controlling metric.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "budget held constant vs v3 rich-critic for the headline comparison"
+    ]
+  },
+  {
+    "title": "Neighbor graph may be recomputed per batch, adding unnecessary training cost",
+    "severity": "major",
+    "primary_lens": "cost",
+    "target_file": "brief.md",
+    "target_section": "D3 \u2014 Hex GNN (gather, not scatter)",
+    "description": "The adjacency builder (`build_neighbor_graph`) operates on CPU and could be called for every training batch if not cached. For a fixed map, the neighbor graph is static; recomputing it each epoch wastes compute and may become a noticeable fraction of training cost on larger maps.",
+    "rationale": "FinOps always looks for avoidable computation. In RL training loops where the same shards are re-used multiple times, caching adjacency structures can reduce per-round cost meaningfully, especially for the larger rungs.",
+    "suggested_addition": "Add a note that the neighbor index/mask should be computed once per shard and cached (e.g., stored as part of the shard or in a LRU cache). The training loop then reuses the precomputed tensors across batches, avoiding redundant graph construction.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Builds `{(x,y)\u2192row}` from `spatial_coords`; for each tile\u00d7direction \u2026 \u2192 `neighbor_index[N,6]`, `neighbor_mask[N,6]`."
+    ]
+  },
+  {
+    "title": "Self-attention over entity sets has no bounded set sizes \u2014 quadratic cost risk",
+    "severity": "major",
+    "primary_lens": "cost",
+    "target_file": "brief.md",
+    "target_section": "D4 \u2014 Self-attention over entity sets",
+    "description": "The brief claims self-attention is O(M\u00b2) with \"M small\", but the maximum size of entity sets (own_units, own_cities, etc.) is not bounded. On larger maps or later-game states, unit counts can reach dozens or even hundreds, making quadratic attention a significant compute surprise.",
+    "rationale": "A cost-conscious design would either prove that M is always small (e.g., maximum own_units \u2264 50) or cap the sequence length. Otherwise, a single large map could blow out the training budget for that rung, violating cost-efficiency expectations.",
+    "suggested_addition": "Add a documented upper bound for each entity set (e.g., own_units \u2264 64) based on the game rules, or implement an adaptive cap that truncates/pools excess entities. If no bound can be guaranteed, include a cost-monitoring alert in D7 to flag when attention O(M\u00b2) exceeds a threshold.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Hand-rolled scaled-dot-product \u2026 per entity set. O(M\u00b2), M small."
+    ]
+  },
+  {
+    "title": "Hex adjacency clock-offset table contradicts engine reference (domain geometry)",
+    "severity": "critical",
+    "primary_lens": "domain",
+    "target_file": "brief.md",
+    "target_section": "D3 \u2014 Hex GNN (gather, not scatter)",
+    "description": "The brief's GNN clock order is `[(+1,+1),(0,+1),(-1,0),(-1,-1),(0,-1),(+1,0)]`, but the authoritative engine table `HexMath.clockPositionToHexcoordMap` (from the scan) is 12=(+1,+1) 2=(0,+1) 4=(-1,0) 6=(-1,-1) 8=(0,-1) 10=(+1,0) \u2014 and the worked walkthrough then lists tile-530 neighbors that must be reconciled against this. The hex domain has only ONE true 6-neighbor relation; any reordering or sign error silently builds the wrong board topology.",
+    "rationale": "Hex adjacency IS the business concept v4 exists to model (locality is the whole reason for the GNN). A mis-mapped offset produces a plausible-but-wrong graph that passes shape checks and trains happily while encoding a fictional map \u2014 the exact class of domain bug that compiles and 'works.'",
+    "suggested_addition": "Add a line in D3 pinning the offset table to a single named SSOT: 'The 6 offsets and their clock order are copied verbatim from `HexMath.clockPositionToHexcoordMap`; the adjacency-parity test (D10.2) asserts Python-pure neighbor rows equal the engine's `getIfTileExistsOrNull` output for every direction, so any drift in offset order or sign fails loudly.' State explicitly that the degree axis index\u2192direction mapping is irrelevant to correctness only if mask and gather use the same order on both sides.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "for each tile\u00d7direction (clock order `[(+1,+1),(0,+1),(-1,0),(-1,-1),(0,-1),(+1,0)]`)",
+      "neighbors = rows of (\u22122,8),(\u22123,8),(\u22124,7),(\u22124,6),(\u22123,6),(\u22122,7)"
+    ]
+  },
+  {
+    "title": "world-wrap radius semantics conflated for rectangular vs hex maps",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "brief.md",
+    "target_section": "The v3 contract / D1.2",
+    "description": "The brief emits `effWrapRadius = if(shape==rectangular) width/2 else radius` and the walkthrough shows effWrapRadius=21, but the engine's `getIfTileExistsOrNull` wrap retry uses `mapSize.radius` directly (rectangular radius = width/2). The pre-resolution is correct only if the engine's wrap arithmetic uses exactly that resolved value in every branch \u2014 including non-square rectangular maps where width/2 may not equal the hex-coordinate wrap span.",
+    "rationale": "World-wrap is a real domain rule: tiles on the east edge are genuinely adjacent to the west edge, and an off-by-one wrap radius makes phantom or missing adjacencies along the seam. On a torus map this corrupts a band of tiles every game, biasing the very locality signal v4 is meant to capture.",
+    "suggested_addition": "In D1.2 add: 'effWrapRadius must reproduce the EXACT value `getIfTileExistsOrNull` uses in its wrap retry for both shapes; the engine-fidelity test (D10.3) must include a non-square rectangular world-wrap map (width\u2260height, width/2\u2260radius) and assert seam-tile neighbor rows match live `getIfTileExistsOrNull`. Document whether rectangular maps in this ruleset can be non-square.'",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "**pre-resolved** `effWrapRadius = if(shape==rectangular) width/2 else radius`",
+      "world-wrap retry `(nx+R,ny-R)` then `(nx-R,ny+R)` \u2014 **exact** mirror of `TileMap.getIfTileExistsOrNull`"
+    ]
+  },
+  {
+    "title": "Sentinel index 0 collides with a real tile (tile row 0 is a valid neighbor)",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "brief.md",
+    "target_section": "D3 \u2014 Hex GNN (gather, not scatter)",
+    "description": "Missing/off-map neighbors are encoded as 'sentinel index 0 + mask 0', but index 0 is also the legitimate row of the first real tile (zeroBasedIndex 0). The mask is supposed to zero out the contribution, but this only works if the mask is applied with absolute correctness everywhere; conflating 'no neighbor' with 'tile 0' removes the domain distinction.",
+    "rationale": "In the hex domain, 'there is no tile in this direction' (edge of a non-wrapping map) is a meaningful state distinct from 'the neighbor happens to be the origin tile.' Relying solely on mask-multiply for that distinction is fragile and makes tile 0's features the silent default for every edge tile in the GNN gather buffer.",
+    "suggested_addition": "Add to D3: 'Sentinel index 0 is safe ONLY because neighbor_mask=0 zeroes its message; the message-MLP and reduce must apply the mask BEFORE any residual/bias add so tile-0 features never leak through an off-map slot. The shard-roundtrip and adjacency-parity tests must include an edge tile whose true neighbor is row 0, asserting that present-neighbor and absent-neighbor are distinguished by mask, not index.'",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Missing \u2192 sentinel index 0 + mask 0",
+      "off-map dirs \u2192 idx 0 mask 0"
+    ]
+  },
+  {
+    "title": "Tile-index in unit/city tokens links entities to GNN nodes but the join is never modeled",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "brief.md",
+    "target_section": "D1.3 / D5 \u2014 Cross-attention",
+    "description": "D1.3 adds `currentTile.zeroBasedIndex` / `centerTile.zeroBasedIndex` to unit and city tokens, but the model never uses these indices to relate an entity to its board node \u2014 cross-attention concatenates GNN nodes and entity tokens into an undifferentiated K/V set. The domain fact that 'this unit is ON this tile' is emitted but discarded.",
+    "rationale": "The core business reason locality matters is that units and cities occupy specific tiles; if the encoder cannot connect an entity to its spatial node, it relearns nothing the old pool didn't, defeating the rationale for adding the tile index. Either the index drives a real join (gather the node embedding into the entity token) or D1.3 is dead weight that bloats the contract.",
+    "suggested_addition": "Clarify in D5 (or D2/D4) how `tileIdx` is consumed: e.g. 'unit/city tokens gather their owning node's GNN embedding via tileIdx (Gather over node outputs) and concatenate it, so entity\u2194board locality is explicit.' If no consumer is planned, state explicitly why the index is still emitted (e.g. future v5) and consider deferring it to avoid a contract bump that buys nothing.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "unit token 8\u21929 (`currentTile.zeroBasedIndex`), city token 16\u219217 (`centerTile.zeroBasedIndex`",
+      "K/V `[GNN nodes \u2295 entity tokens]` with the union mask"
+    ]
+  },
+  {
+    "title": "owner_slot semantics (255=self) must be reindexed consistently across emit and embed",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "brief.md",
+    "target_section": "D2 \u2014 Embeddings",
+    "description": "The domain encodes tile/unit ownership as 0=none, 1..N=civ, 255=self (a special sentinel meaning 'the acting civ'), and D2 reindexes 255\u219241 into a size-42 slot table shared by owner_slot and unit_owner_slot. The brief asserts the reindex but does not state that 'self' is a perspective-relative concept that must be applied identically in spatial channel 7/10, unit tokens, and the embedding lookup.",
+    "rationale": "'Self' vs a numbered civ is a load-bearing domain distinction \u2014 the policy must know which units/tiles are its own. If the 255\u219241 remap happens in one place (embedding) but not consistently with how the slot table treats the acting civ, the model conflates self-ownership with civ #41 or with 'none', corrupting the most decision-relevant ownership signal.",
+    "suggested_addition": "In D2 state: 'owner_slot/unit_owner_slot are perspective-relative: 0=none, 1..40=other civ, 255=self. The 255\u219241 reindex is applied in the dataset/feature layer (one place), and the slot-table row 41 means SELF, never a real civ. Add an assertion/test that no real civ index ever maps to row 41 and that self tiles embed to row 41 in both spatial and entity paths.'",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "owner_slot & unit_owner_slot share a **slot table size 42** (`maxCivTokens 40 +2`; reindex 255\u219241)",
+      "owner_slot (0 none, 1..N civ, 255 self)"
+    ]
+  },
+  {
+    "title": "Make Phase B optional, not \"spec-mandated\" by default",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "Build sequencing",
+    "description": "The brief correctly identifies Phase A as the minimum test of the diagnosed fix, but then says the full attention stack must be built anyway. That turns a clean experiment into a large rewrite even if GNN-only answers the question.",
+    "rationale": "From a YAGNI standpoint, self-attention, cross-attention, and trunk splitting have not earned their cost until Phase A shows locality helps and export/runtime are healthy. Building them unconditionally increases maintenance burden and muddies attribution.",
+    "suggested_addition": "Add a hard Phase A decision gate: \"Do not start Phase B until GNN-only export passes, throughput is acceptable, and Medium results justify more capacity. If GNN-only beats v3, report that as the primary result and require an explicit follow-up decision before adding attention. If GNN-only fails with a large train/eval gap, stop and report undertraining rather than layering more encoder capacity.\"",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Phase A ... train a GNN-only structured net and check Medium. This is the minimum to test \"does restoring 2D locality beat the pool?\"",
+      "Phase B (layer on, spec-mandated): D4 self-attention ... D5 cross-attention + D6 trunk split."
+    ]
+  },
+  {
+    "title": "The capacity ladder is too much machinery for one experiment",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder + demand-driven scaling",
+    "description": "D7 introduces seven constructor knobs, rung orchestration, K=3 trend logic, train/eval-gap proxies, subprocess memory caps, wall-clock timeouts, and parsed benchmark verdicts. For a single falsifiable comparison, that is a lot of automation and configuration surface.",
+    "rationale": "This is classic configuration theater: impressive, but future maintainers now have to understand a mini scheduler before they can reproduce the model choice. It also risks making the headline result depend on ladder behavior rather than a simple pre-registered architecture.",
+    "suggested_addition": "Replace the autonomous ladder with a fixed, explicit plan: small rung for export/parity smoke, then one pre-registered evaluation rung. If multiple rungs are still required, list them as a static array and run/report all of them; do not auto-scale based on soft proxies in v4.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Constructor args `(embed_dim, gnn_layers, gnn_channels, attn_layers, attn_heads, attn_dim, trunk_w)`; rungs small/medium/large per spec",
+      "SCALE UP one rung iff (rising AND throughput \u226570% baseline AND train/eval-gap-small)"
+    ]
+  },
+  {
+    "title": "Trunk split adds another uncontrolled capacity change",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "D6 \u2014 Trunk split",
+    "description": "D6 separates policy and value bodies even though the diagnosed problem is spatial pooling/locality. That is another model-capacity change layered into the same v4 result.",
+    "rationale": "If Medium improves or worsens, this makes attribution harder: was it the hex graph, attention, embeddings, or the policy/value trunk split? Unless there is evidence the shared trunk is the bottleneck, this is speculative complexity.",
+    "suggested_addition": "Defer D6 from the default v4 path. Keep the existing shared trunk shape for Phase A/B, preserving only the required heads and `_small_init_value_head`. Add trunk split only as a separate ablation if shared-trunk results show value/policy interference.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Shared body `[cross_ctx \u2295 global \u2295 acting_civ] \u2192 MLP(trunk_w)`; SEPARATE `policy_body\u2192{tech_head,policy_head}` and `value_body\u2192value_head`",
+      "The frozen training core ... is untouched \u2014 only the `nn.Module` is swapped."
+    ]
+  },
+  {
+    "title": "Avoid three neighbor-builder implementations",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "D3 / D9 / D10 adjacency building",
+    "description": "The brief describes Python adjacency building, a pure Kotlin builder for parity, and live TileMap-based construction inside `OnnxPolicy.forwardRich`. That is at least three places future developers can accidentally drift.",
+    "rationale": "Parity tests reduce risk, but duplicated business logic still has an abstraction tax. The clean maintainable version is one production Kotlin neighbor builder called by both `OnnxPolicy` and tests, plus the Python equivalent required for training.",
+    "suggested_addition": "Add a constraint: \"Do not inline neighbor construction in `OnnxPolicy.forwardRich`. Implement one Kotlin production function, e.g. `buildNeighborInputs(tileMap, clockOffsets)`, and call it from `OnnxPolicy`, `SimBenchmark`, parity runners, and engine-fidelity tests. The pure coordinate builder should exist only where no `TileMap` is available and must share fixtures with the production path.\"",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "New `python/unciv_train/hexgraph.py`: pure `build_neighbor_graph(coords, eff_wrap_radius, world_wrap, shape)`",
+      "`OnnxPolicy.kt`: ... `forwardRich` builds neighbor tensors from `gameInfo.tileMap` via real `getIfTileExistsOrNull` over the 6 offsets"
+    ]
+  },
+  {
+    "title": "Two neighbor-graph builders must stay bit-identical across JVM/Python forever",
+    "severity": "critical",
+    "primary_lens": "architecture",
+    "target_file": "brief.md",
+    "target_section": "D3 / D9 \u2014 neighbor build sites",
+    "description": "The neighbor_index is constructed independently in two places \u2014 Python at train time from spatial_coords, and Kotlin at inference from the live TileMap \u2014 and the model's correctness depends on these producing identical graphs for every map topology (hex, rectangular width/2\u2260radius, world-wrap, ragged edges). Parity is asserted only transitively (Python-pure==Kotlin-pure, Kotlin-pure==live-engine) over synthetic fixtures, not over the actual inference path the JVM uses (`gameInfo.tileMap` via `getIfTileExistsOrNull`).",
+    "rationale": "This is a dual-source-of-truth for a load-bearing derived structure with no single canonical owner; any future change to hex offset conventions, world-wrap resolution, or coordinate emission silently desyncs train vs inference and the model degrades with no failing test. The clock-order convention is declared 'frozen' but frozen-by-convention across two languages is exactly the kind of coupling that drifts.",
+    "suggested_addition": "Designate ONE canonical adjacency definition (the pure Kotlin `buildNeighborIndex` spec) and make the Python builder a documented mirror with a generated golden-vector fixture: emit a set of real Medium/Tiny maps' neighbor_index from the live engine, freeze them as test data, and assert BOTH the Python-pure builder AND the JVM inference path reproduce them byte-for-byte. Add a contract note that any edit to offsets/wrap logic must regenerate the golden vectors.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Python train builds neighbor tensors from `spatial_coords` (pure function); JVM **inference builds from the live TileMap in `forwardRich`**",
+      "tests chain Python-pure == Kotlin-pure (adjacency parity) and Kotlin-pure == live-engine (fidelity) so inference (live engine) is transitively covered"
+    ]
+  },
+  {
+    "title": "Phase A validates GNN-only but AC1 ships the full stack \u2014 confound between fix and capacity",
+    "severity": "major",
+    "primary_lens": "architecture",
+    "target_file": "brief.md",
+    "target_section": "Build sequencing / Acceptance (AC1)",
+    "description": "Phase A trains a GNN-only net to answer 'does restoring 2D locality beat the pool?', but the pre-registered success metric AC1 is defined against the full structured encoder (GNN+self-attn+cross-attn+ladder). The brief never states which configuration AC1 is measured on, nor what happens if GNN-only already beats v3 (is the rest of the stack then unfalsifiable scope?).",
+    "rationale": "From an architecture standpoint, layering attention + cross-attention + a capacity ladder on top of the diagnosed fix means a positive AC1 result cannot attribute the win to any single subsystem \u2014 every abstraction above the GNN must still earn its existence, and the success metric as written can't tell you whether it did.",
+    "suggested_addition": "State explicitly which encoder configuration AC1's 200-game Medium z-test runs on (presumably the best ladder rung of the full stack). Add a secondary checkpoint: record the Phase-A GNN-only Medium result as a named sub-metric, so the marginal value of D4/D5/D6 over GNN-only is observable rather than bundled. Define what happens if GNN-only already passes (ship GNN-only vs. continue layering).",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "train a **GNN-only** structured net and check Medium. This is the minimum to test \"does restoring 2D locality beat the pool?\"",
+      "the structured encoder BEATS the v3 rich-pool on **Medium** at **p<0.05**"
+    ]
+  },
+  {
+    "title": "Entity\u2194node join (D4/FND-0036) creates a hidden dependency cycle in encoder data flow",
+    "severity": "major",
+    "primary_lens": "architecture",
+    "target_file": "brief.md",
+    "target_section": "D4 \u2014 entity\u2194node join",
+    "description": "D4 fuses each entity token with its co-located GNN node embedding (via tile-index), then runs entity self-attention; D5 then feeds [GNN nodes \u2295 entity tokens] as cross-attention K/V. This means entity tokens depend on GNN node outputs, and the cross-attention K/V set mixes already-fused entities with the same nodes \u2014 risking double-counting of node information and an unclear computation order if a tile-index is stale or points at a sentinel.",
+    "rationale": "The dependency direction between the GNN, entity self-attention, and cross-attention is not made explicit, and a join keyed on `currentTile.zeroBasedIndex` has no stated guard for the case where an entity's tile-index is invalid, out of range, or collides with the sentinel row N \u2014 exactly the kind of leaky cross-module coupling that produces silent wrong embeddings.",
+    "suggested_addition": "Add a dataflow diagram/ordering statement: GNN \u2192 per-node embeddings \u2192 entity fusion (gather by tile-index, with bounds-assert 0\u2264idx<N, NOT the sentinel) \u2192 entity self-attention \u2192 cross-attention over [nodes \u2295 fused-entities]. Specify whether fused-entity node info is intentionally present in both the entity tokens AND the K/V node set, and confirm the tile-index bounds-check applies to the entity-join gather, not only the neighbor gather.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "gather the entity's co-located GNN node embedding via its tile-index (D1.3) and concat/add into the entity token",
+      "K/V `[GNN nodes \u2295 entity tokens]` with the union mask"
+    ]
+  },
+  {
+    "title": "Train/eval-gap signal is a 'soft proxy' but is a hard gate input for ladder scaling",
+    "severity": "major",
+    "primary_lens": "architecture",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder",
+    "description": "The SCALE-UP decision requires 'train/eval-gap-small', but the brief admits this is a 'calibrated value_loss-trend proxy (documented soft signal)' because the value head is small-init and no held-out train win-rate exists. A soft, self-admittedly weak signal is wired directly into a hard control-flow gate that determines how much capacity gets built.",
+    "rationale": "An abstraction whose semantics are 'we're not really sure this measures what we claim' should not be a load-bearing branch condition; if the proxy is noisy, the ladder will either over-scale (worsening the confounded Medium result) or stop early, and there's no stated calibration procedure or fallback when the proxy and the win-rate trend disagree.",
+    "suggested_addition": "Either demote train/eval-gap from a required AND-condition to a reported diagnostic, OR specify the calibration: what value_loss-trend threshold counts as 'gap-small', measured how, validated against what. Define behavior when the proxy contradicts the eval-win-rate-rising signal (which wins?). State this proxy's limitation in the AC1 confound discussion since it's the mechanism meant to detect the undertraining the diagnosis warned about.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Train/eval-gap is a **calibrated value_loss-trend proxy** (documented soft signal \u2014 the value head is small-init so early value_loss is tiny",
+      "**SCALE UP** one rung iff (rising **AND** throughput \u226570% baseline **AND** train/eval-gap-small)"
+    ]
+  },
+  {
+    "title": "Fingerprint gate forces full dataset regeneration but no migration/cost path is stated",
+    "severity": "minor",
+    "primary_lens": "architecture",
+    "target_file": "brief.md",
+    "target_section": "D1.5 / Risks",
+    "description": "Bumping SampleSchema.VERSION 2\u21923 and adding the spatial_coords block changes the ruleset fingerprint, which correctly causes old shards to be refused fail-loud. The brief treats datasets as 'perishable by design \u2014 regenerate' but never states the regeneration cost or whether any v3 baseline shards must be re-emitted for the budget-held-constant comparison to be apples-to-apples.",
+    "rationale": "The headline AC1 comparison hinges on 'identical budget vs the v3 rich-critic Medium run'; if v3's recorded run used contract-v2 shards that are now refused, the comparison may require re-running v3 under the new emit path, which is a real dependency the brief doesn't acknowledge.",
+    "suggested_addition": "Clarify whether the v3 rich-critic baseline numbers are reused as-recorded or re-generated under contract-v3 emit, and confirm the budget-constant comparison does not silently mix a v2-shard v3 run against a v3-shard v4 run. State the approximate regeneration cost so the timeline reflects it.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "fingerprint changes via new block/header (old shards correctly refused \u2014 regenerate)",
+      "\"Budget held constant\" := identical ... as the v3 rich-critic Medium run"
+    ]
+  },
+  {
+    "title": "Partial silent fallbacks will silently corrupt the experiment data",
+    "severity": "critical",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "Non-negotiable constraints (FND-0016)",
+    "description": "The brief aborts a rung if `onnx_decisions == 0` to prevent the silent heuristic fallback from polluting results. However, if the ONNX model crashes on 99% of turns but succeeds on 1%, `onnx_decisions` will be > 0, and the experiment will silently record a blend of heuristic and model performance.",
+    "rationale": "Silent partial failures in ML pipelines invalidate the data. The failure domain must be strictly isolated: if the model is being evaluated, it must make all the decisions, or the run must fail.",
+    "suggested_addition": "Change the fail-loud condition from `onnx_decisions == 0` to a strict completeness check (e.g., `onnx_decisions == total_decisions` or a >99% threshold). If the model falls back to the heuristic for more than a negligible fraction of turns, the rung must abort.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "A rung whose data-gen/eval onnx_decisions == 0 aborts fail-loud",
+      "the silent FairOpponentModel fallback must never be reported as model results"
+    ]
+  },
+  {
+    "title": "Native memory leak via unclosed OrtSession in benchmark loop",
+    "severity": "critical",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "D8 \u2014 Throughput guard",
+    "description": "The design meticulously mandates closing tensors in a `finally` block, but omits the lifecycle of the ONNX `OrtSession` and `OrtEnvironment`. When D8 repeatedly loads and discards policies to benchmark different rungs, orphaned sessions will leak native memory until the JVM suffers a hard OOM crash.",
+    "rationale": "Native memory leaks in the JVM bypass standard garbage collection and heap limits, leading to unpredictable, unrecoverable process crashes that are notoriously difficult to debug during on-call incidents.",
+    "suggested_addition": "Require `OnnxPolicy` to implement `AutoCloseable` (or equivalent) to explicitly close the `OrtSession` and `OrtEnvironment`. Ensure the benchmark and eval loops explicitly call this cleanup when discarding a policy.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "All tensors closed in finally (:136,186,201).",
+      "EXTEND SimBenchmark with an ONNX-policy rung mode... Measure data-gen turns/s + ms/decision"
+    ]
+  },
+  {
+    "title": "Silent NaN guard will cause infinite compute waste on divergence",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder + demand-driven scaling",
+    "description": "The existing `train.py` NaN guard silently restores the last-good state. If the new, more complex structured encoder is unstable and diverges, the training loop will repeatedly hit NaNs, restore, and retry, spinning uselessly and burning compute budget without making progress.",
+    "rationale": "SREs treat silent retries that mask systemic failures as an anti-pattern. A diverging model is a failed state, not a transient network error; swallowing it wastes resources and delays alerting.",
+    "suggested_addition": "Update the ladder orchestration to track divergence events. If a rung hits the NaN guard (or hits it more than N times), treat it as a hard rung failure (identical to an OOM) and abort the rung, rather than silently continuing.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "NaN/divergence guard restores last-good and never exports"
+    ]
+  },
+  {
+    "title": "SIGKILL OOM handling will corrupt non-atomic state files",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder + demand-driven scaling",
+    "description": "The ladder relies on OS-level SIGKILL (rc 137) to detect OOMs, meaning the Python process dies instantly. While the design mandates atomic writes for the ONNX export, it does not mandate atomic writes for training checkpoints or the ladder's progress JSON. A SIGKILL during these writes will corrupt the state.",
+    "rationale": "If a system is designed to be killed by the OS as a standard control-flow mechanism (OOM detection), all persistent state writes must be atomic, otherwise the run cannot be safely resumed or debugged.",
+    "suggested_addition": "Extend the atomic write requirement (`.tmp \u2192 rename`) to all state files written by the training loop, specifically the PyTorch checkpoints and the ladder's eval/progress JSON.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "ladder rejects OOM rung (SIGKILL rc 137)",
+      "atomic export (.tmp \u2192 rename, like ShardFormat"
+    ]
+  },
+  {
+    "title": "Scope mandates full attention stack without defining a minimum viable increment for the success metric",
+    "severity": "critical",
+    "primary_lens": "outcomes",
+    "target_file": "plan.md",
+    "target_section": "Build sequencing",
+    "description": "The brief requires all three phases (GNN, self-attention, cross-attention) even though the pre-registered success metric (AC1 \u2014 beat v3 on Medium) could be achieved by Phase A (GNN\u2011only). There is no explicit gate to stop and ship if Phase A already meets the metric, forcing the team to build complexity that may add risk without measurable user value.",
+    "rationale": "In product execution, shipping the simplest thing that could possibly work reduces risk, schedule, and maintenance burden. A defined stop\u2011after\u2011Phase\u2011A gate prevents building speculative attention layers that the success metric does not require.",
+    "suggested_addition": "In \u00a7Build sequencing, add: **Gate G1 (after Phase A):** Train the GNN\u2011only model and evaluate on Medium. If it already beats v3 at p<0.05, **stop** and ship the GNN\u2011only variant as v4 launch; self\u2011attention and cross\u2011attention become stretch goals for v4.1. If it does not beat v3, then proceed to Phase B. This ensures the shipped encoder is no more complex than necessary to meet the declared success criterion.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Phase A (the diagnosed fix + export risk \u2014 validate before layering): D1 emit + D9 contract/bridge + D2 embeddings + D3 GNN + D10 parity & small-rung export smoke \u2192 train a GNN\u2011only structured net and check Medium.",
+      "(The spec mandates the full stack; sequencing front-loads the diagnosed fix and the export risk \u2014 it does not drop scope.)"
+    ]
+  },
+  {
+    "title": "Self\u2011attention and cross\u2011attention lack measurable success criteria",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "plan.md",
+    "target_section": "Deliverables D4, D5",
+    "description": "The brief describes D4 (self\u2011attention over entity sets) and D5 (cross\u2011attention) in detail but provides no measurable success criterion for these components. Their incremental contribution to the overall success metric is not pre\u2011registered, and there is no plan to validate them through ablation or incremental evaluation.",
+    "rationale": "Without per\u2011component metrics, these complex modules become 'hope\u2011ware' \u2014 they add technical debt and export risk without proven user benefit. A product manager would insist on a falsifiable test for each component so that if it doesn't deliver a statistically significant improvement, it is dropped rather than shipped.",
+    "suggested_addition": "In \u00a7Deliverables, add for D4 and D5: **Per\u2011component success metric:** After Phase A establishes the GNN\u2011only baseline, each subsequent addition (self\u2011attention, cross\u2011attention) must be evaluated via an ablation using the same evaluation protocol. A component is accepted only if it yields a statistically significant improvement over the previous configuration on Medium (p<0.05, two\u2011proportion z) *without* causing a Tiny regression. If a component fails to improve, it is dropped and the earlier configuration is shipped. The full stack is only shipped if each successive component clears this gate.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "D4 \u2014 Self-attention over entity sets + entity\u2194node join",
+      "D5 \u2014 Cross-attention"
+    ]
+  },
+  {
+    "title": "Success metric is relative to a broken baseline, not to the true user goal",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "plan.md",
+    "target_section": "Pre-registered, falsifiable success metric (AC1)",
+    "description": "AC1 requires only that structured encoder beats v3 rich\u2011pool on Medium (p<0.05). The user's real goal is for the rich critic to not be worse than the blind critic (which wins 28.9% on Medium vs v3's 14.7%). Beating a known\u2011broken baseline could still leave the model far below the blind critic, failing to deliver the intended outcome.",
+    "rationale": "A product metric should measure whether the feature closes the gap to the simple blind baseline \u2014 the value that users actually care about. A relative\u2011only metric risks declaring success when the model is still non\u2011competitive, leading to false confidence and wasted follow\u2011on investment.",
+    "suggested_addition": "Add a **second pre\u2011registered metric (AC2):** \u201cThe structured encoder achieves non\u2011inferiority against the blind critic on Medium (one\u2011sided two\u2011proportion z, p>0.05, where the hypothesis is that the structured encoder\u2019s win\u2011rate is less than the blind critic\u2019s) under the same evaluation budget and seeds.\u201d This confirms that adding spatial structure no longer makes the rich critic worse than the simplest baseline.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "the structured encoder BEATS the v3 rich-pool on Medium at p<0.05",
+      "v3 rich-critic \u2026 14.7% vs blind 28.9%"
+    ]
+  },
+  {
+    "title": "Undertraining confound contingency is passive; no active experiment to decouple capacity from training regime",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "plan.md",
+    "target_section": "Confound (stated plainly)",
+    "description": "The brief acknowledges the from\u2011scratch\u2011per\u2011round training regime may undermine v4, but only recommends weight\u2011carryover as a follow\u2011up. There is no concrete, pre\u2011committed contingency that would run a small weight\u2011carryover experiment if v4 fails in order to isolate whether the architectural improvement is valuable when decoupled from the training limitation.",
+    "rationale": "Without a pre\u2011defined contingency, a null result could waste the insight that the structured encoder might still be superior under a better training schedule. A product\u2011focused plan would commit to a cheap, immediate follow\u2011up experiment so that the architectural investment can be properly evaluated, not just shelved.",
+    "suggested_addition": "In \u00a7Confound, add: **Contingency:** \u201cIf the final v4 result does not beat v3 at p<0.05, immediately run a lightweight weight\u2011carryover experiment on Medium using the best\u2011performing rung (no ladder, 1\u20112 rounds of fine\u2011tuning, same evaluation budget). This experiment is time\u2011boxed to 4 additional compute\u2011hours and its result is reported alongside the main experiment to guide the decision on whether to invest in a permanent training\u2011regime fix.\u201d",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Weight-carryover remains the recommended follow-up if the result is ambiguous.",
+      "the recorded v2 diagnosis \u2026 warns that adding capacity could make Medium worse"
+    ]
+  },
+  {
+    "title": "No definition of 'done' for shipping the feature into the self\u2011play pipeline",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "plan.md",
+    "target_section": "Verification (what proves it)",
+    "description": "The verification section lists tests, export smoke, benchmark, and the experiment, but it does not define the acceptance criteria under which `--variant structured` becomes a shippable, default\u2011ready artifact that the self\u2011play loop can use in place of the existing rich critic. The end state described is an experiment, not an integrated feature.",
+    "rationale": "A shipped feature must be usable by the target workflow without manual heroics. Without a clear 'done' definition \u2014 e.g., the model passes all parity tests, can be trained and exported end\u2011to\u2011end, and seamlessly replaces the v3 critic in a self\u2011play round \u2014 the team may stop at experiment completion and never deliver the integrated experience.",
+    "suggested_addition": "Add a new \u00a7Shipping criteria: \u201cAfter experiment, **done** means: (1) `StructuredPolicyValueNet` passes all tests (parity, roundtrip, contract\u2011refusal, legality, export smoke); (2) `run_loop --variant structured` trains, exports, and evaluates models on Tiny and Medium without manual steps; (3) the exported ONNX is accepted by `OnnxPolicy` and can serve as a data\u2011generation model in a full self\u2011play round (validated by a one\u2011round smoke test); (4) the ladder automatically selects the best rung per the defined gates; (5) `--variant structured` is documented and the user can switch from v3 to v4 with a single flag change.\u201d",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Verification (what proves it): \u2026 `run_loop --variant structured` Tiny+Medium curves",
+      "the structured encoder BEATS the v3 rich-pool on Medium"
+    ]
+  },
+  {
+    "title": "Ladder gates still contain non-testable thresholds",
+    "severity": "critical",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder + demand-driven scaling",
+    "description": "The ladder controls which rung is trained, rejected, or shipped, but two decision inputs are not concretely testable: \"train/eval-gap-small\" and \"within noise band\". The brief says the gap is a calibrated value_loss-trend proxy and a soft signal, but does not define the numeric threshold, calibration dataset, window, or pass/fail rule.",
+    "rationale": "QA cannot write deterministic acceptance tests for rung scaling or stopping if a reviewer can interpret the same curve differently. This is especially risky because the ladder can mask a failed encoder by stopping early or selecting a different rung.",
+    "suggested_addition": "Add explicit ladder acceptance rules: `train/eval-gap-small := <metric> <= <threshold> over rounds <N..M>`; `noise band := absolute win-rate delta <= X percentage points OR z-test p >= Y`; `value_loss-trend proxy := slope/value over exact window W with threshold T`. Include 3 example rung histories with expected decisions: scale, stop-no-improve, reject-undertraining.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "\"SCALE UP one rung iff (rising AND throughput \u226570% baseline AND train/eval-gap-small)\"",
+      "\"STOP when a rung's final eval \u2264 the previous rung's (within noise band)\""
+    ]
+  },
+  {
+    "title": "Throughput guard lacks a reproducible measurement protocol",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "D8 \u2014 Throughput guard",
+    "description": "The 70% throughput requirement is testable in principle, but the brief does not specify repetitions, warmup, statistic used, hardware/CPU thread constraints, variance tolerance, or whether PASS is based on p50/p95/mean turns/s. `ms/decision` is reported but no acceptance budget is defined for it.",
+    "rationale": "Performance tests are noisy; without a fixed protocol, a rung could pass or fail depending on machine load or which BENCH run QA happens to use. This makes the non-negotiable throughput guard hard to reproduce in CI or release validation.",
+    "suggested_addition": "Define D8 as: run benchmark with fixed seed set S, warmup W turns, R repetitions, single-thread/MT mode specified, and PASS iff median turns/s across R runs is >= 70% of the median heuristic baseline measured in the same process/session. Also state whether `ms/decision` has an informational-only or blocking threshold, e.g. `p95 ms/decision <= X`.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "\"REJECT a rung < 70% of the heuristic baseline turns/s.\"",
+      "\"Measure data-gen turns/s + ms/decision; emit a `BENCH| RUNG verdict=PASS|REJECT` line\""
+    ]
+  },
+  {
+    "title": "AC1 does not define outcome accounting for eval games",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "TL;DR \u2014 success metric / D10 \u2014 experiment",
+    "description": "The Medium and Tiny z-tests are pre-registered, but the brief does not define how draws, timeouts, crashed games, zero-ONNX-decision games, resignations, or invalid eval runs enter the numerator and denominator. It also says fixed seeds but does not list or locate the seed set QA should use.",
+    "rationale": "Two-proportion tests are only reproducible if the exact success/failure accounting is fixed before the run. Otherwise, teams can unintentionally change the denominator or exclude bad games and alter the p-value.",
+    "suggested_addition": "Add an eval accounting rule: `success = structured civ win; failure = loss or draw unless explicitly excluded`; `exclude only runs with infrastructure crash before turn 1; any game with onnx_decisions == 0 invalidates the entire eval`; `timeouts count as losses after T`. Store the exact Tiny/Medium final-eval seeds in `<path>` and require the report to include wins/losses/draws/exclusions plus the computed z and p.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "\"BEATS the v3 rich-pool on Medium at p<0.05 (two-proportion z, structured as p1, over the final 200-game eval)\"",
+      "\"fixed seeds, + a 200-game final eval\""
+    ]
+  },
+  {
+    "title": "Frozen training-core constraint has no verification gate",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "Non-negotiable constraints / Verification",
+    "description": "The brief makes `_optimize_actor_critic`, `compute_gae`, and the training core untouchable, but the verification list does not say how QA will prove they were not modified. Existing behavior tests may still pass after subtle reward, GAE, PPO, or terminal-value changes.",
+    "rationale": "This is a load-bearing experimental-control requirement: if the training core changes, the v3 vs v4 comparison is no longer testing only the encoder swap. QA needs a mechanical guard, not reviewer memory.",
+    "suggested_addition": "Add a CI check or review gate: compare the source hash or exact diff ranges for `compute_gae`, `_optimize_actor_critic`, and `train_actor_critic_rich` against base commit `5ac0a3cf6`; fail unless changes are limited to wiring in `StructuredPolicyValueNet`. Include the hash/diff evidence in the experiment report.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "\"Frozen seam `forward(inputs:dict)\u2192(tech_logits,policy_logits,tanh(value))`; `_optimize_actor_critic`, `compute_gae`, `train_actor_critic_rich` core UNTOUCHED\"",
+      "\"The frozen training core (`_optimize_actor_critic`/`compute_gae`/terminal-reward+critic) is untouched \u2014 only the `nn.Module` is swapped.\""
+    ]
+  },
+  {
+    "title": "NaN-safe attention is a non-negotiable without direct tests",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "Non-negotiable constraints / D4 \u2014 Self-attention / Verification",
+    "description": "The brief requires NaN-safety everywhere masks are applied and describes fully-masked entity sets yielding zeros, but the verification matrix does not include a direct unit/property test for the hand-rolled attention mask paths. Rich-logits parity may not exercise every all-empty or mixed-mask case across each entity set and attention layer.",
+    "rationale": "Masked softmax over all `-inf` is a classic NaN source. Because this is a non-negotiable export/runtime correctness requirement, QA needs targeted tests that fail exactly on NaN/Inf behavior rather than relying on broad integration parity.",
+    "suggested_addition": "Add `python/tests/test_structured_attention_masks.py`: parameterize each entity set with all-zero masks, single-real-token masks, mixed masks, and all-missing neighbor masks; assert `torch.isfinite` for tech logits, policy logits, and value, and assert fully-masked self-attention outputs are exactly zero before fusion. Add an ORT export smoke variant for the all-empty entity-set fixture.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "\"NaN-safe everywhere masks are applied (mirror `masked_pool` guards) \u2014 incl. hand-rolled attention\"",
+      "\"a fully-masked entity set yields zeros ... never NaN\""
+    ]
+  },
+  {
+    "title": "OOM DoS (Tensor Bomb) via Unbounded Entity Sets",
+    "severity": "critical",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "D4 \u2014 Self-attention over entity sets + entity\u2194node join",
+    "description": "The design relies on the Kotlin featurizer to cap entity-set sizes, assuming `M` is bounded. However, a maliciously crafted save file or poisoned dataset shard could contain tens of thousands of units. Because self-attention is O(M\u00b2), this will cause an immediate GPU/CPU Out-Of-Memory crash during Python training or JVM inference.",
+    "rationale": "Never trust the data plane (client) to enforce algorithmic complexity bounds on the ML pipeline (server). An attacker can trivially DoS the training loop or game client by providing a shard that bypasses expected game limits.",
+    "suggested_addition": "Add a hard defensive truncation in Python (e.g., `tokens = tokens[:, :256, :]`) and JVM before feeding entity sets into the attention layer, ensuring the O(M\u00b2) matrix allocation always survives malformed or maliciously large inputs.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Entity-set sizes are capped by the featurizer (maxCivTokens=40 + unit/city caps) \u2192 M bounded, no unbounded quadratic"
+    ]
+  },
+  {
+    "title": "JNI Segfault via zeroBasedIndex Desync in ONNX Gather",
+    "severity": "critical",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "D9 \u2014 Contract growth + multi-tensor bridge",
+    "description": "Kotlin's `buildSpatial` silently skips tiles if `tile.zeroBasedIndex` exceeds array bounds. However, `forwardRich` builds `neighbor_index` using those same raw `zeroBasedIndex` values. If a manipulated save file contains a tile with an artificially high index, it will be written into `neighbor_index` but omitted from the spatial tensor. ONNX `Gather` will then read out of bounds, causing a C++ JNI segfault that instantly kills the JVM.",
+    "rationale": "In a JNI environment, out-of-bounds tensor reads do not throw catchable Java exceptions\u2014they cause hard process crashes. Trusting raw save-file indices directly in memory-unsafe operations is a critical vulnerability.",
+    "suggested_addition": "In `OnnxPolicy.kt`, explicitly clamp or filter `neighbor_index` values to ensure no index exceeds the *actual* `n_spatial` dimension of the built spatial tensor, replacing any out-of-bounds references with the sentinel index `N`.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "forwardRich builds neighbor tensors from gameInfo.tileMap via real getIfTileExistsOrNull",
+      "bounds-check 0\u2264idx\u2264N before tensor build (FND-0027)"
+    ]
+  },
+  {
+    "title": "Out-Of-Bounds PyTorch Crash via Modded Categorical Indices",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "D2 \u2014 Embeddings (model)",
+    "description": "The `owner_slot` embedding table size is hardcoded to 42 based on a standard `maxCivTokens=40`. If a shard is generated from a modded game with >40 civs, it will contain slot indices \u2265 41. When fed into PyTorch's `nn.Embedding(42)`, this throws a hard C++ Out-Of-Bounds exception, crashing the Python training process.",
+    "rationale": "Data pipelines must be resilient to schema drift and modded data. Unhandled exceptions in the training loop allow a single poisoned shard to halt the entire offline RL pipeline.",
+    "suggested_addition": "The Python data loader must explicitly clamp or modulo all categorical inputs to `num_embeddings - 1` (e.g., `torch.clamp(tokens, max=41)`) before the embedding lookup, treating out-of-bounds indices as the unknown/sentinel slot.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "owner_slot & unit_owner_slot share a slot table size 42 (maxCivTokens 40 +2; reindex 255\u219241)"
+    ]
+  },
+  {
+    "title": "Path Traversal and Command Injection in Evaluation Loop",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "D10 \u2014 Parity + experiment",
+    "description": "The experiment runner uses CLI arguments (`--variant`) to orchestrate file paths and invokes the JVM via `./gradlew selfPlay --args=...`. If the `--variant` argument is not sanitized, an attacker or malicious CI script could supply a payload like `../../../etc/cron.d/malicious` to achieve arbitrary file overwrite during the atomic ONNX export, or inject Gradle/shell flags.",
+    "rationale": "Untrusted input flowing into file paths and subprocess arguments is a classic vector for privilege escalation and arbitrary code execution in ML pipelines.",
+    "suggested_addition": "Add strict regex validation (e.g., `^[a-zA-Z0-9_-]+$`) to `args.variant` in `run_loop.py`. Ensure all subprocess calls to Gradle use absolute paths and strict argument lists without shell interpolation.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Experiment: run_loop --variant structured",
+      "atomic export (.tmp \u2192 rename, like ShardFormat \u2014 FND-0014)"
+    ]
+  },
+  {
+    "title": "No resource usage tracking per rung \u2014 cost of experiments opaque",
+    "severity": "major",
+    "primary_lens": "cost",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder + demand-driven scaling",
+    "description": "The ladder makes decisions based on throughput and eval improvement, but never records wall-clock time, peak memory, or GPU utilization per run. Without this data, the team can't right-size later experiments or quantify whether a large rung's cost is justified by its marginal improvement.",
+    "rationale": "FinOps requires cost-per-unit visibility. Without resource consumption logs, the cost per model rung or per experiment is a blind spot, leaving future experiments with no baseline for budgeting or optimization.",
+    "suggested_addition": "Add to D7: 'Log training wall-clock time, peak memory (RSS), and generation/eval times per rung. Emit a `COST|` line in run_loop output with these metrics so experiments are self-documenting for cost analysis.'",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "D7 \u2014 Capacity ladder + demand-driven scaling",
+      "Record signals + decision per rung."
+    ]
+  },
+  {
+    "title": "OOM failures waste compute with no pre-flight memory estimation",
+    "severity": "major",
+    "primary_lens": "cost",
+    "target_file": "brief.md",
+    "target_section": "D7 \u2014 Capacity ladder + demand-driven scaling",
+    "description": "The ladder relies on process SIGKILL (exit 137) to detect OOM, which means a training step may run for minutes before exceeding memory and being killed, wasting that compute. A lightweight memory pre-check could reject a rung before the expensive training attempt.",
+    "rationale": "Wasted GPU/CPU cycles are direct costs. A rough memory model (e.g., num_params * bytes + batch * tile * hidden) could prevent futile launches, especially on resource-limited machines where OOM is likely.",
+    "suggested_addition": "Before launching a training round for a new rung, run a quick memory estimation: compute expected memory from model parameter count, batch size, and tile count. If > available memory, reject with 'rung rejected (OOM risk)' and skip training, saving the compute.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "OOM/failure handling (FND-0010/0011): the train rung runs under a memory cap + wall-clock timeout; an abnormal exit \u2192 \"rung rejected (train failed, likely OOM); micro-batching = future work\"",
+      "micro-batching = future work (future work); edge-list emission; inference circuit-breaker/telemetry"
+    ]
+  },
+  {
+    "title": "No wall-time budget cap per experiment, risking runaway costs",
+    "severity": "major",
+    "primary_lens": "cost",
+    "target_file": "brief.md",
+    "target_section": "TL;DR \u2014 how this solves the ask",
+    "description": "The experiment budget is held constant only in 'rounds=8, gen-games/round=16, eval-games/round=80'. However, the wall time for a round can vary dramatically between small and large rungs (e.g., 2\u00d7 larger model may run 4\u00d7 slower per step). Without a time budget, an experiment could consume vastly more compute than the v3 baseline, undermining the 'budget held constant' claim in practical terms.",
+    "rationale": "FinOps cares about actual compute cost, not just 'number of rounds'. If the experiment takes 10\u00d7 the wall time of v3, that's effectively a 10\u00d7 cost increase, even if the round count is identical. A time cap guardrails this.",
+    "suggested_addition": "Add a non-negotiable constraint: 'Maximum experiment wall-clock time = 3\u00d7 the v3 rich-critic Medium run's wall time (from prior logs). If any rung would exceed this under linear extrapolation of per-round time, scale-down or exit early.' Log total time at experiment end and report alongside the z-test.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Budget held constant := identical (rounds=8, gen-games/round=16, eval-games/round=80, opponent=RandomPolicy, fixed seeds, + a 200-game final eval) as the v3 rich-critic Medium run (FND-0030/0017).",
+      "A null/negative result is an accepted, reported outcome (the user accepted the confound), not a ship-blocker"
+    ]
+  },
+  {
+    "title": "Throughput guard may be gamed by cheap baseline, masking expensive models",
+    "severity": "major",
+    "primary_lens": "cost",
+    "target_file": "brief.md",
+    "target_section": "D8 \u2014 Throughput guard",
+    "description": "The guard rejects a rung if its throughput is <70% of the heuristic baseline turns/s. If the heuristic baseline is trivially fast (sub-millisecond per decision), a model that is 5\u00d7 slower might still pass the guard, yet multiply the total experiment cost by 5\u00d7. The 70% threshold is arbitrary and decoupled from actual cost per decision.",
+    "rationale": "A FinOps review asks: what is the cost per unit of work? Trading a tiny performance gain for a 3\u00d7 slowdown would be flagged. The guard should enforce a maximum absolute cost per inference (e.g., ms/decision < X ms) rather than a relative one that can be satisfied by an extremely cheap baseline.",
+    "suggested_addition": "Supplement the 70% relative gate with an absolute ms/decision ceiling derived from prior v3 rich-critic runs (e.g., max 5 ms/decision on target hardware). If any rung exceeds that absolute threshold, reject regardless of relative score. This couples the guard to real compute constraints, not an artificial baseline.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "D8 \u2014 Throughput guard (extends existing SimBenchmark): \u2026 REJECT a rung < 70% of the heuristic baseline turns/s.",
+      "SimBenchmark already exists (10.7 KB) \u2026 material change: the benchmark was added to measure the heuristic baseline turns/s"
+    ]
+  },
+  {
+    "title": "No cost-benefit analysis for added encoder capacity",
+    "severity": "major",
+    "primary_lens": "cost",
+    "target_file": "brief.md",
+    "target_section": "TL;DR \u2014 how this solves the ask",
+    "description": "The plan invests embeddings, GNN, self-attention, and cross-attention into the encoder but never specifies what cost increase is acceptable for what performance gain. The experiment only checks if it 'beats v3 on Medium,' but if it wins by a tiny margin while costing 10\u00d7 more compute, that might not be a worthwhile investment from a FinOps perspective.",
+    "rationale": "FinOps evaluates cost proportional to value. Without an upfront statement of tolerable cost increase, the team risks building an expensive solution that barely clears the statistical bar, while a simpler (and cheaper) encoder might achieve nearly the same result.",
+    "suggested_addition": "Define a secondary cost-efficiency metric: 'Max acceptable cost multiplier = 2\u00d7 the v3 rich-critic's total compute (wall-time\u00d7cores). If the winning rung exceeds that multiplier, the experiment is marked as 'cost-inefficient' and the recommendation is to investigate cheaper optimizations before adoption.'",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Pre-registered, falsifiable success metric (AC1): the structured encoder BEATS the v3 rich-pool on Medium at p<0.05\u2026",
+      "Risk 4: v4 worse on Medium under from-scratch training \u2026 budget held constant"
+    ]
+  },
+  {
+    "title": "Hex clock-order convention asserts neighbor 0 = (+1,+1) without engine-tile-edge basis",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "brief.md",
+    "target_section": "D3 \u2014 Hex GNN (gather, not scatter)",
+    "description": "The brief freezes a clock order `[(+1,+1),(0,+1),(-1,0),(-1,-1),(0,-1),(+1,0)]` and claims it mirrors `getIfTileExistsOrNull` branch A/B/C/D, but Unciv's true hex adjacency is defined by `HexMath.clockPositionToHexcoordMap` (12/0,2,4,6,8,10) and `tile.neighbors`/`getNeighborTiles`. The brief explicitly chooses NOT to use `tile.neighbors` and instead re-derives offsets \u2014 but `getIfTileExistsOrNull` is a generic coord lookup, NOT the hex adjacency definition. There is no stated proof that walking these 6 offsets reproduces the domain's actual notion of 'adjacent tile.'",
+    "rationale": "If the 6 offsets don't match Unciv's real hex adjacency (which is the whole domain concept the GNN is supposed to encode), the model learns spatial relations that don't correspond to in-game adjacency \u2014 the encoder restores the wrong locality and AC1 tests a confounded hypothesis.",
+    "suggested_addition": "Add a domain anchor: state that the 6 offsets are derived from `HexMath.clockPositionToHexcoordMap` (the engine's adjacency definition), and that the engine-fidelity test (D10 test 3) must compare against `tile.neighbors`/`getNeighborTiles` semantics \u2014 NOT merely `getIfTileExistsOrNull` over hand-picked offsets \u2014 to prove the gathered neighbors ARE the game's adjacent tiles.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "for each\ntile\u00d7direction (clock order `[(+1,+1),(0,+1),(-1,0),(-1,-1),(0,-1),(+1,0)]`) computes (nx,ny), direct lookup, then\nworld-wrap retry",
+      "via real `getIfTileExistsOrNull` over the 6 offsets in clock order (sentinel+mask0 for null) \u2014 **NOT `tile.neighbors`**\n(null-filtered, loses degree-6 slots)"
+    ]
+  },
+  {
+    "title": "Entity\u2194node fusion uses zeroBasedIndex but visibility/fog rules differ between spatial and tokens",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "brief.md",
+    "target_section": "D4 \u2014 Self-attention over entity sets + entity\u2194node join",
+    "description": "D4 fuses each entity (unit/city token) with its co-located GNN node embedding via tile-index. But the spatial channels are gated by visibility (`if(!visible) continue` skips owner/units/improvement), while opponent unit/city tokens may be emitted under different visibility/espionage rules. An opponent unit token may point to a tile node whose features were never populated (fog), so the fused node embedding is the sentinel/empty row \u2014 silently grounding the entity on a blank tile.",
+    "rationale": "The domain has asymmetric information (fog of war, espionage); fusing an entity with a node that was zeroed by visibility rules misrepresents what the acting civ actually knows, corrupting the very 'grounding on the board' D4 claims to provide.",
+    "suggested_addition": "Specify the visibility contract for entity\u2194node fusion: state whether opponent entity tokens are only emitted for visible/known tiles, and what the fused node embedding represents when the co-located tile is fogged (e.g., a fog node carries terrain/coords only). Add a test that an opponent unit on a fogged tile fuses with a node consistent with the acting civ's knowledge, not a contradiction.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "gather the entity's co-located GNN node embedding\nvia its tile-index (D1.3) and concat/add into the entity token \u2014 grounding the entity on the board",
+      "out[base + 7] = (tile.getOwner()...  // after  if (!visible) continue"
+    ]
+  },
+  {
+    "title": "effWrapRadius for rectangular maps assumes width/2 == wrap distance \u2014 domain check missing",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "brief.md",
+    "target_section": "D1.2 / D-wrap-radius",
+    "description": "The brief pre-resolves `effWrapRadius = if(shape==rectangular) width/2 else radius`. But Unciv's world-wrap is a property of the map (`worldWrap` flag) and the wrap distance for rectangular maps depends on the actual grid layout. The brief asserts this equals `width/2` to mirror `getIfTileExistsOrNull`, but rectangular Unciv maps use offset/hex coordinates where the x-extent and the wrap modulus are not trivially `width/2`.",
+    "rationale": "If the wrap radius is wrong for any rectangular Medium map, neighbor lookups across the wrap seam resolve to the wrong tile or to none, breaking adjacency exactly at the map edge \u2014 and the Medium experiment (the headline AC1) runs on Medium maps where this matters most.",
+    "suggested_addition": "Confirm against the engine that `TileMap.getIfTileExistsOrNull` for rectangular world-wrap maps uses `radius = width/2` (cite the exact source line), and add to the adjacency-parity test (D10 test 2) a rectangular world-wrap map whose `width/2 != radius` with seam tiles, asserting the Python builder resolves the wrapped neighbor to the same tile as the live engine.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "**pre-resolved** `effWrapRadius = if(shape==rectangular) width/2 else radius`",
+      "radius=mapSize.radius (rectangular: width/2)"
+    ]
+  },
+  {
+    "title": "AC1 'beats v3 on Medium' is confounded by undertraining \u2014 success metric may be untestable",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "brief.md",
+    "target_section": "Pre-registered success metric / Confound",
+    "description": "The brief candidly states the recorded v2 diagnosis attributes the Medium regression to undertraining under from-scratch-per-round training, and warns adding capacity could make Medium WORSE \u2014 yet AC1 pre-registers 'structured beats v3 on Medium' as the success metric while leaving the training regime untouched. The business question ('does restoring 2D locality help?') is structurally entangled with the training-regime confound the team chose not to fix.",
+    "rationale": "From a domain standpoint, a pre-registered metric that the team's own root-cause analysis predicts will likely fail for reasons unrelated to the hypothesis under test is a weak experiment \u2014 a null result won't distinguish 'locality doesn't help' from 'undertraining masked it,' which is the actual business question.",
+    "suggested_addition": "Make the decision rule explicit and domain-meaningful: state up front that if the best rung fails AC1 AND the train/eval gap is large (undertraining signature), the canonical next step is to re-run the SAME structured encoder with weight-carryover before concluding locality doesn't help \u2014 so the negative result triggers the right follow-up rather than abandoning the encoder hypothesis.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "the recorded v2\ndiagnosis (memory + RESULTS.md) attributes the Medium regression to *undertraining* under that regime, warning\nthat *adding capacity could make Medium worse*",
+      "the structured encoder BEATS the v3 rich-pool on\n**Medium** at **p<0.05**"
+    ]
+  },
+  {
+    "title": "owner_slot 255\u219241 reindex must preserve 'self vs civ vs none' semantics consistently",
+    "severity": "minor",
+    "primary_lens": "domain",
+    "target_file": "brief.md",
+    "target_section": "D2 \u2014 Embeddings / FND-0037",
+    "description": "The brief reindexes owner_slot 255\u219241 across spatial ch7/ch10 and unit/city owner_slot, sharing a slot table of size 42 (0 none, 1..40 civ, 41 self). But the domain meaning of slot 0 differs by channel: spatial ch7 owner=0 means 'no owner / unowned tile', while unit owner_slot is always a real civ (units always belong to someone). Collapsing these into one shared embedding table risks the model conflating 'unowned tile' with 'unknown/missing unit owner'.",
+    "rationale": "Ownership is a core domain concept with distinct meanings (unowned territory vs. an enemy unit's owner); a shared table that overloads index 0 across semantically different fields can blur a distinction the policy needs to reason about.",
+    "suggested_addition": "Document the slot-table semantics per field: confirm whether index 0 means the same thing for tile-owner (unowned) and unit-owner (sentinel/absent), and either justify the shared table or note that the embedding learns the field-context from the surrounding token. Add an assertion that unit owner_slot is never 0 for a present unit.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "owner_slot & unit_owner_slot\nshare a **slot table size 42** (`maxCivTokens 40 +2`; reindex 255\u219241)",
+      "7 owner_slot (0 none, 1..N civ, 255 self)"
+    ]
+  }
+]

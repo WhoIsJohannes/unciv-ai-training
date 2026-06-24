@@ -1,0 +1,8 @@
+<p>One Medium decision, end to end (<em>illustrative mock values — not measured; sanity-check against the design</em>):</p>
+<ol>
+  <li><strong>Emit (Kotlin):</strong> Featurizer writes spatial[1261×13 u8], spatial_coords[1261×2 f32] (tile 530 → x=−3,y=7), global(…, effWrapRadius=21, worldWrap=1, shape=1), unit/city tokens (+tileIdx). Contract <code>schema_version=3</code>.</li>
+  <li><strong>Shard→Python:</strong> reader loads blocks; <code>hexgraph.build_neighbor_graph(coords,21,true,1)</code> → tile 530's 6 neighbor rows; off-map dirs → idx 0/mask 0; wrap dirs via ±21. → neighbor_index[1261,6], neighbor_mask[1261,6].</li>
+  <li><strong>model.forward:</strong> embeddings → GNN gathers [1261,6,C], message-MLP, ×mask, reduce → per-node; entity self-attn; cross-attn (query reads nodes⊕entities) → context → trunk → (tech_logits, policy_logits, tanh(value)).</li>
+  <li><strong>Export:</strong> value head dropped; ONNX inputs = {global, acting_civ, 6×(set+mask), neighbor_index int64, neighbor_mask}; metadata stamps contract_version=3.</li>
+  <li><strong>Inference (Kotlin):</strong> <code>forwardRich</code> rebuilds neighbor_index from the live TileMap (real getIfTileExistsOrNull), runs ORT, masks illegal actions, picks a legal tech/policy.</li>
+</ol>

@@ -1,0 +1,914 @@
+[
+  {
+    "id": "FND-0001",
+    "cluster_key": "fcc535bf1849",
+    "title": "Bundle of GNN + embeddings + attention needs staged gates",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "Feature",
+    "description": "The brief treats hex GNN, categorical embeddings, self-attention, and cross-attention as one feature. That is a lot of new machinery to land before knowing which piece actually helps, and it makes Medium results hard to interpret.",
+    "rationale": "From a YAGNI lens, this is the classic \u201cbig elegant rewrite\u201d trap: maximum complexity, minimum attribution. Future maintainers inherit all components even if only one mattered.",
+    "suggested_addition": "Add a Phase 2 constraint: implement v4 in rungs, each with parity/export/throughput checks before adding the next layer. Suggested rungs: (1) schema/coordinate contract only, (2) categorical embeddings with existing masked pool, (3) one hex GNN layer, (4) attention only if prior rung exports cleanly and does not fail D8. If a rung already fixes or worsens Medium, stop and record the result before adding more architecture.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Feature: v4 \u2014 Structured Encoder (hex GNN + categorical embeddings + self/cross-attention)",
+      "No structured-encoder scaffold exists \u2014 current encoders are uniform MLP+pool. D3/D4/D5 (GNN, self-attention, cross-attention) are net-new modules"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0002",
+    "cluster_key": "206c732c0716",
+    "title": "Coordinate side-tensor looks like avoidable contract bloat",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "Open questions for Phase 2 design",
+    "description": "The brief leaves open an i16 side-tensor for signed coordinates, but the scan also says D9 expects no new tensor names and coordinates should ride inside existing spatial/global tensors. Adding a new tensor for two coordinate values expands the Kotlin/Python/ONNX/JVM contract surface for a small encoding problem.",
+    "rationale": "Cross-language tensor contracts are expensive to maintain. If a biased or normalized in-band representation works, a side-tensor is abstraction tax with no clear payoff.",
+    "suggested_addition": "Resolve D1.1 with a bias toward in-band encoding: keep coordinates inside the existing `spatial` tensor unless there is a demonstrated map-size/range failure. If in-band encoding is impossible, Phase 2 must explicitly list every touched contract file and explain why the extra tensor is worth the maintenance cost.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Signed-coord encoding for D1.1: i16 side-tensor vs biased-u8",
+      "extending widths is fine (coords ride inside `spatial`, map dims inside `global` \u2192 no new tensor names per D9)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0003",
+    "cluster_key": "3a7d18fb63b6",
+    "title": "Do not add an encoder framework for one v4 implementation",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "Python model + training",
+    "description": "The scan says the stable seam is the module passed into training, but the brief does not explicitly prevent a new encoder registry/factory/interface layer. With only one structured encoder being built, a generic abstraction would just make the model path harder to read.",
+    "rationale": "This is where ML codebases often rot: one concrete experiment becomes a mini-framework. A junior developer should be able to open one model file and understand the forward pass.",
+    "suggested_addition": "Add an implementation rule: v4 should be one concrete `nn.Module` preserving `forward(inputs: dict) -> (tech_logits, policy_logits, value)`. Do not introduce an encoder interface, strategy registry, plugin factory, or configurable component graph unless there are at least two real implementations used by production code or tests.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "This `forward` signature is the stable seam \u2014 v4's new encoder must preserve it.",
+      "No structured-encoder scaffold exists \u2014 current encoders are uniform MLP+pool."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0004",
+    "cluster_key": "fd20ad71643f",
+    "title": "Avoid compatibility layers for perishable v2/v4 data",
+    "severity": "minor",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "Contract pipeline",
+    "description": "The scan correctly notes schema/fingerprint coupling and perishable shards, but the brief does not explicitly say to fail fast instead of supporting old rich shards/models. Without that guardrail, Phase 2 may grow adapters for v2/v4 coexistence across reader, export, and JVM bridge.",
+    "rationale": "Backward compatibility is not free. If the project accepts regenerating offline RL data, then dual-readers and migration code are unnecessary maintenance burden.",
+    "suggested_addition": "Add a contract rule: v4 increments the schema/contract/fingerprint and old v2 rich shards/models are not supported by adapters or migrations. Readers and bridge code should fail loudly on mismatches; regeneration is the supported path.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Schema/layout version | `SampleSchema.VERSION = 2` ... reader refuses mismatch (perishable shards)",
+      "Fingerprint coupling \u2014 any spatial change invalidates old fingerprints (datasets perishable; regenerate \u2014 expected)."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0005",
+    "cluster_key": "0cc88952de23",
+    "title": "Extend SimBenchmark narrowly; do not build a benchmark harness",
+    "severity": "minor",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "Light scan summary",
+    "description": "The brief catches that `SimBenchmark` already exists, but it does not constrain D8 against becoming a configurable benchmark framework. The needed work is a narrow ONNX-policy path and a fixed rejection gate, not a new matrix runner.",
+    "rationale": "Benchmark infrastructure is easy to overbuild and hard to delete. One existing task with one additional mode is enough to answer the throughput question.",
+    "suggested_addition": "Add a D8 scope guard: extend `desktop/src/com/unciv/app/desktop/SimBenchmark.kt` and `:desktop:simBench` only. Add one ONNX-policy mode, emit the existing `BENCH|` style output, and enforce the 70%-of-heuristic gate. Do not add a new Gradle task, benchmark DSL, scenario matrix, or external configuration unless a real caller needs it now.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`SimBenchmark` already exists (`:desktop:simBench`, measures heuristic baseline turns/s) \u2192 D8 extends it rather than creating it.",
+      "It does not yet exercise the ONNX-policy path (ms/decision, ONNX-driven turns/s, the 70% gate)."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0006",
+    "cluster_key": "4edcd26b563f",
+    "title": "v4 swaps encoder while training-regime confound stays unaddressed \u2014 result unfalsifiable",
+    "severity": "major",
+    "primary_lens": "architecture",
+    "target_file": "discovery-output.md",
+    "target_section": "Pre-feature decisions (resolved by user)",
+    "description": "The brief proceeds with v4 encoder capacity changes while the recorded diagnosis says the Medium regression is from-scratch-per-round undertraining, not encoder weakness. With the confound left in, a flat or worse Medium result cannot distinguish 'encoder didn't help' from 'undertraining masked it' \u2014 the design has no pre-registered decision rule for that ambiguity.",
+    "rationale": "From an architecture-correctness lens, building a large net-new subsystem (GNN + dual attention) on top of an unresolved causal confound risks a month of work whose outcome is structurally uninterpretable. The seam being swapped is the most expensive one to build.",
+    "suggested_addition": "Add a pre-registered evaluation contract to the design: define the exact Medium-result thresholds that (a) confirm v4 as a win, (b) trigger the weight-carryover follow-up, (c) trigger rollback. Specify these BEFORE D3/D4/D5 are built so the result is falsifiable regardless of the training-regime confound.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "my saved memory + v2 RESULTS.md say the Medium regression is undertraining (from-scratch-per-round training), and that adding encoder capacity before fixing that risks making Medium worse",
+      "Weight-carryover remains the recommended follow-up if v4's Medium result is ambiguous."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0007",
+    "cluster_key": "dfa8dee5350d",
+    "title": "Spatial-channel count is a god-constant spanning 7 lockstep sites with no single source of truth",
+    "severity": "major",
+    "primary_lens": "architecture",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "Risks / surprises for the v4 extension",
+    "description": "The scan documents that spatial-channel count must change in lockstep across buildSpatial, SPATIAL_CHANNELS, NUM_SPATIAL_CHANNELS, Vocab fingerprint, contract.py fallback, OnnxPolicy fallback, and parity fixtures \u2014 and that token_specs_from_schema 'silently falls back' to hardcoded widths if perItem is missing. D1 adds two coord channels across all of these by hand.",
+    "rationale": "A value that must be edited in seven coupled places, with a silent fallback that hides drift, is a structural fragility that will produce a hard-to-diagnose contract mismatch at the JVM bridge. This is the dependency-graph hazard most likely to bite in the design phase.",
+    "suggested_addition": "In Phase 2 design, make the schema emission the single authoritative source for channel layout and treat any reliance on hardcoded width fallbacks as a fatal assertion, not a silent default. Add a design item: replace token_specs_from_schema's silent fallback with a hard error when perItem is absent, so a schema-emit regression alarms instead of corrupting tensors.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Spatial-channel count is referenced in many places \u2014 must move in lockstep",
+      "`token_specs_from_schema` silently falls back to hardcoded widths if `perItem` missing \u2014 a schema-emit regression would not alarm."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0008",
+    "cluster_key": "c507b912f702",
+    "title": "GNN ONNX-exportability under opset-17 is a load-bearing assumption with no fallback path",
+    "severity": "major",
+    "primary_lens": "architecture",
+    "target_file": "discovery-output.md",
+    "target_section": "Open questions for Phase 2 design",
+    "description": "The brief flags GNN message-passing op choice (gather/index_select/scatter_add) as a 'pre-registered export risk' to validate on the small rung, but defines no contingency if scatter_add or the adjacency-gather pattern does not export cleanly under opset 17. The entire D3/D4/D5 encoder is net-new and the export step is positional/strict.",
+    "rationale": "The cross-language contract bridge is the spine of this system; if the GNN can't cross it, the whole structured encoder is blocked, and discovering this after D3/D4 are built is the expensive ordering. An acknowledged risk without a branch is a deferred crisis.",
+    "suggested_addition": "Add to the design: an explicit go/no-go export spike at the SMALL rung BEFORE building the full encoder, plus a named fallback (e.g. dense-adjacency matmul formulation, or opset bump) if scatter-based message passing fails to export. Gate D4/D5 build on the D3 export spike passing.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "GNN message-passing op choice for ONNX opset-17 exportability (gather/index_select/scatter_add) \u2014 validate export on the *small* rung before scaling (pre-registered export risk).",
+      "No structured-encoder scaffold exists \u2014 current encoders are uniform MLP+pool."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0009",
+    "cluster_key": "56a44f9c29f2",
+    "title": "forward() dict signature is the only declared seam \u2014 attention adds keys/shapes it must not break",
+    "severity": "minor",
+    "primary_lens": "architecture",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "Python model + training (DO NOT MODIFY the encoder-agnostic core)",
+    "description": "The scan names forward(inputs:dict) \u2192 (tech_logits, policy_logits, tanh(value)) as 'the stable seam' and mandates DO-NOT-MODIFY on the training core. But v4 introduces adjacency/coord inputs and cross-attention between token sets \u2014 the brief does not state whether the new encoder consumes only existing dict keys or requires new ones, which would ripple into features.py, dataset.py, and the JVM bridge.",
+    "rationale": "If the new encoder needs inputs that aren't already in the dict (adjacency lists, signed coords), the 'stable seam' is not actually preserved and the encoder-agnostic claim is false \u2014 clarifying the contract boundary now prevents a leaky abstraction in design.",
+    "suggested_addition": "In Phase 2, explicitly enumerate every dict key v4's encoder reads, mark which are new vs existing, and confirm each new key has a corresponding producer in features.py/Featurizer.kt and a tensor in the JVM bridge. State whether forward()'s output tuple is unchanged (it must be for the training core to stay untouched).",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "This `forward` signature is the stable seam \u2014 v4's new encoder must preserve it.",
+      "v4 only swaps the `nn.Module` passed in."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0010",
+    "cluster_key": "3aa0a994bd2c",
+    "title": "Construction-namespace collision fix is a prerequisite dependency for D2, but ordering isn't enforced",
+    "severity": "minor",
+    "primary_lens": "architecture",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "Risks / surprises for the v4 extension",
+    "description": "The scan notes that D2's single buildingCount+unitCount+1 construction embedding depends on D1.4 fixing the building#k/unit#k index collision in writeCityToken. This is a hidden cross-capability dependency: the embedding table size and index meaning are corrupted until the emit-side fix lands.",
+    "rationale": "A feature (D2 embeddings) silently assuming a bug-fix (D1.4) is correct is exactly the kind of unacknowledged inter-capability dependency that produces a quietly-wrong model \u2014 the embedding would train on colliding indices if ordering slips.",
+    "suggested_addition": "In the Phase 2 plan, make D1.4 (construction-namespace fix + unit test) an explicit blocking prerequisite for D2, and add an assertion that the construction index space equals buildingCount+unitCount+1 on both the Kotlin emit side and the Python embedding side so a regression in either fails loudly.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "unit branch lacks the `+ buildingCount` offset \u2192 building#k and unit#k collide. D1.4 fixes; D2's single `buildingCount+unitCount+1` construction embedding depends on the fix."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0011",
+    "cluster_key": "1027c1d36e92",
+    "title": "Missing Rollback Strategy for Lockstep Contract Versioning",
+    "severity": "critical",
+    "primary_lens": "production-readiness",
+    "target_file": "discovery-output.md",
+    "target_section": "Contract pipeline",
+    "description": "The pipeline requires lockstep updates across Kotlin, Python, and the JVM bridge. If the v4 model causes OOMs or crashes in production, rolling back the JVM code is impossible without also rolling back the model, which requires regenerating the dataset.",
+    "rationale": "A 2-minute rollback is impossible if it requires retraining a model or regenerating a dataset. Lockstep deployments without backward compatibility guarantee extended downtime when a deployment inevitably fails.",
+    "suggested_addition": "Design must specify a rollback strategy: The JVM `OnnxPolicy` must retain backward compatibility to load and execute v3 models (using the v3 contract) so the binary can be rolled back independently of the data pipeline, OR the v3 model must be bundled as an immediate fallback asset.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "The contract version must change in lockstep across all of these",
+      "reader refuses mismatch (perishable shards)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0012",
+    "cluster_key": "493316ded43f",
+    "title": "Unbounded O(N^2) Memory Scaling in Attention Layers",
+    "severity": "critical",
+    "primary_lens": "production-readiness",
+    "target_file": "discovery-output.md",
+    "target_section": "Feature",
+    "description": "The v4 design introduces self/cross-attention mechanisms. Attention memory and compute scale quadratically (O(N^2)) with sequence length (number of tiles, units, or cities).",
+    "rationale": "Without hard limits on sequence lengths, large maps late in the game will cause the JVM ONNX runtime to OOM, crashing the application. We cannot deploy a model with unbounded memory requirements.",
+    "suggested_addition": "Define explicit maximum sequence lengths (e.g., max units, max cities) for the attention layers. The Kotlin dataplane must truncate inputs to these bounds, and the ONNX export must enforce them to guarantee bounded memory usage during inference.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Structured Encoder (hex GNN + categorical embeddings + self/cross-attention)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0013",
+    "cluster_key": "85a93f194dec",
+    "title": "Missing Circuit Breaker / Fallback for Inference Failures",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "JVM ONNX bridge",
+    "description": "The new GNN and attention layers introduce complex tensor shape requirements. If `OnnxPolicy.kt` encounters an unexpected shape, NaN, or timeout during `forwardRich`, it currently lacks a defined failure isolation boundary.",
+    "rationale": "A single component failure (AI inference) should never take down the user-facing service. If the model breaks, the game must survive.",
+    "suggested_addition": "Wrap `OnnxPolicy.forwardRich` in a circuit breaker or catch-all exception handler. If inference fails or times out, log the error with structured context (tensor shapes, game state) and gracefully degrade to the heuristic baseline bot for that turn.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "forwardRich (:127-138); buildRichTensors (:153-166)",
+      "All tensors closed in finally (:136,186,201)."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0014",
+    "cluster_key": "615682900a47",
+    "title": "Missing Production Telemetry for Inference Latency",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "Tests + benchmark + hex primitives",
+    "description": "While D8 adds a benchmark gate (70% of heuristic), there is no commitment to observability for the new model's performance in production.",
+    "rationale": "GNNs and attention models are significantly heavier than the v3 MLP. We need to know if inference latency breaches acceptable thresholds in the wild, not just in a sterile benchmark environment.",
+    "suggested_addition": "Add structured metrics for inference latency (`unciv.ai.inference.ms`) and error rates, tagged by model version (v3 vs v4) and map size, to monitor real-world performance degradation.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "D8 EXTENDS the existing benchmark (add an ONNX-policy mode + the 70%-of-heuristic rejection gate)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0015",
+    "cluster_key": "e5eac3a4458c",
+    "title": "Silent Pipeline Starvation on Contract Version Bump",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "Contract pipeline",
+    "description": "When v4 bumps the contract version, the Python reader will drop all existing v3 shards. If the Kotlin emitter fails or is delayed, the training pipeline will silently spin on empty data.",
+    "rationale": "Data pipelines must explicitly alarm when starved. Silent failures in asynchronous data handoffs lead to days of wasted compute and delayed incident response.",
+    "suggested_addition": "Add a metric and explicit alert for 'dropped shards due to version mismatch' and 'training batch starvation' in the Python reader to immediately flag when the v4 data pipeline is stalled.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "reader refuses mismatch (perishable shards)",
+      "datasets perishable; regenerate \u2014 expected"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0016",
+    "cluster_key": "341010dad8ac",
+    "title": "No measurable success metric for the primary medium-regression fix",
+    "severity": "critical",
+    "primary_lens": "outcomes",
+    "target_file": "discovery-output.md",
+    "target_section": "",
+    "description": "The brief states the Medium regression (14.7% win rate vs blind-critic 28.9%, z=-3.48) as the motivation, but does not define a quantifiable target for the v4 encoder to meet. Without a target (e.g., \"Medium win rate against blind-critic must reach \u226524% with p<0.05\"), we cannot confirm the encoder resolves the problem or decide when to pivot.",
+    "rationale": "Product decisions require a clear success criterion; otherwise the team may ship a technically sound encoder that fails to improve the user-facing metric, wasting effort.",
+    "suggested_addition": "Add a 'Success Metrics' section: Primary metric: v4 Medium win rate vs. blind-critic (same opponent and compute budget as v3 rich-critic) must reach \u226524% (p<0.05). Secondary metric: v4 win rate should not regress vs. v3 on other difficulty levels. Measurement: automated evaluation in the self-play loop after N epochs; if not met after 3 attempts, fall back to weight-carryover approach.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "replaces the v3 rich-critic's masked mean+max pool, to fix the Medium regression (v3 rich-critic 14.7% vs blind-critic 28.9%, z=\u22123.48)."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0017",
+    "cluster_key": "84589598dd4c",
+    "title": "Missing explicit 'Non-Negotiable Constraints' section",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "discovery-output.md",
+    "target_section": "",
+    "description": "The codebase scan and notes list several hard constraints (ONNX export parity, not modifying training core, fingerprint stability, etc.) but the brief does not enumerate them as non-negotiables. Without a dedicated section, the design team may inadvertently violate one of these constraints.",
+    "rationale": "Explicit non-negotiables prevent costly rework and ensure alignment across contributors; they are essential for scoping the implementation.",
+    "suggested_addition": "Add a 'Non-Negotiable Constraints' section: 1) Encoder must export to ONNX opset\u201117 without custom ops (pre\u2011registered risk). 2) Logit parity with JVM must hold at atol 1e\u20114 (rich parity test). 3) Do NOT modify encoder\u2011agnostic training core (train.py, model.py's forward signature, etc.). 4) Fingerprint must be deterministic from token\u2011set schema; any schema change forces dataset regeneration. 5) Throughput gate: ONNX\u2011driven decisions/s must be \u226570% of heuristic baseline (D8).",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "DO NOT MODIFY the encoder-agnostic core",
+      "ONNX-exportability of GNN gather/scatter under opset 17 is the pre-registered export risk"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0018",
+    "cluster_key": "ca61d21b697d",
+    "title": "No explicit scope exclusions",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "discovery-output.md",
+    "target_section": "",
+    "description": "The brief does not define what is out of scope, leaving room for the encoder effort to expand into adjacent areas (new token sets, training hyperparameter tuning, reward shaping). Without clear boundaries, the feature may drift and delay delivery.",
+    "rationale": "A product brief must constrain the work to what truly needs to be built; scope exclusions protect the team from gold\u2011plating and ensure the minimal viable change is shipped.",
+    "suggested_addition": "Add a 'What This Brief Is NOT' section: This feature does NOT: add new token sets or token channels beyond the signed coordinate addition; modify the training loop (no weight carryover, no PPO changes); change the spatial resolution or graph structure beyond adding coordinate channels; optimize for latency beyond the 70% heuristic gate; or alter the blind\u2011critic or v1\u2011reinforce paths.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "v4 only swaps the nn.Module passed in",
+      "Feature: v4 \u2014 Structured Encoder (hex GNN + categorical embeddings + self/cross-attention)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0019",
+    "cluster_key": "389ac61ddbe2",
+    "title": "Undertraining confound lacks a guardrail metric or escalation plan",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "discovery-output.md",
+    "target_section": "Pre-feature decisions",
+    "description": "The brief acknowledges that the Medium regression may be due to undertraining (from-scratch-per-round) and that proceeding with v4 risks making it worse, yet it does not specify a metric or threshold at which the team should halt and adopt the weight\u2011carryover fix.",
+    "rationale": "If v4 fails to improve Medium win rate, stakeholders need a pre\u2011agreed trigger to pivot rather than continuing to tune the encoder in vain. A guardrail prevents the sunk\u2011cost fallacy.",
+    "suggested_addition": "Add a 'Risk Mitigation' item: 'If v4 Medium win rate after 3 full training rounds does not improve by at least 5 percentage points over the v3 rich\u2011critic baseline (14.7% \u2192 <19.7%), we will treat the training\u2011regime confound as the dominant factor and immediately switch to the weight\u2011carryover approach before further encoder changes.'",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "my saved memory + v2 RESULTS.md say the Medium regression is undertraining (from-scratch-per-round training), and that adding encoder capacity before fixing that risks making Medium worse."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0020",
+    "cluster_key": "6fa707738a90",
+    "title": "No measurable pass/fail criterion for fixing the Medium regression",
+    "severity": "critical",
+    "primary_lens": "testability",
+    "target_file": "discovery-output.md",
+    "target_section": "Feature",
+    "description": "The brief frames v4 as fixing the Medium regression, but it does not define what result constitutes a fix. There is no required win-rate threshold, confidence interval, seed count, opponent setup, evaluation budget, or comparison baseline for v4 versus v3 rich-critic and blind-critic.",
+    "rationale": "QA cannot write an acceptance test for the headline outcome without a statistical definition of done. This is especially risky because the brief explicitly acknowledges the training-regime confound, so ambiguous Medium results are likely unless the evaluation gate is pre-registered.",
+    "suggested_addition": "Add an explicit evaluation acceptance gate: `v4 is accepted only if, on Medium using the standard self-play eval harness with N games and fixed published seeds, it achieves at least X% win rate / score metric and is not statistically worse than blind-critic at alpha=Y. Report v3 rich-critic, blind-critic, and v4 under the same training budget. If the result is inconclusive, mark the feature as behaviorally unproven rather than fixed.`",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "replaces the v3 rich-critic's masked mean+max pool, to fix the Medium regression (v3 rich-critic 14.7% vs blind-critic 28.9%, z=\u22123.48).",
+      "User chose: proceed with v4 as written, accepting the training-regime confound. Weight-carryover remains the recommended follow-up if v4's Medium result is ambiguous."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0021",
+    "cluster_key": "65f63f7f06df",
+    "title": "D8 throughput gate is not yet reproducible enough to test",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "discovery-output.md",
+    "target_section": "Domain preset / Light scan summary",
+    "description": "The brief references a `D8 throughput gate` and a `70% gate`, but it does not specify the exact benchmark command, hardware assumptions, warmup, repetitions, p50/p95/p99 latency target, or whether the gate is turns/s, ms/decision, or both. A relative `70% of heuristic` target is not independently verifiable unless the heuristic baseline measurement protocol is frozen.",
+    "rationale": "Performance tests are highly sensitive to machine, warmup, ONNX runtime initialization, and random game state. Without a deterministic benchmark protocol, QA can neither reproduce failures nor decide whether a regression is real.",
+    "suggested_addition": "Add a performance acceptance section: `Run ./gradlew :desktop:simBench --args=\"...\" on the standard CI/benchmark profile. Discard first K warmup turns, run R repetitions with fixed seeds, and fail if ONNX-policy throughput is <70% of heuristic baseline or if p99 forwardRich latency exceeds X ms/decision. Benchmark output must include BENCH lines for heuristic turns/s, ONNX turns/s, p50/p95/p99 ms/decision, model path, contract version, and commit SHA.`",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Domain preset (Phase 2 hint): data-pipeline \u2192 practitioner (contract/numerical correctness), cost_efficiency (D8 throughput gate).",
+      "D8 EXTENDS the existing benchmark (add an ONNX-policy mode + the 70%-of-heuristic rejection gate), it does not build it from scratch."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0022",
+    "cluster_key": "e28cd61fd332",
+    "title": "No committed test data matrix for contract/schema migration",
+    "severity": "critical",
+    "primary_lens": "testability",
+    "target_file": "discovery-output.md",
+    "target_section": "Open questions for Phase 2 design",
+    "description": "The brief identifies contract-wide schema changes, signed coordinate encoding, map dims, city/unit tile indices, construction embedding fixes, and maxCivTokens assumptions, but it does not define the fixtures QA should use to verify them. There is no required regenerated shard set, golden observation, Kotlin/Python parity fixture, or edge-case matrix for empty, maxed, negative-coordinate, wrapped, and malformed inputs.",
+    "rationale": "This feature is a cross-language contract bridge; most failures will be silent numerical or layout mismatches. If test data is invented ad hoc during implementation, parity and migration bugs can pass locally but fail in ONNX/JVM evaluation.",
+    "suggested_addition": "Add a required fixture matrix: `Phase 2 must produce golden fixtures for: empty token sets; max units/cities/civ_tokens; negative signed coordinates; world-wrap and non-wrap maps; city construction as building and unit; unknown vocab id; missing perItem schema; old v2 shard rejection; and maxCivTokens overflow. Each fixture must be emitted by Kotlin, loaded by Python, exported to ONNX, and checked by JVM parity with atol <= 1e-4 unless a stricter tolerance is specified.`",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Contract pipeline (the spine v4 must move in lockstep) Kotlin emit \u2192 shard \u2192 Python read \u2192 model \u2192 ONNX export \u2192 JVM bridge.",
+      "Signed-coord encoding for D1.1: i16 side-tensor vs biased-u8 ... Confirm maxCivTokens (slot table size = maxCivTokens+2 assumed = 42)."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0023",
+    "cluster_key": "cd09c9e32a69",
+    "title": "ONNX exportability risk lacks concrete acceptance tests",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "discovery-output.md",
+    "target_section": "Open questions for Phase 2 design",
+    "description": "The brief correctly flags GNN message-passing exportability as a risk, but the only stated mitigation is to validate export on a small rung before scaling. It does not define what operators are allowed, what dynamic axes must be exercised, or what numerical equivalence must hold between PyTorch, ONNX Runtime, and the JVM bridge.",
+    "rationale": "ONNX export failures often appear late and can be caused by one unsupported scatter/gather path or dynamic ragged shape. QA needs an early, deterministic gate that fails before the team invests in full training runs.",
+    "suggested_addition": "Add an exportability gate: `Before full training, export a minimal v4 model using the chosen GNN ops under opset 17 and run parity on at least batch sizes 1 and >1, ragged token counts 0/1/N, and two map sizes. Acceptance requires successful export, no unsupported/custom ops, ONNX Runtime execution, JVM bridge execution, and PyTorch-vs-ONNX-vs-JVM logits within declared tolerance.`",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "GNN message-passing op choice for ONNX opset-17 exportability (gather/index_select/scatter_add) \u2014 validate export on the small rung before scaling (pre-registered export risk).",
+      "No structured-encoder scaffold exists \u2014 current encoders are uniform MLP+pool. D3/D4/D5 (GNN, self-attention, cross-attention) are net-new modules; ONNX-exportability ... is the pre-registered export risk to validate early."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0024",
+    "cluster_key": "ecc719a0c5fb",
+    "title": "Error-state behavior for incompatible or malformed artifacts is undefined",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "discovery-output.md",
+    "target_section": "Light scan summary",
+    "description": "The brief notes that schema, contract version, fingerprints, token widths, and tensor ordering must move in lockstep, but it does not specify expected behavior when they do not. Missing or stale metadata, old shards, wrong tensor order, width mismatch, or fallback width use need explicit fail-fast behavior and test assertions.",
+    "rationale": "For QA, a correct failure mode is part of the contract. Silent fallback or permissive loading can produce plausible-looking training/eval output with corrupted features, which is worse than a hard failure.",
+    "suggested_addition": "Add negative acceptance criteria: `Old v2 shards must be rejected with a clear schema-version error. ONNX models with wrong contract_version, ruleset_fingerprint, input_names, or token widths must be rejected before inference. If perItem schema metadata is missing, tests must assert whether fallback is intentionally allowed or treated as an error. All contract failures must include actionable error messages naming the mismatched field.`",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "The contract version must change in lockstep across all of these.",
+      "token_specs_from_schema silently falls back to hardcoded widths if perItem missing \u2014 a schema-emit regression would not alarm."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0025",
+    "cluster_key": "bfc4b7cfe6b3",
+    "title": "ONNX Runtime Memory Corruption via Unvalidated GNN Indices",
+    "severity": "critical",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "Open questions for Phase 2 design",
+    "description": "The shift to a GNN requires `gather`, `index_select`, or `scatter_add` operations in the ONNX graph. If the adjacency matrix (derived from game state) contains out-of-bounds indices, the ONNX Runtime C++ backend can segfault or allow out-of-bounds memory reads.",
+    "rationale": "ONNX Runtime does not inherently bounds-check `gather`/`scatter` indices for performance reasons. A maliciously crafted save file or map (e.g., exploiting world-wrap edge cases) could feed invalid adjacency indices, crashing the host JVM or potentially achieving code execution.",
+    "suggested_addition": "Add strict bounds-clamping (using ONNX `Clip` or `Min`/`Max` ops) for all adjacency indices directly inside the PyTorch/ONNX computation graph before `gather`/`scatter` ops, ensuring indices can never exceed the dynamic node count.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "GNN message-passing op choice for ONNX opset-17 exportability (gather/index_select/scatter_add)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0026",
+    "cluster_key": "36b0a9602627",
+    "title": "Denial of Service (OOM) via Uncapped Dynamic Axes in Attention Layers",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "JVM ONNX bridge",
+    "description": "The v4 architecture introduces self/cross-attention, which has O(N^2) memory and compute complexity. The ONNX export uses dynamic axes (`{1:\"n_<name>\"}`). A crafted game state with an extreme number of units or cities will cause the JVM to allocate massive tensors, leading to an Out-Of-Memory crash.",
+    "rationale": "While the v3 architecture (mean/max pool) scaled linearly O(N) and could handle large inputs gracefully, v4's attention mechanisms create a quadratic attack surface for DoS via resource exhaustion when processing untrusted game states.",
+    "suggested_addition": "Implement hard caps on the dynamic axes (e.g., `n_own_units`, `n_opp_units`) in `OnnxPolicy.kt` before passing tensors to `forwardRich`. Excess entities must be truncated or rejected to guarantee strict O(N^2) memory bounds during inference.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Feature: v4 \u2014 Structured Encoder (hex GNN + categorical embeddings + self/cross-attention)",
+      "dynamic axes batch {0} + ragged {1:\"n_<name>\"}"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0027",
+    "cluster_key": "7734c5ab1c1d",
+    "title": "Provenance Gate Bypasses Cryptographic Integrity",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "JVM ONNX bridge",
+    "description": "The brief relies on a \"provenance gate\" that hashes the schema/vocab to verify compatibility, but this does not verify the cryptographic integrity of the `.onnx` file itself.",
+    "rationale": "If users can load custom or community-provided AI models (common in gaming/modding), an attacker can craft a malicious ONNX payload (exploiting opset 17 vulnerabilities) that perfectly matches the schema fingerprint but executes malicious graph nodes.",
+    "suggested_addition": "Clarify the trust boundary for ONNX model loading. If models can be loaded from user-provided paths, the provenance gate must be upgraded to verify a cryptographic signature (e.g., Ed25519) of the model file, not just the schema fingerprint.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "provenance gate (:52-63); rich = mContract==CONTRACT_VERSION_RICH",
+      "Vocab.canonicalSections() hashes \"schema:spatialChannels\" \u2192 changing channels changes the fingerprint"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0028",
+    "cluster_key": "e804e2df31bf",
+    "title": "No cost analysis for increased training compute from v4 encoder without fixing training regime",
+    "severity": "major",
+    "primary_lens": "cost",
+    "target_file": "discovery-output.md",
+    "target_section": "Pre-feature decisions (resolved by user)",
+    "description": "The v4 encoder adds GNN, embeddings, and attention, likely increasing training compute per round by 2\u20135\u00d7. Since training still occurs from scratch per round and the user accepted the undertraining confound, there is a real risk of burning GPU hours on a model that may not outperform the v3 baseline. No cost budget or break-even analysis is included.",
+    "rationale": "Running a more expensive encoder without first improving training efficiency wastes compute; cost should be tied to measurable improvement in the target metric (Medium win rate).",
+    "suggested_addition": "Add a cost-justification section: estimate v4's training compute delta vs v3, set a win-rate improvement threshold (e.g., +10% Medium win rate after 50 rounds), and define a fallback to v3 with weight-carryover if the threshold isn't met. Track cost-per-round and cost-per-improvement-point in the self-play loop dashboard.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "User chose: proceed with v4 as written, accepting the training-regime confound. Weight-carryover remains the recommended follow-up if v4's Medium result is ambiguous."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0029",
+    "cluster_key": "2af12315f754",
+    "title": "v4 inference latency may erode self-play game throughput per compute dollar",
+    "severity": "major",
+    "primary_lens": "cost",
+    "target_file": "discovery-output.md",
+    "target_section": "Light scan summary (SimBenchmark / D8)",
+    "description": "The GNN + self/cross-attention layers are more expensive per forward pass than v3's MLP+pool. The D8 throughput gate only rejects models below 70% of heuristic speed\u2014it doesn't assess whether the slower speed is justified by sample efficiency gains. A v4 model that runs 30% slower but only improves win rate 5% would increase cost-per-effective-training-signal.",
+    "rationale": "Self-play loop wall time directly drives cloud cost; a slower model requires proportionally more compute to generate the same number of training samples, potentially negating any algorithmic gains.",
+    "suggested_addition": "Estimate v4's inference time vs v3 (ms/forward on target CPU) and project self-play loop throughput. If v4 is >20% slower, require a proportional improvement in training sample efficiency (e.g., episodes-to-convergence) to approve production deployment. Include this in the D8 gate as a cost-efficiency ratio, not just a binary speed check.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "D8 EXTENDS the existing benchmark (add an ONNX-policy mode + the 70%-of-heuristic rejection gate)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0030",
+    "cluster_key": "bca3bcc8399d",
+    "title": "No caching strategy for redundant ONNX inference calls in self-play loop",
+    "severity": "minor",
+    "primary_lens": "cost",
+    "target_file": "discovery-output.md",
+    "target_section": "Light scan summary (self-play loop)",
+    "description": "Self-play often visits identical or similar game states across episodes. The brief doesn't mention any caching of ONNX model outputs (e.g., state-hash \u2192 logits), which could lead to redundant inference calls and wasted compute.",
+    "rationale": "In self-play, a simple LRU cache could reduce inference calls by 10\u201330%, directly lowering cloud cost without any architectural changes.",
+    "suggested_addition": "Evaluate the feasibility of a state-hash cache of ONNX model outputs in the self-play loop. Estimate the potential cache hit rate from historical self-play data and set a cost-saving target (e.g., 15% reduction in inference calls).",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0031",
+    "cluster_key": "5c1229b1a4e0",
+    "title": "Increased token widths and spatial channels will inflate shard sizes and storage costs",
+    "severity": "minor",
+    "primary_lens": "cost",
+    "target_file": "discovery-output.md",
+    "target_section": "Light scan summary + Risks / surprises (#6)",
+    "description": "D1 adds signed (x,y) spatial channels, D1.3 adds tile indices to unit/city tokens, and the broader v4 encoder may require storing intermediate tensors. Per-sample shard sizes will grow, increasing I/O and storage costs across thousands of self-play rounds. No data volume projection is included.",
+    "rationale": "Self-play generates massive shard datasets; a 20% per-sample size increase multiplies linearly across rounds, potentially blowing the storage budget for long-running self-play experiments.",
+    "suggested_addition": "Estimate the per-sample storage size increase from new channels/indices. If >20%, consider (a) fp16 or int8 quantization for stored features, (b) a retention policy to prune training rounds older than N, and (c) tracking cost per terabyte of self-play data generated.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "D1's signed (x,y) channels need a decision (i16 side-tensor vs biased-u8)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0032",
+    "cluster_key": "7223b73364a2",
+    "title": "ONNX export fallback for GNN ops may incur unbounded debugging and rework cost",
+    "severity": "minor",
+    "primary_lens": "cost",
+    "target_file": "discovery-output.md",
+    "target_section": "Open questions for Phase 2 design",
+    "description": "The GNN's gather/index_select/scatter_add ops are flagged as an export risk. If they fail to export under opset 17, the team may need to rewrite the encoder or implement custom ONNX ops, consuming engineering time and potentially invalidating already-trained models. No time or resource budget for this contingency is set.",
+    "rationale": "Unbounded debugging of ONNX export issues can burn expensive ML-engineering hours and delay the self-play pipeline, increasing the total cost of the feature with no guaranteed benefit.",
+    "suggested_addition": "Add a time-box for ONNX export validation (e.g., 2 days of effort). If exportability cannot be proven within that window, commit to a fallback encoder (e.g., extended MLP+pool with the new features) that is known to export. Track export-related engineering hours against the feature budget.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "GNN message-passing op choice for ONNX opset-17 exportability (gather/index_select/scatter_add) \u2014 validate export on the *small* rung before scaling (pre-registered export risk)."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0033",
+    "cluster_key": "13edb189ca8b",
+    "title": "v4 attacks symptom (encoder capacity) while recorded root cause is undertraining",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "discovery-output.md",
+    "target_section": "Pre-feature decisions (resolved by user)",
+    "description": "Your own saved memory + v2 RESULTS.md diagnose the Medium regression as undertraining (from-scratch-per-round). The user chose to proceed with v4 anyway, accepting the confound, but the brief does not define how v4's Medium result will be interpreted given that confound is still live. If Medium does not recover, was it bad encoder design or still undertraining? The domain success criterion is unfalsifiable as written.",
+    "rationale": "In this RL-eval domain, the business outcome is 'beat blind-critic on Medium' (close the 14.7% vs 28.9% gap, z=-3.48). Shipping a bigger encoder without a falsifiable read on whether it moved the needle for the right reason risks burning an L-sized effort on a confounded experiment.",
+    "suggested_addition": "Add a 'Success interpretation' section defining, before any code is written: (a) the Medium win-rate threshold that counts as v4 success, (b) what result triggers the pre-registered weight-carryover follow-up, and (c) an explicit statement that an ambiguous Medium result will NOT be attributed to encoder design until the training-regime confound is controlled.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "my saved memory + v2 RESULTS.md say the Medium regression is undertraining",
+      "accepting the training-regime confound. Weight-carryover remains the recommended follow-up if v4's Medium result is ambiguous"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0034",
+    "cluster_key": "0a34d9777a9f",
+    "title": "Construction-namespace collision is a live domain bug, not just a refactor blocker",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "Risks / surprises for the v4 extension",
+    "description": "The scan flags that in writeCityToken the unit branch lacks the `+ buildingCount` offset, so building#k and unit#k collide in `current_construction`. This means the v3 baseline has been feeding the critic a semantically corrupted feature where 'building a Warrior' is indistinguishable from 'building a particular building'. The brief treats this only as a D1.4 fix prerequisite for D2, not as a fact that may already be distorting the baseline the regression was measured against.",
+    "rationale": "The thing being modeled \u2014 what a city is currently constructing \u2014 is a core domain concept, and a collision means the model has been learning on a misencoded signal. This could partially explain the rich-critic regression itself and changes how the baseline comparison should be read.",
+    "suggested_addition": "Note in the brief that the construction-collision (Featurizer.kt:205) corrupts an existing domain feature in the v3 baseline, and decide explicitly whether the v4 Medium comparison should be re-baselined against a fixed-collision v3 to isolate encoder effects from this bug fix.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "unit branch lacks the `+ buildingCount` offset \u2192 building#k and unit#k collide. D1.4 fixes",
+      "D2's single `buildingCount+unitCount+1` construction embedding depends on the fix"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0035",
+    "cluster_key": "26b9a1a55854",
+    "title": "Signed-coordinate encoding choice carries domain semantics (hex geometry) that must be stated",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "discovery-output.md",
+    "target_section": "Open questions for Phase 2 design",
+    "description": "D1.1 introduces (x,y) coordinate channels, but the domain uses a hex grid with world-wrap (HexMath offset-grid, TileMap.getIfTileExistsOrNull retries across the wrap seam). A raw signed (x,y) channel does not encode hex adjacency or wrap-distance correctly; two tiles adjacent across the world-wrap seam are far apart in raw coordinates. The brief frames this purely as a u8-vs-i16 encoding question, missing the deeper question of whether linear coords even represent the game's spatial domain faithfully.",
+    "rationale": "The whole point of v4 is a structured spatial encoder; if the coordinate features given to the GNN/attention misrepresent hex adjacency and world-wrap, the encoder will learn a distorted map of the actual game geography.",
+    "suggested_addition": "In the Phase 2 design, state explicitly how hex geometry and world-wrap are represented to the encoder: confirm whether the GNN adjacency (D3, replicating clockPositionToHexcoordMap + wrap retries) carries the spatial relations and the (x,y) channels are merely positional, or whether wrap-aware coordinates are needed. Document the chosen invariant.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Signed-coord encoding for D1.1: i16 side-tensor vs biased-u8",
+      "D3's Python adjacency builder replicates this"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0036",
+    "cluster_key": "f9dc3450a18c",
+    "title": "Cross-language adjacency replication risks two divergent definitions of 'neighbor'",
+    "severity": "major",
+    "primary_lens": "domain",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "Tests + benchmark + hex primitives",
+    "description": "D3's Python adjacency builder replicates Kotlin's HexMath.clockPositionToHexcoordMap and TileMap world-wrap retry logic. The brief notes the replication but does not require a parity guarantee on the adjacency definition itself \u2014 only the existing logits parity test (D10) is mentioned. The ubiquitous-language concept 'adjacent tile' must mean exactly the same thing on both sides or the trained model and the JVM inference path will disagree on the game's spatial structure.",
+    "rationale": "A subtle divergence in hex-neighbor or wrap-seam handling between Python (training) and Kotlin (inference) is a classic domain-modeling bug that compiles, passes shape checks, and silently degrades play \u2014 exactly the kind the encoder is meant to fix.",
+    "suggested_addition": "Require a dedicated adjacency-parity test (beyond logits parity) that asserts the Python adjacency builder produces the identical neighbor set as Kotlin HexMath across map sizes including world-wrap seams, before D4/D5 attention is layered on top.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "world-wrap retries `getOrNull(x\u00b1radius, y\u2213radius)`",
+      "**D3's Python adjacency builder replicates this.**"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0037",
+    "cluster_key": "973699f1e040",
+    "title": "maxCivTokens=40 assumption is a domain-cardinality fact left unverified",
+    "severity": "minor",
+    "primary_lens": "domain",
+    "target_file": "discovery-output.md",
+    "target_section": "Open questions for Phase 2 design",
+    "description": "The slot table size (maxCivTokens+2 = 42) drives the categorical civ embedding and the self/cross-attention token budget, but maxCivTokens=40 is still an unconfirmed assumption. If the actual game ruleset supports a different number of civs/city-states, the embedding table and attention masks model the wrong domain cardinality.",
+    "rationale": "Civ count is a fixed domain fact tied to the ruleset; getting it wrong means either truncated civs (lost information) or wasted slots (mask bugs), both of which corrupt the cross-attention over players.",
+    "suggested_addition": "Verify maxCivTokens against Vocab.kt/SampleSchema.kt and the active ruleset during Phase 2 design before sizing any embedding/attention table, and record the confirmed value as a stated invariant in the design.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Confirm `maxCivTokens` (slot table size = `maxCivTokens+2` assumed = 42)",
+      "**Slot table (=42) assumes maxCivTokens=40** \u2014 verify in `Vocab.kt`/`SampleSchema.kt` before D2."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  }
+]

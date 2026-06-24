@@ -1,0 +1,17 @@
+<p><strong>The ask:</strong> the v3 rich-critic encoder loses on Medium maps (14.7% vs blind 28.9%, z=−3.48)
+because its spatial encoder is a masked mean+max <em>pool</em> — permutation-invariant with zero positional
+signal, so on ~1261 Medium tiles it throws away 2D locality.</p>
+<p><strong>How this solves it:</strong> replace the pool with a <strong>structured encoder</strong> — categorical
+embeddings + a hex-aware <strong>GNN</strong> (gather each tile's ≤6 true hex neighbors, masked-reduce over a
+fixed degree-6 axis) + hand-rolled self-attention over entity sets (each fused with its board node) +
+cross-attention where a <code>[global⊕acting_civ]</code> query reads the board — sized by a demand-driven
+capacity ladder under a hard throughput guard. The frozen training core
+(<code>_optimize_actor_critic</code>/<code>compute_gae</code>, terminal reward + critic) is untouched: only the
+<code>nn.Module</code> is swapped.</p>
+<p><strong>Build sequencing (validate the diagnosed fix first):</strong> Phase A = contract + embeddings + GNN +
+parity/export-smoke → a GNN-only net, check Medium; Phase B = self-attention + entity↔node join + cross-attention
++ trunk split; Phase C = ladder + throughput guard + the Tiny/Medium experiment.</p>
+<p><strong>Confound (accepted):</strong> v4 leaves from-scratch-per-round training untouched, which the recorded
+v2 diagnosis blames for the regression. The plan holds budget constant vs v3, reports the train/eval gap +
+round-over-round Medium curve, and <em>reports a null/negative result plainly</em> — a negative is an accepted,
+reported outcome, not a ship-blocker.</p>

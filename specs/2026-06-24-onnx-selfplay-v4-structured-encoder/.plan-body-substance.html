@@ -1,0 +1,34 @@
+<p><strong>★ Review focus — the v3 contract (schema) + new public surfaces (interface) + the non-negotiables.</strong>
+Every width/version site must move in lockstep; the table is the contract.</p>
+<table>
+  <caption>v3 shard blocks &amp; ONNX inputs (vs v2)</caption>
+  <thead><tr><th scope="col">block / input</th><th scope="col">dtype</th><th scope="col">width</th><th scope="col">change</th></tr></thead>
+  <tbody>
+    <tr><td>global</td><td>f32</td><td>26→<strong>29</strong></td><td>+effWrapRadius (pre-resolved), +worldWrap, +shape ordinal</td></tr>
+    <tr><td>spatial</td><td><strong>u8</strong></td><td>13 (unchanged)</td><td>NOT widened — u8 clamps [0,255]</td></tr>
+    <tr><td>spatial_coords</td><td><strong>f32</strong></td><td>2/tile (NEW)</td><td>signed tile (x,y); shard-only adjacency source</td></tr>
+    <tr><td>own/opp_units</td><td>f32</td><td>8→<strong>9</strong></td><td>+currentTile.zeroBasedIndex (entity↔node join)</td></tr>
+    <tr><td>own/opp_cities</td><td>f32</td><td>16→<strong>17</strong></td><td>+centerTile.zeroBasedIndex; construction-collision fix</td></tr>
+    <tr><td>neighbor_index</td><td><strong>int64</strong></td><td>[B,N,6] (NEW input)</td><td>GNN gather; sentinel=N (zero pad row); shares spatial's n axis</td></tr>
+    <tr><td>neighbor_mask</td><td>f32</td><td>[B,N,6] (NEW input)</td><td>real-neighbor mask (degree-6 padded)</td></tr>
+  </tbody>
+</table>
+<p><strong>New public surfaces (interface):</strong></p>
+<pre><code>python/unciv_train/hexgraph.py  (NEW, pure)
+  build_neighbor_graph(coords:[N,2], eff_wrap_radius:int, world_wrap:bool, shape:int)
+      -> (neighbor_index:[N,6] int64, neighbor_mask:[N,6] f32)   # mirrors TileMap.getIfTileExistsOrNull; sentinel=N
+
+python/unciv_train/model.py  (NEW module — preserves the FROZEN seam)
+  class StructuredPolicyValueNet(...)  forward(inputs:dict) -> (tech_logits, policy_logits, tanh(value))
+
+OnnxPolicy.kt (inference): buildNeighborTensors(gameInfo.tileMap) -> int64[1,N,6]+f32[1,N,6] (real engine, bounds-checked)
+SampleSchema.OnnxContract.NEIGHBOR_INPUT_NAMES = ["neighbor_index","neighbor_mask"]  # mirrored in contract.py</code></pre>
+<p><strong>Non-negotiables:</strong> frozen seam; opset-17 (no scatter/SDPA); heads {tech,policy}(+value train-only);
+terminal-reward+critic only; fail-loud lockstep (no silent truncation); legality + determinism + provenance
+preserved; <strong>abort fail-loud if a rung's <code>onnx_decisions==0</code></strong> (no silent heuristic fallback
+reported as model results); NaN-safe masking everywhere (incl. hand-rolled attention — fully-masked set → zeros).</p>
+<p><strong>Acceptance (falsifiable):</strong> Medium — structured &gt; v3 rich-pool, two-proportion z (structured as
+p1), p&lt;0.05 over a 200-game final eval. Tiny — <em>non-inferiority</em> (one-sided z, p&gt;0.05 for structured&lt;v3).
+"Budget constant" := identical (8 rounds, gen 16, eval 80, RandomPolicy opponent, fixed seeds, +200-game final) as v3.</p>
+<p><strong>Capacity ladder (decisions):</strong> small (embed 8, gnn 2×32, attn 1×2×32, trunk 128) → medium → large.
+K=3; scale up iff eval rising AND throughput≥70% AND train/eval-gap small; stop on no-improve / &lt;70% / train-fail.</p>

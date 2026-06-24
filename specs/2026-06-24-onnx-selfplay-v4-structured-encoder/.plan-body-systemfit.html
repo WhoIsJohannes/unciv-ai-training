@@ -1,0 +1,12 @@
+<p><strong>New:</strong> <code>hexgraph.py</code> (adjacency builder), <code>StructuredPolicyValueNet</code>
+(model), a JVM neighbor-tensor builder + int64 tensor path, the <code>spatial_coords</code> block, the
+<code>neighbor_index/mask</code> ONNX inputs, and the ladder/throughput orchestration.</p>
+<p><strong>Touched:</strong> Featurizer (emit), SampleSchema/contract.py (versions + NEIGHBOR_INPUT_NAMES),
+DataPlaneHooks.buildHeaderJson (gains a Vocab param), dataset.py/features.py/export_onnx.py (read/route the new
+tensors), OnnxPolicy.kt (bridge + provenance want-list), SimBenchmark (ONNX rung mode), run_loop.py (ladder).</p>
+<p><strong>Untouched-but-relied-on (FROZEN):</strong> <code>_optimize_actor_critic</code>,
+<code>compute_gae</code>, <code>train_actor_critic_rich</code> core, terminal-reward+critic, masking/legality,
+the <code>_RichPolicyOnly</code> export wrapper (tolerates appended inputs). v4 only swaps the nn.Module.</p>
+<p><strong>Calls in:</strong> run_loop → train_round(--variant structured) → StructuredPolicyValueNet.
+<strong>Calls out:</strong> the model reads neighbor_index built by hexgraph (train) / OnnxPolicy (inference),
+both replicating <code>TileMap.getIfTileExistsOrNull</code> — guarded by 3-way adjacency parity.</p>
