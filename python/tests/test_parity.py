@@ -212,3 +212,33 @@ def test_jvm_python_structured_logits_match(tmp_path):
 
     assert np.allclose(py_tech, jvm_tech, atol=ATOL), f"structured tech drift > {ATOL}: {py_tech} vs {jvm_tech}"
     assert np.allclose(py_policy, jvm_policy, atol=ATOL), f"structured policy drift > {ATOL}: {py_policy} vs {jvm_policy}"
+
+
+@pytest.mark.skipif(not _toolchain_ok(), reason="JVM toolchain (gradlew + JDK) not available")
+def test_hexgraph_matches_live_engine(tmp_path):
+    """FND-0036: the Python adjacency builder (used at TRAIN time) must reproduce the LIVE engine's
+    neighbor graph (used at INFERENCE via OnnxPolicy.buildNeighborTensorsLive) EXACTLY — incl.
+    world-wrap edges — on a real generated map. This is the train↔inference adjacency-agreement guard."""
+    from unciv_train.hexgraph import build_neighbor_graph
+    out_file = tmp_path / "adj.json"
+    env = dict(os.environ, JAVA_HOME=JAVA_HOME)
+    cmd = [str(GRADLEW), "selfPlay", "--console=plain",
+           "--args=" + f"adjacency-dump 4242 {out_file} Tiny"]
+    p = subprocess.run(cmd, cwd=str(REPO), env=env, capture_output=True, text=True, timeout=900)
+    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
+    d = json.loads(out_file.read_text())
+    n = int(d["nTiles"])
+    assert d["worldWrap"] == 1, "fidelity test must run on a world-wrap map to exercise the wrap branch"
+    coords = np.array(d["coords"], dtype=np.float32)
+    idx, mask = build_neighbor_graph(coords, d["effWrapRadius"], bool(d["worldWrap"]), d["shape"])
+    live = np.array(d["live"], dtype=np.int64)  # [n,6]; -1 = no neighbor in that direction
+    mismatches = []
+    for i in range(n):
+        for dd in range(6):
+            if live[i, dd] == -1:
+                if mask[i, dd] != 0:
+                    mismatches.append(f"tile{i} dir{dd}: live=none, hexgraph idx={idx[i,dd]} mask=1")
+            elif not (mask[i, dd] == 1 and idx[i, dd] == live[i, dd]):
+                mismatches.append(f"tile{i} dir{dd}: live={live[i,dd]} hexgraph idx={idx[i,dd]} mask={mask[i,dd]}")
+    assert not mismatches, f"hexgraph != live engine ({len(mismatches)} mismatches): {mismatches[:8]}"
+    assert mask.sum() > 0, "expected at least one resolved neighbor"

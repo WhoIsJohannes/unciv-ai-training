@@ -162,8 +162,9 @@ class OnnxPolicy(
         private val FALLBACK_WIDTH = mapOf("own_units" to 9, "opp_units" to 9,
                                            "own_cities" to 17, "opp_cities" to 17, "civ_tokens" to 84)
 
-        /** v3 clock-direction offsets (dirs 12,2,4,6,8,10) — MUST match Python hexgraph.OFFSETS. */
-        private val HEX_OFFSETS = arrayOf(
+        /** v3 clock-direction offsets (dirs 12,2,4,6,8,10) — MUST match Python hexgraph.OFFSETS.
+         *  internal so the adjacency-dump fidelity harness reuses the SAME offsets (no drift). */
+        internal val HEX_OFFSETS = arrayOf(
             intArrayOf(1, 1), intArrayOf(0, 1), intArrayOf(-1, 0),
             intArrayOf(-1, -1), intArrayOf(0, -1), intArrayOf(1, 0),
         )

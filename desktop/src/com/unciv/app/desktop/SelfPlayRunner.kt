@@ -9,6 +9,7 @@ import com.unciv.logic.GameInfo
 import com.unciv.logic.GameStarter
 import com.unciv.logic.civilization.PlayerType
 import com.unciv.logic.map.MapParameters
+import com.unciv.logic.map.MapShape
 import com.unciv.logic.map.MapSize
 import com.unciv.logic.map.MirroringType
 import com.unciv.logic.simulation.SimStats
@@ -71,7 +72,8 @@ object SelfPlayRunner {
             "parity-dump" -> { bootstrap(); parityDump(args) }
             "parity-run" -> parityRun(args)   // ORT only — no engine bootstrap needed
             "parity-dump-rich" -> { bootstrap(); parityDumpRich(args) }
-            "parity-run-rich" -> parityRunRich(args)   // ORT only — multi-tensor v2 contract
+            "parity-run-rich" -> parityRunRich(args)   // ORT only — multi-tensor v2/v3 contract
+            "adjacency-dump" -> { bootstrap(); adjacencyDump(args) }   // v3 FND-0036 fidelity harness
             "trace" -> { bootstrap(); trace(args) }
             else -> error("unknown mode '$mode'")
         }
@@ -413,5 +415,43 @@ object SelfPlayRunner {
             session.close()
         }
         println("PARITY_RUN_RICH -> $logitsOut")
+    }
+
+    /** v3 FND-0036 fidelity dump: emit per-tile (x,y) + the LIVE engine's degree-6 neighbor
+     *  zeroBasedIndices (getIfTileExistsOrNull + the SAME [OnnxPolicy.HEX_OFFSETS] used at inference)
+     *  on a WORLD-WRAP map, so a Python test can assert hexgraph.build_neighbor_graph reproduces it. */
+    @ExperimentalTime
+    private fun adjacencyDump(args: Array<String>) {
+        val seed = args.getOrNull(1)?.toLongOrNull() ?: 4242L
+        val out = args.getOrNull(2) ?: "adjacency-dump.json"
+        val mapSizeName = args.getOrNull(3) ?: "Tiny"
+        val ruleset = setupRuleset()
+        val mp = mapParameters(seed, mapSizeName).apply { worldWrap = true }  // exercise the wrap branch
+        val game = GameStarter.startNewGame(GameSetupInfo(gameParameters(ruleset), mp))
+        UncivGame.Current.gameInfo = game
+        val tm = game.tileMap
+        val n = tm.tileList.size
+        val deg = SampleSchema.OnnxContract.HEX_DEGREE
+        val coords = Array(n) { intArrayOf(0, 0) }
+        val live = Array(n) { IntArray(deg) { -1 } }
+        for (tile in tm.tileList) {
+            val r = tile.zeroBasedIndex
+            if (r < 0 || r >= n) continue
+            val x = tile.position.x.toInt(); val y = tile.position.y.toInt()
+            coords[r] = intArrayOf(x, y)
+            for (d in 0 until deg) {
+                val nb = tm.getIfTileExistsOrNull(x + OnnxPolicy.HEX_OFFSETS[d][0], y + OnnxPolicy.HEX_OFFSETS[d][1])
+                live[r][d] = nb?.zeroBasedIndex ?: -1
+            }
+        }
+        val effWrapRadius = if (mp.shape == MapShape.rectangular) mp.mapSize.width / 2 else mp.mapSize.radius
+        val shapeOrd = when (mp.shape) { MapShape.rectangular -> 0; MapShape.flatEarth -> 2; else -> 1 }
+        val sb = StringBuilder("{")
+        sb.append("\"nTiles\":$n,\"effWrapRadius\":$effWrapRadius,")
+        sb.append("\"worldWrap\":${if (mp.worldWrap) 1 else 0},\"shape\":$shapeOrd,")
+        sb.append("\"coords\":[").append((0 until n).joinToString(",") { "[${coords[it][0]},${coords[it][1]}]" }).append("],")
+        sb.append("\"live\":[").append((0 until n).joinToString(",") { live[it].joinToString(",", "[", "]") }).append("]}")
+        File(out).writeText(sb.toString())
+        println("ADJACENCY_DUMP nTiles=$n worldWrap=${mp.worldWrap} -> $out")
     }
 }
