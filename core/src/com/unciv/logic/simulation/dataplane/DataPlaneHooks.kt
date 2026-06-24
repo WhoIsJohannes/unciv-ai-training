@@ -143,7 +143,7 @@ object DataPlaneHooks {
     /** Provenance + caps + layout header JSON (also written verbatim as `schema.json`). */
     fun buildHeaderJson(
         gameInfo: GameInfo, fingerprint: String, gameId: String, seed: Long,
-        caps: SampleCaps, blocks: List<Observation.Block>,
+        caps: SampleCaps, blocks: List<Observation.Block>, vocab: Vocab,
     ): String {
         val v = UncivGame.VERSION
         val layoutJson = blocks.joinToString(",") { b ->
@@ -151,6 +151,15 @@ object DataPlaneHooks {
             """{"name":"${esc(b.name)}","dtype":"${b.dtype}","kind":"$kind","perItem":${b.perItem},"len":${b.values.size}}"""
         }
         val channels = SampleSchema.SPATIAL_CHANNELS.joinToString(",") { "\"${esc(it)}\"" }
+        // v3: vocab counts so the Python model sizes its nn.Embedding tables (num_embeddings=count+1)
+        // from the schema — NEVER hardcoded. Names match the keys the Python embedding builder reads.
+        val vocabCounts = """{""" +
+            """"terrains":${vocab.size(Vocab.TERRAINS)},"resources":${vocab.resourceCount},""" +
+            """"improvements":${vocab.size(Vocab.IMPROVEMENTS)},"buildings":${vocab.buildingCount},""" +
+            """"units":${vocab.unitCount},"religions":${vocab.size(Vocab.RELIGIONS)},""" +
+            """"eras":${vocab.size(Vocab.ERAS)},"policies":${vocab.policyCount},""" +
+            """"policyBranches":${vocab.policyBranchCount},"promotions":${vocab.promotionCount}""" +
+            """}"""
         // slot↔civId for the major civs (agnostic provenance) — lets the trainer filter to its
         // learner's steps even though turn-order shuffle varies civ_slot per game.
         val majorSlots = gameInfo.civilizations.withIndex()
@@ -169,6 +178,7 @@ object DataPlaneHooks {
             """"maxOwnCities":${caps.maxOwnCities},"maxVisOppCities":${caps.maxVisOppCities},""" +
             """"maxOwnUnits":${caps.maxOwnUnits},"maxVisOppUnits":${caps.maxVisOppUnits}},""" +
             """"spatialChannels":[$channels],""" +
+            """"vocabCounts":$vocabCounts,""" +
             """"layout":[$layoutJson]""" +
             "}"
     }
@@ -210,7 +220,7 @@ class ShardRecorder(
         val blocks = obs.blocks + Observation.Block("actions", SampleSchema.DT_F32, BlockKind.FIXED, 0, actions)
         if (!opened) {
             layout = blocks
-            val header = DataPlaneHooks.buildHeaderJson(gameInfo, fingerprint, gameId, seed, config.caps, blocks)
+            val header = DataPlaneHooks.buildHeaderJson(gameInfo, fingerprint, gameId, seed, config.caps, blocks, vocab)
             emitter.open(header)
             writeSchemaSidecar(header)
             opened = true

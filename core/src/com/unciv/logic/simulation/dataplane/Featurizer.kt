@@ -4,6 +4,7 @@ import com.unciv.logic.GameInfo
 import com.unciv.logic.battle.CityCombatant
 import com.unciv.logic.city.City
 import com.unciv.logic.civilization.Civilization
+import com.unciv.logic.map.MapShape
 import com.unciv.logic.map.mapunit.MapUnit
 import com.unciv.ui.screens.victoryscreen.RankingType
 
@@ -26,8 +27,8 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
     private val channels = SampleSchema.NUM_SPATIAL_CHANNELS
 
     val civTokenWidth get() = fair.tokenWidth
-    private val cityTokenWidth = 16
-    private val unitTokenWidth = 8
+    private val cityTokenWidth = 17  // v3: +centerTile.zeroBasedIndex (entity↔GNN-node co-location)
+    private val unitTokenWidth = 9   // v3: +currentTile.zeroBasedIndex
 
     fun observe(x: Civilization): Observation {
         var overflow = false
@@ -127,6 +128,7 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
             varF32("own_units", unitTokenWidth, ownUnits),
             varF32("opp_units", unitTokenWidth, oppUnits),
             fixedU8("spatial", buildSpatial(x, ownerSlot)),
+            fixedF32(SampleSchema.BLOCK_SPATIAL_COORDS, buildSpatialCoords()),  // v3: signed (x,y), GNN adjacency source
             fixedU8("mask_tech", boolF(LegalActionMasks.techMask(x, vocab))),
             fixedU8("mask_policy", boolF(LegalActionMasks.policyMask(x, vocab, ruleset))),
             fixedU8("mask_greatPerson", boolF(LegalActionMasks.greatPersonMask(x, vocab))),
@@ -156,11 +158,24 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
             val s = demoCtx.perCategory.getValue(cat)
             agg[i * 3] = s.best; agg[i * 3 + 1] = s.avg; agg[i * 3 + 2] = s.worst
         }
+        // v3 map dims: the Python hex-GNN adjacency builder needs the EFFECTIVE wrap radius
+        // (rectangular maps wrap by width/2, hex by radius — see TileMap.getIfTileExistsOrNull),
+        // plus the worldWrap bit + shape ordinal. Read by NAMED schema field (mapDims), not a raw offset.
+        val mp = gameInfo.tileMap.mapParameters
+        val effWrapRadius = if (mp.shape == MapShape.rectangular) mp.mapSize.width / 2 else mp.mapSize.radius
+        val shapeOrdinal = when (mp.shape) {
+            MapShape.rectangular -> 0f
+            MapShape.flatEarth -> 2f
+            else -> 1f   // hexagonal (default)
+        }
         val head = floatArrayOf(
             gameInfo.turns.toFloat(), x.tech.era.eraNumber.toFloat(),
             gameInfo.tileMap.tileList.size.toFloat(),
             x.getKnownCivs().count { it.isMajorCiv() }.toFloat(),
             gameInfo.civilizations.count { it.isMajorCiv() && it.isAlive() }.toFloat(),
+            effWrapRadius.toFloat(),
+            if (mp.worldWrap) 1f else 0f,
+            shapeOrdinal,
         )
         return head + agg
     }
@@ -200,9 +215,14 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
         val hasSpy = config.omniscientOpponents ||
             (!isOwn && x.espionageManager.getSpiesInCity(city).any { it.isSetUp() })
         w.put(if (hasSpy) 1f else 0f)
+        w.put(city.getCenterTile().zeroBasedIndex)   // v3: tile index → co-locate entity with its GNN node
         if (isOwn || hasSpy) {
             val cur = city.cityConstructions.currentConstructionName()
-            w.put((vocab.building(cur).takeIf { it >= 0 } ?: vocab.unit(cur)) + 1)
+            // v3 fix: building#k and unit#k must not collide. building → k+1; unit → buildingCount+k+1; none → 0.
+            val bIdx = vocab.building(cur)
+            val code = if (bIdx >= 0) bIdx + 1
+                       else vocab.unit(cur).let { if (it >= 0) vocab.buildingCount + it + 1 else 0 }
+            w.put(code)
             w.put(city.cityConstructions.getBuiltBuildings().count())
         }
     }
@@ -220,6 +240,7 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
         w.put(if (capital != null) t.position.x.toInt() - capital.position.x.toInt() else 0)
         w.put(if (capital != null) t.position.y.toInt() - capital.position.y.toInt() else 0)
         w.put(u.promotions.getAvailablePromotions().count())
+        w.put(t.zeroBasedIndex)   // v3: tile index → co-locate entity with its GNN node
     }
 
     private fun unitTypeCat(u: MapUnit): Int = when {
@@ -257,6 +278,24 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
                 out[base + 11] = unitTypeCat(unit).toFloat()
                 out[base + 12] = (unit.health.coerceIn(0, 100) / 100f * 4f).toFloat()
             }
+        }
+        return out
+    }
+
+    /**
+     * v3: per-tile signed (x,y) hex coords as a SEPARATE f32 block (u8 `spatial` clamps [0,255] and
+     * can't carry signed/large coords). Always written (position is static, fog-independent). The
+     * Python hex-GNN adjacency builder reads this; it is NOT an ONNX model input.
+     */
+    private fun buildSpatialCoords(): FloatArray {
+        val tiles = gameInfo.tileMap.tileList
+        val w = SampleSchema.NUM_SPATIAL_COORDS
+        val out = FloatArray(tiles.size * w)
+        for (tile in tiles) {
+            val base = tile.zeroBasedIndex * w
+            if (base < 0 || base + w > out.size) continue
+            out[base] = tile.position.x.toFloat()
+            out[base + 1] = tile.position.y.toFloat()
         }
         return out
     }

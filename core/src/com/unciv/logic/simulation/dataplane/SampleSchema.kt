@@ -13,13 +13,14 @@ package com.unciv.logic.simulation.dataplane
  */
 object SampleSchema {
     /**
-     * VERSION 2 (was 1): trajectory shards now carry a real terminal reward + an end-of-game
-     * terminal step per civ (was a hardcoded `reward=0f`, `isTerminal=0` placeholder). The recorded
-     * civ-level action is now ALSO applied to the game (the policy DRIVES tech+policy for controlled
-     * civs — see [DataPlaneHooks]), so a v1 shard (label-only, no reward) is not training-compatible.
+     * VERSION 3 (was 2): v4 structured-encoder layout. Adds a per-tile `spatial_coords` (f32 x,y)
+     * block (the hex-GNN adjacency source — `spatial` stays u8 and cannot hold signed coords), map
+     * dims in `global` (effective wrap radius + worldWrap + shape), a per-entity tile index in the
+     * unit/city tokens, and fixes the construction-namespace collision in the city token. A v2 shard
+     * is not layout-compatible. (VERSION 2 was: real terminal reward + applied civ-level action.)
      * The Python reader REFUSES a VERSION mismatch ⇒ regenerate; datasets are perishable by design.
      */
-    const val VERSION = 2
+    const val VERSION = 3
 
     /** 8 ASCII bytes at the head of every shard. */
     const val MAGIC = "UNCVSMP1"
@@ -37,9 +38,12 @@ object SampleSchema {
         /** Contract v1 = blind single-tensor input ("obs"); v1-reinforce + blind-critic models. */
         const val CONTRACT_VERSION = 1
         /** Contract v2 = rich MULTI-TENSOR input (global, acting_civ, per-type token sets + masks);
-         *  rich-critic models. OnnxPolicy reads META_CONTRACT_VERSION and selects the build path,
-         *  so v1 and v2 models coexist (the provenance gate accepts either). */
+         *  rich-critic (pool) models. */
         const val CONTRACT_VERSION_RICH = 2
+        /** Contract v3 = v4 STRUCTURED encoder: the v2 multi-tensor input PLUS two hex-GNN adjacency
+         *  inputs (neighbor_index int64 + neighbor_mask f32, both [B,N,6] sharing spatial's N axis).
+         *  OnnxPolicy reads META_CONTRACT_VERSION and selects the build path, so v1/v2/v3 coexist. */
+        const val CONTRACT_VERSION_STRUCTURED = 3
         /** Net input tensor (v1): concat(observation block "global", block "acting_civ"), float32. */
         const val INPUT_NAME = "obs"
         // v2 named multi-tensor inputs. Each token set pairs with a "<name>_mask" presence mask.
@@ -47,6 +51,13 @@ object SampleSchema {
         const val INPUT_ACTING = "acting_civ"
         val RICH_TOKEN_NAMES = listOf("spatial", "own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens")
         const val MASK_SUFFIX = "_mask"
+        // v3 hex-GNN adjacency inputs (NOT token sets — distinct int64 index + float mask, degree-6).
+        // Derived from per-tile coords at train time (Python) and from the live TileMap at inference (JVM).
+        const val INPUT_NEIGHBOR_INDEX = "neighbor_index"
+        const val INPUT_NEIGHBOR_MASK = "neighbor_mask"
+        val NEIGHBOR_INPUT_NAMES = listOf(INPUT_NEIGHBOR_INDEX, INPUT_NEIGHBOR_MASK)
+        /** Fixed hex degree (6 clock directions); missing neighbor → sentinel index N + mask 0. */
+        const val HEX_DEGREE = 6
         const val OUTPUT_TECH = "tech_logits"
         const val OUTPUT_POLICY = "policy_logits"
         /** The civ-level heads the net controls, in `actions`-block order. */
@@ -99,6 +110,14 @@ object SampleSchema {
         "unit_health_bucket", // TRANSIENT: 0..4 (0 when full / not damaged-visible)
     )
     val NUM_SPATIAL_CHANNELS get() = SPATIAL_CHANNELS.size
+
+    /**
+     * v3: per-tile signed (x,y) hex coordinates, emitted as a SEPARATE f32 block (the u8 `spatial`
+     * plane clamps to [0,255] and cannot carry signed/large coords). Shard-only — the Python hex-GNN
+     * adjacency builder reads it; it is NOT an ONNX model input (the model gets `neighbor_index`).
+     */
+    const val BLOCK_SPATIAL_COORDS = "spatial_coords"
+    const val NUM_SPATIAL_COORDS = 2  // (x, y)
 
     /** Factored legal-action mask heads (boolean per candidate). Unit-intent + per-city
      *  construction are emitted per-entity in the UNIT/CITY tokens, not as global heads. */
