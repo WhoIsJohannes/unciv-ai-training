@@ -158,7 +158,8 @@ object DataPlaneHooks {
             """"improvements":${vocab.size(Vocab.IMPROVEMENTS)},"buildings":${vocab.buildingCount},""" +
             """"units":${vocab.unitCount},"religions":${vocab.size(Vocab.RELIGIONS)},""" +
             """"eras":${vocab.size(Vocab.ERAS)},"policies":${vocab.policyCount},""" +
-            """"policyBranches":${vocab.policyBranchCount},"promotions":${vocab.promotionCount}""" +
+            """"policyBranches":${vocab.policyBranchCount},"promotions":${vocab.promotionCount},""" +
+            """"nations":${vocab.nationCount}""" +
             """}"""
         // slot↔civId for the major civs (agnostic provenance) — lets the trainer filter to its
         // learner's steps even though turn-order shuffle varies civ_slot per game.

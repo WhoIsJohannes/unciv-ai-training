@@ -148,4 +148,13 @@ def vocab_counts_from_schema(schema_path: str | Path) -> dict:
             f"{schema_path}: schema missing 'vocabCounts' — regenerate shards on contract v3 "
             "(embedding cardinalities must come from the schema, never hardcoded)"
         )
-    return {str(k): int(v) for k, v in vc.items()}
+    # The Kotlin header emits PLURAL keys (terrains/resources/...); the model's embedding tables key
+    # off SINGULAR names (terrain/resource/...). Normalize so the Kotlin↔Python seam lines up — this
+    # is the integration seam the unit smoke (hardcoded singular keys) can't catch.
+    _ALIASES = {
+        "terrains": "terrain", "resources": "resource", "improvements": "improvement",
+        "religions": "religion", "eras": "era", "buildings": "building", "units": "unit",
+        "promotions": "promotion", "nations": "nation", "policies": "policy",
+        "policyBranches": "policyBranch",
+    }
+    return {_ALIASES.get(str(k), str(k)): int(v) for k, v in vc.items()}

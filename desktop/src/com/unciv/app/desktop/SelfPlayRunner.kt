@@ -38,6 +38,7 @@ import com.unciv.models.tilesets.TileSetCache
 import com.unciv.utils.Log
 import java.io.File
 import java.nio.FloatBuffer
+import java.nio.LongBuffer
 import kotlin.time.ExperimentalTime
 
 /**
@@ -356,6 +357,10 @@ object SelfPlayRunner {
         var global = FloatArray(0)
         var acting = FloatArray(0)
         val tokens = ArrayList<Triple<String, FloatArray, Int>>()
+        var neighborIdx: LongArray? = null   // v3 structured: hex-GNN neighbor inputs from the fixture
+        var neighborMask: FloatArray? = null
+        var neighborN = 0
+        var neighborDeg = SampleSchema.OnnxContract.HEX_DEGREE
         for (raw in File(obsIn).readLines()) {
             val line = raw.trim()
             if (line.isEmpty()) continue
@@ -371,6 +376,14 @@ object SelfPlayRunner {
                     val v = FloatArray(count * width) { t[it + 4].toFloat() }
                     tokens.add(Triple(name, v, width))
                 }
+                "adj" -> {   // <name> adj <N> <deg> <N*deg ints/floats> — neighbor_index (int64) / neighbor_mask
+                    val nn = t[2].toInt(); val deg = t[3].toInt()
+                    neighborN = nn; neighborDeg = deg
+                    if (name == SampleSchema.OnnxContract.INPUT_NEIGHBOR_INDEX)
+                        neighborIdx = LongArray(nn * deg) { t[it + 4].toFloat().toLong() }
+                    else if (name == SampleSchema.OnnxContract.INPUT_NEIGHBOR_MASK)
+                        neighborMask = FloatArray(nn * deg) { t[it + 4].toFloat() }
+                }
             }
         }
         val env = OrtEnvironment.getEnvironment()
@@ -379,6 +392,13 @@ object SelfPlayRunner {
         var inputs: LinkedHashMap<String, OnnxTensor>? = null
         try {
             inputs = OnnxPolicy.richTensorsFromArrays(env, global, acting, tokens)
+            val nIdx = neighborIdx; val nMask = neighborMask
+            if (nIdx != null && nMask != null) {   // v3 structured: feed fixture-built neighbor tensors
+                inputs[SampleSchema.OnnxContract.INPUT_NEIGHBOR_INDEX] =
+                    OnnxTensor.createTensor(env, LongBuffer.wrap(nIdx), longArrayOf(1, neighborN.toLong(), neighborDeg.toLong()))
+                inputs[SampleSchema.OnnxContract.INPUT_NEIGHBOR_MASK] =
+                    OnnxTensor.createTensor(env, FloatBuffer.wrap(nMask), longArrayOf(1, neighborN.toLong(), neighborDeg.toLong()))
+            }
             session.run(inputs).use { res ->
                 @Suppress("UNCHECKED_CAST")
                 val tech = (res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor).value as Array<FloatArray>
