@@ -217,12 +217,8 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
         w.put(if (hasSpy) 1f else 0f)
         w.put(city.getCenterTile().zeroBasedIndex)   // v3: tile index → co-locate entity with its GNN node
         if (isOwn || hasSpy) {
-            val cur = city.cityConstructions.currentConstructionName()
-            // v3 fix: building#k and unit#k must not collide. building → k+1; unit → buildingCount+k+1; none → 0.
-            val bIdx = vocab.building(cur)
-            val code = if (bIdx >= 0) bIdx + 1
-                       else vocab.unit(cur).let { if (it >= 0) vocab.buildingCount + it + 1 else 0 }
-            w.put(code)
+            // v3 fix: collision-free building∪unit code (see Vocab.constructionCode).
+            w.put(vocab.constructionCode(city.cityConstructions.currentConstructionName()))
             w.put(city.cityConstructions.getBuiltBuildings().count())
         }
     }

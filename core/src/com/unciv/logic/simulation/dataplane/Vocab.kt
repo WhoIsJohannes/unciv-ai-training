@@ -48,6 +48,19 @@ class Vocab(ruleset: Ruleset) {
     fun victory(id: String) = index(VICTORIES, id)
     fun religion(id: String) = index(RELIGIONS, id)
 
+    /**
+     * v3 collision-free construction code over the disjoint building∪unit namespace (field width is
+     * reserved as buildingCount+unitCount): building#k → k+1, unit#k → buildingCount+k+1, none → 0.
+     * The +1 keeps 0 = "no/empty construction". (Was a latent bug: the unit branch lacked the
+     * buildingCount offset, so building#k and unit#k collided onto the same code.)
+     */
+    fun constructionCode(name: String): Int {
+        val b = building(name)
+        if (b >= 0) return b + 1
+        val u = unit(name)
+        return if (u >= 0) buildingCount + u + 1 else 0
+    }
+
     val techCount get() = size(TECHS)
     val buildingCount get() = size(BUILDINGS)
     val unitCount get() = size(UNITS)
