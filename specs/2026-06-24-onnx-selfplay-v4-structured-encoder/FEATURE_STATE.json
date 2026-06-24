@@ -1,0 +1,7 @@
+{ "slug": "onnx-selfplay-v4-structured-encoder", "started": "2026-06-24", "mode": "BUILD", "size": "L",
+  "current_phase": 2, "current_step": 4, "last_completed_step": 3,
+  "spec_dir": "specs/2026-06-24-onnx-selfplay-v4-structured-encoder",
+  "worktree": "/Users/j/Unciv-onnx-selfplay-loop", "branch": "onnx-selfplay-loop",
+  "repo_root": "/Users/j/Unciv",
+  "source_commit_at_start": "5ac0a3cf699fca518d65062106fb3f59733e26cf",
+  "notes": "worktree+branch deleted externally mid-session; recreated from master per user choice. SimBenchmark already exists -> D8 extends it." }
