@@ -33,21 +33,21 @@ Full design detail: `design/design-C1..C4.md`. Decisions: `decisions.md`. Build 
 - **CHECKPOINT A:** train GNN-only structured net, check Medium vs v3
 
 ## Phase B — attention layers
-- [ ] D4 self-attention over entity sets (hand-rolled, NaN-safe; fully-masked set → zeros)
-- [ ] D4 entity↔node join (gather co-located GNN node by tile-index, fuse into entity token)
-- [ ] D5 cross-attention (single query; K/V = nodes⊕entities; union mask; NaN-safe)
-- [ ] D6 trunk split (shared body → policy-late {tech,policy} + value-late; small-init value head)
+- [x] D4 self-attention over entity sets (hand-rolled, NaN-safe; fully-masked set → zeros)
+- [x] D4 entity↔node join (gather co-located GNN node by tile-index, fuse into entity token)
+- [x] D5 cross-attention (single query; K/V = nodes⊕entities; union mask; NaN-safe)
+- [x] D6 trunk split (shared body → policy-late {tech,policy} + value-late; small-init value head)
 
 ## Phase C — ladder + throughput + experiment
-- [ ] D7 ladder (small/medium/large; K=3; scale/stop rules; OOM via mem-cap+timeout; train/eval-gap proxy)
-- [ ] D7 run_loop --variant structured (alias rich-v2); run_one_round returns model_path+rung
-- [ ] D8 Timers.timeThis("onnxForward") wrap; SimBenchmark ONNX mode (training ruleset/2-civ); 70% gate; BENCH| RUNG line; OrtSession closed in finally
+- [x] D7 ladder (small/medium/large; K=3; scale/stop rules; OOM via mem-cap+timeout; train/eval-gap proxy)
+- [x] D7 run_loop --variant structured (alias rich-v2); run_one_round returns model_path+rung
+- [x] D8 Timers.timeThis("onnxForward") wrap; SimBenchmark ONNX mode (training ruleset/2-civ); 70% gate; BENCH| RUNG line; OrtSession closed in finally
 - [ ] D10 experiment: Tiny+Medium curves, budget constant vs v3; 200-game Medium z-test (AC1); Tiny non-inferiority
 
 ## Non-negotiables (assert throughout)
-- [ ] frozen seam; _optimize_actor_critic/compute_gae/train core untouched
-- [ ] opset 17 (no scatter/SDPA); heads {tech,policy}+value-train-only; terminal-reward+critic only
-- [ ] fail-loud lockstep; legality; determinism+provenance; onnx_decisions>0 + ONNX-error fail-loud
+- [x] frozen seam; _optimize_actor_critic/compute_gae/train core untouched
+- [x] opset 17 (no scatter/SDPA); heads {tech,policy}+value-train-only; terminal-reward+critic only
+- [x] fail-loud lockstep; legality; determinism+provenance; onnx_decisions>0 + ONNX-error fail-loud
 
 ## Codebase patterns (fill as discovered)
 - (Kotlin) blocks written via Observation.writeBlock; u8 clamps [0,255], f32 lossless (ShardFormat.f32s)
