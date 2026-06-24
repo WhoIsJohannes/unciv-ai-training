@@ -13,10 +13,9 @@ from pathlib import Path
 from typing import Any
 
 # Mirror of com.unciv.logic.simulation.dataplane.SampleSchema.VERSION — keep in lockstep.
-# v2: shards now carry a real terminal reward + an end-of-game terminal step per civ, and the
-# recorded civ-level action is applied to the game (the policy drives tech+policy). v1 shards
-# (label-only, reward=0) are not training-compatible — the reader refuses them.
-SCHEMA_VERSION = 2
+# v3 (v4 structured encoder): adds the per-tile spatial_coords (f32 x,y) block, map dims in global,
+# per-entity tile-index, and the construction-namespace fix. v2/v1 shards are not layout-compatible.
+SCHEMA_VERSION = 3
 
 
 class SchemaError(Exception):
