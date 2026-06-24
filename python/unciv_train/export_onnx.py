@@ -5,6 +5,8 @@ JVM via `session.getMetadata().getCustomMetadata()` so EVAL refuses a contract-m
 """
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
 import onnx
@@ -14,6 +16,20 @@ import torch.nn as nn
 from . import contract
 from .contract import Dims
 from .model import PolicyNet
+
+
+def _atomic_save(model, out_path: str) -> None:
+    """Atomic ONNX write: serialize to a sibling .tmp then os.replace (mirrors ShardFormat's atomic
+    finalize — a crash mid-write never leaves a half-written model the JVM might load)."""
+    out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=out_dir, suffix=".onnx.tmp")
+    os.close(fd)
+    try:
+        onnx.save(model, tmp)
+        os.replace(tmp, out_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 class _PolicyOnly(nn.Module):
@@ -89,16 +105,28 @@ def export_rich(
     ruleset_fingerprint: str,
     sample_inputs: dict | None = None,
     opset: int = 17,
+    neighbors: bool = False,
+    contract_version: int | None = None,
 ) -> None:
-    """Rich/contract-v2 export: MULTI-TENSOR named input (global, acting_civ, each token set +
-    its presence mask) with dynamic axes; policy-only outputs (value dropped). Stamps
-    CONTRACT_VERSION_RICH so the JVM bridge selects the multi-tensor path."""
+    """Rich/contract-v2(+v3) export: MULTI-TENSOR named input (global, acting_civ, each token set +
+    its presence mask) with dynamic axes; policy-only outputs (value dropped).
+
+    Stamps CONTRACT_VERSION_RICH (=2) by default so the JVM bridge selects the multi-tensor path.
+    When `neighbors=True` (v4 structured encoder), also appends the degree-6 graph tensors
+    `neighbor_index` (int64) + `neighbor_mask` (f32) — built OUTSIDE the float32 sample coercion so
+    the int64 index dtype survives — both sharing spatial's `n_spatial` dynamic axis (degree axis
+    static 6), and the caller should pass `contract_version=CONTRACT_VERSION_STRUCTURED`. Atomic write.
+    """
     import numpy as np
 
     out_path = str(out_path)
     net.eval()
+    if contract_version is None:
+        contract_version = contract.CONTRACT_VERSION_RICH
 
-    # Ordered tensor names: global, acting_civ, then each token set + its presence mask.
+    # Ordered tensor names: global, acting_civ, then each token set + its presence mask. The two
+    # neighbor tensors (when present) are appended immediately after the spatial pair so the
+    # positional export order is unambiguous and documents the coupling to spatial's node axis.
     names = [contract.INPUT_GLOBAL, contract.INPUT_ACTING]
     dummy: dict[str, torch.Tensor] = {
         contract.INPUT_GLOBAL: torch.zeros(1, dims.global_w),
@@ -106,15 +134,31 @@ def export_rich(
     }
     dyn = {contract.INPUT_GLOBAL: {0: "batch"}, contract.INPUT_ACTING: {0: "batch"},
            contract.OUTPUT_TECH: {0: "batch"}, contract.OUTPUT_POLICY: {0: "batch"}}
+    n0 = 2
     for name, width in token_specs.items():
-        n0 = 2
         dummy[name] = torch.zeros(1, n0, width)
         dummy[name + "_mask"] = torch.ones(1, n0)
         names += [name, name + "_mask"]
         dyn[name] = {0: "batch", 1: "n_" + name}
         dyn[name + "_mask"] = {0: "batch", 1: "n_" + name}
+        if neighbors and name == "spatial":
+            # Reuse spatial's dummy row count (n0) AND its dynamic label so the neighbor node axis is
+            # byte-identically bound to spatial's "n_spatial" — values 0..n0-1 are valid Gather rows.
+            n_sp = int(dummy["spatial"].shape[1])
+            ni, nm = contract.INPUT_NEIGHBOR_INDEX, contract.INPUT_NEIGHBOR_MASK
+            dummy[ni] = torch.zeros(1, n_sp, contract.NEIGHBOR_DEGREE, dtype=torch.int64)
+            dummy[nm] = torch.ones(1, n_sp, contract.NEIGHBOR_DEGREE)
+            names += [ni, nm]
+            dyn[ni] = {0: "batch", 1: "n_spatial"}
+            dyn[nm] = {0: "batch", 1: "n_spatial"}
     if sample_inputs is not None:
-        dummy.update({k: torch.as_tensor(np.asarray(v, dtype=np.float32)) for k, v in sample_inputs.items()})
+        # Coerce float32 for every override EXCEPT neighbor_index, which must stay int64 (ORT Gather
+        # index dtype) — handle it OUTSIDE the float32 dict so it is never down-cast to float.
+        for k, v in sample_inputs.items():
+            if k == contract.INPUT_NEIGHBOR_INDEX:
+                dummy[k] = torch.as_tensor(np.asarray(v)).long()
+            else:
+                dummy[k] = torch.as_tensor(np.asarray(v, dtype=np.float32))
 
     wrapped = _RichPolicyOnly(net, names)
     args = tuple(dummy[n] for n in names)  # POSITIONAL tensors in name order (ONNX-traceable)
@@ -129,10 +173,10 @@ def export_rich(
     onnx.helper.set_model_props(model, {
         contract.META_SCHEMA_VERSION: str(schema_version),
         contract.META_RULESET_FINGERPRINT: ruleset_fingerprint,
-        contract.META_CONTRACT_VERSION: str(contract.CONTRACT_VERSION_RICH),
+        contract.META_CONTRACT_VERSION: str(contract_version),
         contract.META_INPUT_WIDTH: str(dims.input_w),
         contract.META_TECH_WIDTH: str(dims.tech_w),
         contract.META_POLICY_WIDTH: str(dims.policy_w),
         contract.META_INPUT_NAMES: ",".join(names),
     })
-    onnx.save(model, out_path)
+    _atomic_save(model, out_path)

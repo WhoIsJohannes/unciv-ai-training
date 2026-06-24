@@ -33,8 +33,12 @@ class TrainStep:
 
 
 # Per-type entity/spatial token blocks consumed by the rich variant (perItem widths come from the
-# generated schema; spatial is FIXED nTiles*13 and reshaped to [nTiles, 13]).
+# generated schema; spatial is nTiles*n_channels (schema-driven) and reshaped to [nTiles, n_channels]).
 RICH_TOKEN_BLOCKS = ("spatial", "own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens")
+# Contract-v3 (structured) shard-only block: per-tile (x,y) coords as f32 [nTiles*2]. Consumed by
+# the Python hex-adjacency builder (hexgraph) to derive neighbor_index/neighbor_mask — it is NOT an
+# ONNX model input and is absent on contract-v2 shards (handled gracefully: returns None).
+SPATIAL_COORDS_BLOCK = "spatial_coords"
 
 
 @dataclass
@@ -103,15 +107,32 @@ def load_training_steps(
     return out
 
 
-def _rich_step_blocks(blocks: dict) -> dict:
-    """Extract the per-step rich token blocks. spatial (FIXED nTiles*13) → [nTiles, 13];
-    entity blocks (VARIABLE) are already [count, perItem]; an absent/empty block → [0, perItem]."""
+def _rich_step_blocks(blocks: dict, n_channels: int) -> dict:
+    """Extract the per-step rich token blocks. spatial (nTiles*n_channels, schema-driven) →
+    [nTiles, n_channels]; entity blocks (VARIABLE) are already [count, perItem]; an absent/empty
+    block → [0, perItem]. The contract-v3 `spatial_coords` block (nTiles*2 f32), when present, is
+    reshaped to [nTiles, 2] and returned for the Python adjacency builder (None on v2 shards).
+
+    `n_channels` is the schema's spatial channel count (FAIL-LOUD god-constant, no hardcoded 13)."""
     out = {
         "global": np.asarray(blocks["global"], dtype=np.float32),
         "acting_civ": np.asarray(blocks["acting_civ"], dtype=np.float32),
     }
-    spatial = np.asarray(blocks["spatial"], dtype=np.float32).reshape(-1, 13)
-    out["spatial"] = spatial
+    spatial = np.asarray(blocks["spatial"], dtype=np.float32)
+    if spatial.size % n_channels != 0:
+        raise ValueError(
+            f"spatial block size {spatial.size} not divisible by n_channels {n_channels} "
+            "(schema/shard channel-count drift)"
+        )
+    out["spatial"] = spatial.reshape(-1, n_channels)
+    coords = blocks.get(SPATIAL_COORDS_BLOCK)
+    if coords is not None:
+        coords = np.asarray(coords, dtype=np.float32)
+        if coords.size % 2 != 0:
+            raise ValueError(f"spatial_coords block size {coords.size} not divisible by 2")
+        out[SPATIAL_COORDS_BLOCK] = coords.reshape(-1, 2)
+    else:
+        out[SPATIAL_COORDS_BLOCK] = None
     for name in ("own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"):
         b = blocks.get(name)
         arr = np.asarray(b, dtype=np.float32) if b is not None else np.zeros((0, 0), np.float32)
@@ -128,10 +149,16 @@ def load_trajectories(
     expected_version: int,
     expected_fingerprint: str,
     rich: bool = False,
+    expected_spatial_channels: int | None = None,
 ) -> list[TrainTrajectory]:
     """Ordered per-game learner-step trajectories for actor-critic + GAE. Same provenance gates as
-    `load_training_steps`. `rich=True` also attaches per-step token blocks for the rich variant.
+    `load_training_steps`. `rich=True` also attaches per-step token blocks for the rich/structured
+    variant; `expected_spatial_channels` is the schema-driven spatial channel count (REQUIRED when
+    rich — no hardcoded 13, FND-0007).
     """
+    if rich and expected_spatial_channels is None:
+        raise ValueError("load_trajectories(rich=True) requires expected_spatial_channels "
+                         "(schema-driven spatial channel count; SSOT is Kotlin SampleSchema)")
     out: list[TrainTrajectory] = []
     for p in sorted(str(x) for x in paths):
         shard = reader.load(p)
@@ -160,6 +187,7 @@ def load_trajectories(
         mask_policy = np.stack([s.blocks["mask_policy"] for s in steps]).astype(np.float32)
         rewards = np.zeros(t, dtype=np.float32)
         rewards[-1] = term_r                              # terminal-only ±1
-        rich_blocks = [_rich_step_blocks(s.blocks) for s in steps] if rich else None
+        rich_blocks = ([_rich_step_blocks(s.blocks, expected_spatial_channels) for s in steps]
+                       if rich else None)
         out.append(TrainTrajectory(obs, a_tech, a_policy, mask_tech, mask_policy, rewards, rich_blocks))
     return out

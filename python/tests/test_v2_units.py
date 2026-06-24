@@ -76,7 +76,8 @@ def test_load_trajectories_keeps_noaction_and_terminal_only_reward(tmp_path):
 def test_load_trajectories_rich_blocks_present(tmp_path):
     p = tmp_path / "traj.bin"
     p.write_bytes(_shard_with_steps([(2, 1)]))
-    trajs = dataset.load_trajectories([p], expected_version=2, expected_fingerprint="deadbeef", rich=True)
+    trajs = dataset.load_trajectories([p], expected_version=2, expected_fingerprint="deadbeef",
+                                      rich=True, expected_spatial_channels=13)
     assert trajs[0].rich is not None and "spatial" in trajs[0].rich[0]
 
 

@@ -201,8 +201,11 @@ def main(argv=None) -> int:
         if args.variant == "v1-reinforce":
             data = ds.load_training_steps(shards, expected_version=ver, expected_fingerprint=fp)
         else:
-            data = ds.load_trajectories(shards, expected_version=ver, expected_fingerprint=fp,
-                                        rich=(args.variant == "rich-critic"))
+            is_rich = args.variant in ("rich-critic", "structured")
+            data = ds.load_trajectories(
+                shards, expected_version=ver, expected_fingerprint=fp, rich=is_rich,
+                expected_spatial_channels=(contract.spatial_channels_from_schema(schema)
+                                           if is_rich else None))
         net, stats, mode = train_round(args.variant, data, dims, schema, args, seed=r)
 
         # checkpoint (state_dict only; loaded with weights_only=True on resume — R7)
