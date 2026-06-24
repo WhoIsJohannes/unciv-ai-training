@@ -32,8 +32,8 @@ def test_returns_correct_shapes_and_dtype():
     assert idx.shape == (n, 6)
     assert mask.shape == (n, 6)
     assert np.issubdtype(np.asarray(idx).dtype, np.integer)
-    # every index must be a valid row (no OOB Gather — council FND-0025)
-    assert idx.min() >= 0 and idx.max() < n
+    # every index in [0, N]: N is the sentinel/pad row the model appends; no OOB Gather (FND-0025/0035)
+    assert idx.min() >= 0 and idx.max() <= n
 
 
 def test_interior_tile_has_all_six_neighbors_in_clock_order():
@@ -55,16 +55,13 @@ def test_edge_tile_masks_absent_neighbors():
 
 
 def test_world_wrap_resolves_off_map_neighbor():
-    # Two tiles at opposite wrap edges become neighbors under world wrap.
-    # x wraps by +-R: a tile at (x,y) whose dir-d neighbor (nx,ny) is off-map is retried at
-    # (nx+R, ny-R) then (nx-R, ny+R) -- mirroring TileMap.getIfTileExistsOrNull branch C/D.
+    # row0=(2,2); its dir10 (+1,0) neighbor (3,2) is off-map but wrap-retry D (nx-R, ny+R)=(0,5)=row1.
+    # (getIfTileExistsOrNull: direct miss -> (nx+R,ny-R)=(6,-1) miss -> (nx-R,ny+R)=(0,5) hit.)
     R = 3
-    # left-edge tile (-R, 0) and the tile that should wrap to it from the right.
-    # dir10 (+1,0) from (R-1, 0) -> (R, 0) is off-map; wrap retry (R-R, 0+R)=(0,R)... construct a
-    # minimal set where exactly one wrap neighbor exists, and assert it is found + masked present.
-    coords = np.asarray([(R - 1, 0), (-R, 0)], dtype=np.float32)  # row0 right-edge, row1 left-edge
+    coords = np.asarray([(2, 2), (0, 5)], dtype=np.float32)
+    DIR10 = 5  # OFFSETS index of (+1,0)
     idx, mask = hexgraph.build_neighbor_graph(coords, eff_wrap_radius=R, world_wrap=True, shape=SHAPE_HEX)
-    # dir10 (+1,0): (R,0) off-map -> wrap (R-R, 0+R)=(0,R) absent, (R+R??)... the exact wrapped row
-    # must equal the live engine; here we only assert wrap CHANGES the result vs no-wrap:
+    assert mask[0, DIR10] == 1 and idx[0, DIR10] == 1, "wrap must find row1 as row0's +1,0 neighbor"
     idx_nw, mask_nw = hexgraph.build_neighbor_graph(coords, eff_wrap_radius=R, world_wrap=False, shape=SHAPE_HEX)
-    assert mask.sum() >= mask_nw.sum(), "world wrap must not lose neighbors vs no-wrap"
+    assert mask_nw[0, DIR10] == 0, "without world wrap that neighbor is off-map (absent)"
+    assert mask.sum() > mask_nw.sum(), "world wrap must find strictly more neighbors here"
