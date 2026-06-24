@@ -17,10 +17,6 @@ import json
 import math
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-
 from . import run_loop  # reuse evaluate() (gradle eval) for the final ceiling eval  # noqa: E402
 
 LAST_K = 4
@@ -60,6 +56,13 @@ def _two_proportion_z(w1: int, n1: int, w2: int, n2: int) -> tuple[float, float]
 
 
 def _overlay(curves: dict[str, list[dict]], png: Path, title: str) -> None:
+    try:  # best-effort: overlay PNG is nice-to-have, not required
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[analyze] matplotlib not installed — skipping overlay PNG")
+        return
     plt.figure(figsize=(8, 4.5))
     plt.axhline(50, color="gray", ls="--", lw=1, label="RandomPolicy (50%)")
     for i, (name, rows) in enumerate(curves.items()):

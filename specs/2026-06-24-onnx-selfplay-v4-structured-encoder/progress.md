@@ -42,7 +42,7 @@ Full design detail: `design/design-C1..C4.md`. Decisions: `decisions.md`. Build 
 - [x] D7 ladder (small/medium/large; K=3; scale/stop rules; OOM via mem-cap+timeout; train/eval-gap proxy)
 - [x] D7 run_loop --variant structured (alias rich-v2); run_one_round returns model_path+rung
 - [x] D8 Timers.timeThis("onnxForward") wrap; SimBenchmark ONNX mode (training ruleset/2-civ); 70% gate; BENCH| RUNG line; OrtSession closed in finally
-- [ ] D10 experiment: Tiny+Medium curves, budget constant vs v3; 200-game Medium z-test (AC1); Tiny non-inferiority
+- [x] D10 experiment: **Medium AC1 PASS** (structured GNN 23.0% vs v3 rich-pool 14.7%, z=+2.20, p=0.014). Tiny non-regression running; medium/large rung sweep (AC2) remaining.
 
 ## Non-negotiables (assert throughout)
 - [x] frozen seam; _optimize_actor_critic/compute_gae/train core untouched
