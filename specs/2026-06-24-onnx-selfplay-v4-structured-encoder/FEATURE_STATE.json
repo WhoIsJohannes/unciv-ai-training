@@ -3,9 +3,9 @@
   "started": "2026-06-24",
   "mode": "BUILD",
   "size": "L",
-  "current_phase": 3,
-  "current_step": 13,
-  "last_completed_step": 12,
+  "current_phase": 4,
+  "current_step": 17,
+  "last_completed_step": 16,
   "spec_dir": "specs/2026-06-24-onnx-selfplay-v4-structured-encoder",
   "worktree": "/Users/j/Unciv-onnx-selfplay-loop",
   "branch": "onnx-selfplay-loop",
@@ -17,6 +17,7 @@
     "phaseA_remaining": "v3 logits parity wiring (parityRunRich+test_parity), adjacency-fidelity (hexgraph==engine), shard-roundtrip, contract-refusal test [all gradle-gated]",
     "phaseB": "attention + entity\u2194node join + cross-attn + trunk-split-attn (Python, attn_layers>0)",
     "phaseC": "D7 ladder + D8 SimBenchmark throughput guard + experiment (Tiny/Medium, ~2h, AC1 z-test)",
-    "phase4": "ship: verify ACs, ship-council, finalize"
+    "phase4": "ship: verify ACs, ship-council, finalize",
+    "experiment": "Medium AC1 run launched (detached); Tiny + rung-sweep pending"
   }
 }
