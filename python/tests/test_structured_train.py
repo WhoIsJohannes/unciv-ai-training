@@ -76,7 +76,7 @@ def test_structured_trainer_runs(rung):
     vocab_counts = {"terrain": 6, "resource": 5, "improvement": 4, "religion": 3, "era": 4,
                     "building": 7, "unit": 8, "nation": 2, "promotion": 3}
     tj = _tiny_trajectory(dims, token_specs)
-    net, stats = train_actor_critic_structured(
+    net, stats, _opt = train_actor_critic_structured(   # v5: trainer now returns (net, stats, optimizer)
         [tj], dims, token_specs, vocab_counts, RUNGS[rung], epochs=2, lr=1e-3, seed=0)
     assert net is not None
     assert np.isfinite(float(stats.get("loss", 0.0))), f"{rung} loss not finite"

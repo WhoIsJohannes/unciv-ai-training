@@ -116,6 +116,9 @@ def _optimize_actor_critic(
     net,
     forward_fn,
     *,
+    optimizer,                       # v5: INJECTED (was constructed here) — carries Adam moments across rounds
+    forward_chunk_fn=None,           # v5: slice-aware forward(lo, hi) for micro-batched traversal
+    micro_batch_steps: int | None = None,  # v5: chunk size; falsy / >= n ⇒ whole-batch (no-op)
     a_tech: torch.Tensor,
     a_policy: torch.Tensor,
     m_tech: torch.Tensor,
@@ -133,18 +136,31 @@ def _optimize_actor_critic(
     norm_adv: bool,
 ) -> tuple[object, dict]:
     import copy
-    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    opt = optimizer                  # v5: persistent optimizer (built once in the trainer, carried by run_loop)
     n = int(a_tech.shape[0])
+    use_micro = bool(micro_batch_steps) and forward_chunk_fn is not None and micro_batch_steps < n
     stats = {"n": n, "n_traj": len(traj_lens), "ret_pos": n_pos}
     safe_state = copy.deepcopy(net.state_dict())  # restore on divergence (council 🔴: no NaN export)
+    safe_opt = copy.deepcopy(opt.state_dict())    # v5: roll back optimizer moments too (else a diverged round poisons them)
 
     # --- Compute advantages + value targets ONCE per round from a V-snapshot (standard PPO/A2C).
     # Recomputing each epoch makes the target chase V (degenerate value_loss); a fixed target ≈ the
     # bounded discounted-terminal return at λ≈1, so the critic regresses toward a stable signal.
     with torch.no_grad():
-        tl0, pl0, val0 = forward_fn()
-        val0 = val0.reshape(-1)
-        old_logp = (_masked_logp(tl0, a_tech, m_tech) + _masked_logp(pl0, a_policy, m_policy)).detach()
+        if use_micro:                                       # v5: chunk the snapshot; cat → math-identical
+            v_parts, lp_parts = [], []
+            for lo in range(0, n, micro_batch_steps):
+                hi = min(lo + micro_batch_steps, n)
+                tl0, pl0, v0 = forward_chunk_fn(lo, hi)
+                v_parts.append(v0.reshape(-1))
+                lp_parts.append(_masked_logp(tl0, a_tech[lo:hi], m_tech[lo:hi])
+                                + _masked_logp(pl0, a_policy[lo:hi], m_policy[lo:hi]))
+            val0 = torch.cat(v_parts)
+            old_logp = torch.cat(lp_parts).detach()
+        else:
+            tl0, pl0, val0 = forward_fn()
+            val0 = val0.reshape(-1)
+            old_logp = (_masked_logp(tl0, a_tech, m_tech) + _masked_logp(pl0, a_policy, m_policy)).detach()
     v_np = val0.cpu().numpy()
     adv_np = np.zeros(n, dtype=np.float32)
     ret_np = np.zeros(n, dtype=np.float32)
@@ -162,34 +178,76 @@ def _optimize_actor_critic(
 
     for ep in range(epochs):
         opt.zero_grad()
-        tl, pl, val = forward_fn()
-        val = val.reshape(-1)
-        logp = _masked_logp(tl, a_tech, m_tech) + _masked_logp(pl, a_policy, m_policy)
-        if clip_eps:                                        # PPO clip (default ON; 0/None ⇒ plain A2C)
-            logratio = (logp - old_logp).clamp(-20.0, 20.0)  # guard exp() overflow on big policy shifts
-            ratio = torch.exp(logratio)
-            surr = torch.min(ratio * adv, torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv)
-            policy_loss = -surr.mean()
-        else:                                               # plain A2C (single-epoch use)
-            policy_loss = -(adv * logp).mean()
-        value_loss = F.mse_loss(val, ret)
-        ent = (_entropy(tl, m_tech) + _entropy(pl, m_policy)).mean()
-        loss = policy_loss + value_coef * value_loss - entropy_coef * ent
+        if use_micro:
+            # v5 MICRO-BATCH path (the permitted TRAVERSAL change): same per-update arithmetic as the
+            # whole-batch else-branch below, applied per K-step chunk and size-weighted (chunk_n/N) so
+            # the summed .mean()s == the whole-batch .mean()s; one backward-accumulate, one opt.step().
+            loss_total = pl_sum = vl_sum = ent_sum = mv_sum = 0.0
+            for lo in range(0, n, micro_batch_steps):
+                hi = min(lo + micro_batch_steps, n)
+                w = (hi - lo) / n
+                tl, pl, val = forward_chunk_fn(lo, hi)
+                val = val.reshape(-1)
+                logp = _masked_logp(tl, a_tech[lo:hi], m_tech[lo:hi]) + _masked_logp(pl, a_policy[lo:hi], m_policy[lo:hi])
+                if clip_eps:
+                    logratio = (logp - old_logp[lo:hi]).clamp(-20.0, 20.0)
+                    ratio = torch.exp(logratio)
+                    surr = torch.min(ratio * adv[lo:hi], torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv[lo:hi])
+                    policy_loss = -surr.mean()
+                else:
+                    policy_loss = -(adv[lo:hi] * logp).mean()
+                value_loss = F.mse_loss(val, ret[lo:hi])
+                ent = (_entropy(tl, m_tech[lo:hi]) + _entropy(pl, m_policy[lo:hi])).mean()
+                loss_c = (policy_loss + value_coef * value_loss - entropy_coef * ent) * w
+                loss_c.backward()                           # accumulate grad; free the chunk graph
+                loss_total += float(loss_c.detach())
+                pl_sum += float(policy_loss.detach()) * w
+                vl_sum += float(value_loss.detach()) * w
+                ent_sum += float(ent.detach()) * w
+                mv_sum += float(val.detach().sum())
+            if not np.isfinite(loss_total):                 # divergence guard — same semantics
+                net.load_state_dict(safe_state)
+                opt.load_state_dict(safe_opt)               # v5: restore optimizer moments too
+                stats["note"] = f"non-finite loss at epoch {ep} — restored last-good weights"
+                stats["diverged"] = True
+                return net, stats
+            gnorm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=10.0)
+            opt.step()
+            safe_state = copy.deepcopy(net.state_dict())
+            safe_opt = copy.deepcopy(opt.state_dict())
+            stats.update(loss=loss_total, policy_loss=pl_sum, value_loss=vl_sum, entropy=ent_sum,
+                         mean_adv=float(adv.mean().item()), mean_value=mv_sum / n, grad_norm=float(gnorm))
+        else:
+            tl, pl, val = forward_fn()
+            val = val.reshape(-1)
+            logp = _masked_logp(tl, a_tech, m_tech) + _masked_logp(pl, a_policy, m_policy)
+            if clip_eps:                                        # PPO clip (default ON; 0/None ⇒ plain A2C)
+                logratio = (logp - old_logp).clamp(-20.0, 20.0)  # guard exp() overflow on big policy shifts
+                ratio = torch.exp(logratio)
+                surr = torch.min(ratio * adv, torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv)
+                policy_loss = -surr.mean()
+            else:                                               # plain A2C (single-epoch use)
+                policy_loss = -(adv * logp).mean()
+            value_loss = F.mse_loss(val, ret)
+            ent = (_entropy(tl, m_tech) + _entropy(pl, m_policy)).mean()
+            loss = policy_loss + value_coef * value_loss - entropy_coef * ent
 
-        if not torch.isfinite(loss):                        # divergence guard (R8 + council 🔴)
-            net.load_state_dict(safe_state)                 # restore last finite weights — never export NaN
-            stats["note"] = f"non-finite loss at epoch {ep} — restored last-good weights"
-            stats["diverged"] = True
-            return net, stats
+            if not torch.isfinite(loss):                        # divergence guard (R8 + council 🔴)
+                net.load_state_dict(safe_state)                 # restore last finite weights — never export NaN
+                opt.load_state_dict(safe_opt)                   # v5: restore optimizer moments too
+                stats["note"] = f"non-finite loss at epoch {ep} — restored last-good weights"
+                stats["diverged"] = True
+                return net, stats
 
-        loss.backward()
-        gnorm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=10.0)
-        opt.step()
-        safe_state = copy.deepcopy(net.state_dict())        # checkpoint last-good (finite) weights
-        stats.update(loss=float(loss.item()), policy_loss=float(policy_loss.item()),
-                     value_loss=float(value_loss.item()), entropy=float(ent.item()),
-                     mean_adv=float(adv.mean().item()), mean_value=float(val.mean().item()),
-                     grad_norm=float(gnorm))
+            loss.backward()
+            gnorm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=10.0)
+            opt.step()
+            safe_state = copy.deepcopy(net.state_dict())        # checkpoint last-good (finite) weights
+            safe_opt = copy.deepcopy(opt.state_dict())          # v5: checkpoint last-good optimizer moments
+            stats.update(loss=float(loss.item()), policy_loss=float(policy_loss.item()),
+                         value_loss=float(value_loss.item()), entropy=float(ent.item()),
+                         mean_adv=float(adv.mean().item()), mean_value=float(val.mean().item()),
+                         grad_norm=float(gnorm))
     stats.setdefault("diverged", False)
     return net, stats
 
@@ -218,23 +276,35 @@ def train_actor_critic_blind(
     entropy_coef: float = 0.01,
     clip_eps: float | None = None,
     norm_adv: bool = True,
-) -> tuple[PolicyNet, dict]:
-    torch.manual_seed(seed)
-    net = PolicyNet(dims)
+    net=None,                        # v5: warm net (continual); None ⇒ fresh
+    optimizer=None,                  # v5: warm optimizer; None ⇒ built once here
+    micro_batch_steps: int | None = None,
+) -> tuple[PolicyNet, dict, object]:
+    if net is None:
+        torch.manual_seed(seed)
+        net = PolicyNet(dims)
+    if optimizer is None:
+        optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     if not trajectories:
-        return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}
+        return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}, optimizer
     a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos = _stack_traj(trajectories)
     obs = torch.tensor(np.concatenate([t.obs for t in trajectories]))
 
     def forward_fn():
         return net(obs)
 
-    return _optimize_actor_critic(
-        net, forward_fn, a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
+    def forward_chunk_fn(lo, hi):
+        return net(obs[lo:hi])
+
+    net, stats = _optimize_actor_critic(
+        net, forward_fn, optimizer=optimizer, forward_chunk_fn=forward_chunk_fn,
+        micro_batch_steps=micro_batch_steps,
+        a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
         rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
         gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
         clip_eps=clip_eps, norm_adv=norm_adv,
     )
+    return net, stats, optimizer
 
 
 def train_actor_critic_rich(
@@ -251,28 +321,41 @@ def train_actor_critic_rich(
     entropy_coef: float = 0.01,
     clip_eps: float | None = None,
     norm_adv: bool = True,
-) -> tuple[object, dict]:
+    net=None,                        # v5: warm net (continual); None ⇒ fresh
+    optimizer=None,                  # v5: warm optimizer; None ⇒ built once here
+    micro_batch_steps: int | None = None,
+) -> tuple[object, dict, object]:
     """Rich variant. Trajectories carry `rich` dicts of padded per-step token tensors + masks
-    (assembled by features.build_rich_batch). The whole round is one padded batch."""
+    (assembled by features.build_rich_batch). The whole round is one padded batch.
+    v5: warm-start + micro-batched traversal; returns the optimizer for cross-round carry."""
     from .features import build_rich_batch
     from .model import RichPolicyValueNet
 
-    torch.manual_seed(seed)
-    net = RichPolicyValueNet(dims, token_specs)
+    if net is None:
+        torch.manual_seed(seed)
+        net = RichPolicyValueNet(dims, token_specs)
+    if optimizer is None:
+        optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     if not trajectories:
-        return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}
+        return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}, optimizer
     a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos = _stack_traj(trajectories)
     inputs = build_rich_batch(trajectories, dims, token_specs)  # dict[name -> tensor], padded
 
     def forward_fn():
         return net(inputs)
 
-    return _optimize_actor_critic(
-        net, forward_fn, a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
+    def forward_chunk_fn(lo, hi):
+        return net({k: v[lo:hi] for k, v in inputs.items()})
+
+    net, stats = _optimize_actor_critic(
+        net, forward_fn, optimizer=optimizer, forward_chunk_fn=forward_chunk_fn,
+        micro_batch_steps=micro_batch_steps,
+        a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
         rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
         gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
         clip_eps=clip_eps, norm_adv=norm_adv,
     )
+    return net, stats, optimizer
 
 
 def train_actor_critic_structured(
@@ -291,27 +374,41 @@ def train_actor_critic_structured(
     entropy_coef: float = 0.01,
     clip_eps: float | None = None,
     norm_adv: bool = True,
-) -> tuple[object, dict]:
+    net=None,                        # v5: warm net (continual); None ⇒ fresh (round 0 / from-scratch)
+    optimizer=None,                  # v5: warm optimizer; None ⇒ built once here and carried by run_loop
+    micro_batch_steps: int | None = None,  # v5: chunk the dense traversal (medium rung on Medium)
+) -> tuple[object, dict, object]:
     """v4 STRUCTURED variant: same encoder-AGNOSTIC core (_optimize_actor_critic) + same rich
     batch/stacking as train_actor_critic_rich — ONLY the nn.Module is swapped for
     StructuredPolicyValueNet (embeddings + hex-GNN + attention, sized by `rung`). The trainer core +
-    train_actor_critic_rich stay UNTOUCHED (the FROZEN seam)."""
+    train_actor_critic_rich stay UNTOUCHED (the FROZEN seam).
+    v5: warm-start (`net`/`optimizer` reused across rounds; manual_seed only on the fresh branch) +
+    micro-batched traversal. Returns the optimizer so the caller can carry it to the next round."""
     from .features import build_rich_batch
     from .model import StructuredPolicyValueNet
 
-    torch.manual_seed(seed)
-    net = StructuredPolicyValueNet(dims, token_specs, vocab_counts, **rung)
+    if net is None:                  # fresh round: deterministic init
+        torch.manual_seed(seed)
+        net = StructuredPolicyValueNet(dims, token_specs, vocab_counts, **rung)
+    if optimizer is None:            # build the persistent optimizer ONCE (round 0 / from-scratch round)
+        optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     if not trajectories:
-        return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}
+        return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}, optimizer
     a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos = _stack_traj(trajectories)
     inputs = build_rich_batch(trajectories, dims, token_specs)
 
     def forward_fn():
         return net(inputs)
 
-    return _optimize_actor_critic(
-        net, forward_fn, a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
+    def forward_chunk_fn(lo, hi):    # slice every [B,...] tensor on axis 0 (per-row independent forward)
+        return net({k: v[lo:hi] for k, v in inputs.items()})
+
+    net, stats = _optimize_actor_critic(
+        net, forward_fn, optimizer=optimizer, forward_chunk_fn=forward_chunk_fn,
+        micro_batch_steps=micro_batch_steps,
+        a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
         rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
         gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
         clip_eps=clip_eps, norm_adv=norm_adv,
     )
+    return net, stats, optimizer

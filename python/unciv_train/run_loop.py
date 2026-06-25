@@ -67,36 +67,85 @@ def evaluate(model: Path, m_games: int, max_turns: int, threads: int, seed: int,
     return json.loads(m.group(1))
 
 
-def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, seed: int):
-    """Dispatch to the right trainer by variant. Returns (net, stats, exporter_callable)."""
+def _atomic_torch_save(obj, path):
+    """v5: crash-safe checkpoint write (mirrors export_onnx's atomic pattern) — tmp sibling → os.replace.
+    A crash mid-write never leaves a half-written ckpt/opt that --resume would then load."""
+    import torch
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _load_warm(variant: str, dims, schema_path, args, out: Path, start: int):
+    """v5 --resume (continual): rebuild the net arch for `variant`, load ckpt_round_{start-1}.pt +
+    opt_round_{start-1}.pt (weights_only=True). Requires BOTH sidecars (fail-fast); load_state_dict
+    errors loudly on a rung/dims mismatch — no silent fresh optimizer."""
+    import torch
     from . import contract
-    if variant == "v1-reinforce":
+    ckpt = out / f"ckpt_round_{start - 1}.pt"
+    optf = out / f"opt_round_{start - 1}.pt"
+    if not ckpt.is_file() or not optf.is_file():
+        raise FileNotFoundError(
+            f"[resume] continual restart needs BOTH {ckpt.name} and {optf.name} in {out} "
+            f"(found ckpt={ckpt.is_file()} opt={optf.is_file()}). A pre-v5 run has no opt sidecar — "
+            f"run with --no-continual or start fresh from round 0.")
+    if variant == "blind-critic":
+        from .model import PolicyNet
+        net = PolicyNet(dims)
+    elif variant == "rich-critic":
+        from .model import RichPolicyValueNet
+        net = RichPolicyValueNet(dims, contract.token_specs_from_schema(schema_path))
+    elif variant == "structured":
+        from .model import RUNGS, StructuredPolicyValueNet
+        net = StructuredPolicyValueNet(dims, contract.token_specs_from_schema(schema_path),
+                                       contract.vocab_counts_from_schema(schema_path), **RUNGS[args.rung])
+    else:
+        raise ValueError(f"--continual --resume unsupported for variant {variant!r}")
+    net.load_state_dict(torch.load(ckpt, weights_only=True))   # raises on shape/rung mismatch
+    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
+    opt.load_state_dict(torch.load(optf, weights_only=True))
+    print(f"[resume] warm-loaded net+opt from {ckpt.name} + {optf.name}")
+    return net, opt
+
+
+def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, seed: int,
+                *, net=None, optimizer=None):
+    """Dispatch to the right trainer by variant. Returns (net, stats, exporter_callable, optimizer).
+    v5: `net`/`optimizer` are the warm continual pair (None ⇒ fresh round); the trainer returns the
+    optimizer so run_loop can carry it forward. micro_batch_steps is threaded from args."""
+    from . import contract
+    mb = getattr(args, "micro_batch_steps", 0) or None
+    if variant == "v1-reinforce":   # v1 is not continual — ignores warm net/opt
         net, stats = tr.train_reinforce(trajectories_or_steps, dims, epochs=args.epochs,
                                         lr=args.lr, seed=seed, entropy_coef=args.entropy_coef)
-        return net, stats, "blind"
+        return net, stats, "blind", None
     if variant == "blind-critic":
-        net, stats = tr.train_actor_critic_blind(
+        net, stats, optimizer = tr.train_actor_critic_blind(
             trajectories_or_steps, dims, epochs=args.epochs, lr=args.lr, seed=seed,
             gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
-            entropy_coef=args.entropy_coef, clip_eps=args.clip_eps)
-        return net, stats, "blind"
+            entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
+            net=net, optimizer=optimizer, micro_batch_steps=mb)
+        return net, stats, "blind", optimizer
     if variant == "rich-critic":
         token_specs = contract.token_specs_from_schema(schema_path)
-        net, stats = tr.train_actor_critic_rich(
+        net, stats, optimizer = tr.train_actor_critic_rich(
             trajectories_or_steps, dims, token_specs, epochs=args.epochs, lr=args.lr, seed=seed,
             gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
-            entropy_coef=args.entropy_coef, clip_eps=args.clip_eps)
-        return net, stats, ("rich", token_specs)
+            entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
+            net=net, optimizer=optimizer, micro_batch_steps=mb)
+        return net, stats, ("rich", token_specs), optimizer
     if variant == "structured":
         from .model import RUNGS
         token_specs = contract.token_specs_from_schema(schema_path)
         vocab_counts = contract.vocab_counts_from_schema(schema_path)
         rung = RUNGS[args.rung]
-        net, stats = tr.train_actor_critic_structured(
+        net, stats, optimizer = tr.train_actor_critic_structured(
             trajectories_or_steps, dims, token_specs, vocab_counts, rung, epochs=args.epochs,
             lr=args.lr, seed=seed, gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
-            entropy_coef=args.entropy_coef, clip_eps=args.clip_eps)
-        return net, stats, ("structured", token_specs)
+            entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
+            net=net, optimizer=optimizer, micro_batch_steps=mb)
+        return net, stats, ("structured", token_specs), optimizer
     raise ValueError(f"unknown variant {variant!r}")
 
 
@@ -176,12 +225,16 @@ def main(argv=None) -> int:
                     help="PPO clip epsilon (default 0.2; required because K epochs reuse fixed "
                          "advantages — pass 0 for single-epoch plain A2C)")
     ap.add_argument("--resume", action="store_true", help="skip rounds already in curve.csv")
+    ap.add_argument("--continual", action=argparse.BooleanOptionalAction, default=True,
+                    help="v5: carry (net, optimizer) across rounds (warm-start). --no-continual ⇒ "
+                         "fresh net+opt every round (v4 from-scratch; for rollback / regime A/B)")
+    ap.add_argument("--micro-batch-steps", type=int, default=0,
+                    help="v5: chunk the dense forward/backward into K-step sub-batches (0 ⇒ whole-batch "
+                         "no-op). Set on the medium rung on Medium to avoid OOM. Changes ONLY traversal.")
     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
     args = ap.parse_args(argv)
     if args.variant == "rich-v2":   # alias for the v4 structured encoder
         args.variant = "structured"
-
-    import torch  # local import: keep CLI help fast
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -202,6 +255,7 @@ def main(argv=None) -> int:
         with open(curve_csv, "w", newline="") as f:
             csv.writer(f).writerow(CURVE_COLS)
 
+    warm_net = warm_opt = None       # v5: the persistent continual (net, optimizer) pair
     for r in range(start_round, args.rounds):
         t0 = time.time()
         round_dir = out / f"round_{r}"
@@ -223,10 +277,19 @@ def main(argv=None) -> int:
                 shards, expected_version=ver, expected_fingerprint=fp, rich=is_rich,
                 expected_spatial_channels=(contract.spatial_channels_from_schema(schema)
                                            if is_rich else None))
-        net, stats, mode = train_round(args.variant, data, dims, schema, args, seed=r)
+        if args.continual and warm_net is None and r > 0:   # --resume restart: load warm net+opt from disk
+            warm_net, warm_opt = _load_warm(args.variant, dims, schema, args, out, r)
+        net, stats, mode, opt = train_round(
+            args.variant, data, dims, schema, args, seed=r,
+            net=(warm_net if args.continual else None),
+            optimizer=(warm_opt if args.continual else None))
+        if args.continual:
+            warm_net, warm_opt = net, opt                   # carry the persistent pair to next round
 
-        # checkpoint (state_dict only; loaded with weights_only=True on resume — R7)
-        torch.save(net.state_dict(), out / f"ckpt_round_{r}.pt")
+        # checkpoint net + optimizer (atomic; weights_only=True on resume — R7). opt sidecar = v5.
+        _atomic_torch_save(net.state_dict(), out / f"ckpt_round_{r}.pt")
+        if opt is not None:
+            _atomic_torch_save(opt.state_dict(), out / f"opt_round_{r}.pt")
 
         model_path = out / f"policy_round_{r}.onnx"
         if mode == "blind":
@@ -261,6 +324,9 @@ def main(argv=None) -> int:
         with open(metrics_jsonl, "a") as f:
             f.write(json.dumps({**row, "variant": args.variant, "map_size": args.map_size,
                                 "rung": args.rung,
+                                "continual": bool(args.continual),
+                                "warm_start": bool(args.continual and r > 0),
+                                "micro_batch_steps": int(args.micro_batch_steps),
                                 "turns_per_sec": ev.get("turns_per_sec"),
                                 "ms_per_decision": ev.get("ms_per_decision"),
                                 "mean_adv": stats.get("mean_adv", 0.0)}) + "\n")
@@ -275,6 +341,9 @@ def main(argv=None) -> int:
             old = out / f"round_{r - args.keep_shards}"
             if old.is_dir():
                 shutil.rmtree(old, ignore_errors=True)
+            # v5: prune stale ckpt/opt sidecars, keeping the last 3 (resume needs round r-1) — FND-0010
+            for stale in (out / f"ckpt_round_{r - 3}.pt", out / f"opt_round_{r - 3}.pt"):
+                stale.unlink(missing_ok=True)
 
     v = verdict(rows)
     print(f"\nVERDICT: {v}  (curve: {curve_csv} | plot: {curve_png})")
