@@ -4,8 +4,8 @@
   "mode": "BUILD",
   "size": "L",
   "current_phase": 4,
-  "current_step": 17,
-  "last_completed_step": 16,
+  "current_step": 23,
+  "last_completed_step": 23,
   "spec_dir": "specs/2026-06-24-onnx-selfplay-v4-structured-encoder",
   "worktree": "/Users/j/Unciv-onnx-selfplay-loop",
   "branch": "onnx-selfplay-loop",
@@ -19,5 +19,6 @@
     "phaseC": "D7 ladder + D8 SimBenchmark throughput guard + experiment (Tiny/Medium, ~2h, AC1 z-test)",
     "phase4": "ship: verify ACs, ship-council, finalize",
     "experiment": "Medium AC1 run launched (detached); Tiny + rung-sweep pending"
-  }
+  },
+  "lifecycle": "SHIPPED (fast-forwarded to local master 5bd2c7a51; not pushed)"
 }
