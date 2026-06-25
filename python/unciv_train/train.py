@@ -138,7 +138,8 @@ def _optimize_actor_critic(
     import copy
     opt = optimizer                  # v5: persistent optimizer (built once in the trainer, carried by run_loop)
     n = int(a_tech.shape[0])
-    use_micro = bool(micro_batch_steps) and forward_chunk_fn is not None and micro_batch_steps < n
+    use_micro = (micro_batch_steps is not None and micro_batch_steps > 0
+                 and forward_chunk_fn is not None and micro_batch_steps < n)  # <=0 ⇒ whole-batch no-op
     stats = {"n": n, "n_traj": len(traj_lens), "ret_pos": n_pos}
     safe_state = copy.deepcopy(net.state_dict())  # restore on divergence (council 🔴: no NaN export)
     safe_opt = copy.deepcopy(opt.state_dict())    # v5: roll back optimizer moments too (else a diverged round poisons them)

@@ -106,22 +106,36 @@ def test_warm_round_does_not_reinit_weights():
 
 def test_ac6_warm_net_matches_exported_onnx(tmp_path):
     """AC6: the warm net a round starts from produces logits matching the ONNX exported from it — the
-    on-policy guarantee (warm net == gen net). Skips cleanly if onnxruntime is unavailable."""
+    on-policy guarantee (warm net == gen net). Compares the warm net's torch tech/policy logits to the
+    exported ONNX logits on the SAME inputs (atol 1e-4). Skips cleanly if onnxruntime is unavailable."""
     ort = pytest.importorskip("onnxruntime")
+    import numpy as np
     from unciv_train.export_onnx import export_rich
+    from unciv_train.features import build_rich_batch
     from unciv_train import contract as C
 
     dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    traj = _traj(dims, 0)
     net, _s, _o = train_actor_critic_structured(
-        [_traj(dims, 0)], dims, _TS, _VOCAB, RUNGS["small"], epochs=1, lr=1e-3, seed=0, clip_eps=0.2)
+        [traj], dims, _TS, _VOCAB, RUNGS["small"], epochs=1, lr=1e-3, seed=0, clip_eps=0.2)
     onnx_path = tmp_path / "policy_round_0.onnx"
     export_rich(net, dims, _TS, onnx_path, schema_version=C.CONTRACT_VERSION_STRUCTURED,
                 ruleset_fingerprint="testfp", neighbors=True,
                 contract_version=C.CONTRACT_VERSION_STRUCTURED)
     assert onnx_path.is_file()
-    # A torch forward of the SAME (warm) net vs the exported ONNX must agree on tech+policy logits.
-    # (Detailed tensor wiring matches test_parity.py::test_jvm_python_structured_logits_match.)
+
+    # The warm net (torch) vs the exported ONNX must agree on the policy-relevant heads (tech+policy);
+    # the value head is train-only and dropped at export, so it is NOT part of the parity surface.
     sess = ort.InferenceSession(str(onnx_path))
     out_names = [o.name for o in sess.get_outputs()]
     assert out_names == [C.OUTPUT_TECH, C.OUTPUT_POLICY], \
         f"export must drop value head, expose exactly tech+policy; got {out_names}"
+
+    inputs = build_rich_batch([traj], dims, _TS)            # the SAME inputs for both forwards
+    net.eval()
+    with torch.no_grad():
+        t_tech, t_policy, _t_val = net(inputs)
+    feed = {i.name: inputs[i.name].numpy() for i in sess.get_inputs()}
+    o_tech, o_policy = sess.run([C.OUTPUT_TECH, C.OUTPUT_POLICY], feed)
+    assert np.allclose(t_tech.numpy(), o_tech, atol=1e-4), "AC6: warm net tech logits != exported ONNX"
+    assert np.allclose(t_policy.numpy(), o_policy, atol=1e-4), "AC6: warm net policy logits != exported ONNX"

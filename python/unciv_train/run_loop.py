@@ -341,9 +341,18 @@ def main(argv=None) -> int:
             old = out / f"round_{r - args.keep_shards}"
             if old.is_dir():
                 shutil.rmtree(old, ignore_errors=True)
-            # v5: prune stale ckpt/opt sidecars, keeping the last 3 (resume needs round r-1) — FND-0010
+            # v5: prune stale ckpt/opt sidecars, keeping the last 3 (resume needs round r-1). Best-effort
+            # — a prune failure must NEVER crash a multi-hour run (ship-council FND-0012).
             for stale in (out / f"ckpt_round_{r - 3}.pt", out / f"opt_round_{r - 3}.pt"):
-                stale.unlink(missing_ok=True)
+                try:
+                    stale.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        # v5: drop this round's big batch tensors before the next gen (memory insurance over 16 rounds;
+        # the persistent net+opt are small and intentionally retained) — ship-council FND-0013/0033.
+        import gc
+        gc.collect()
 
     v = verdict(rows)
     print(f"\nVERDICT: {v}  (curve: {curve_csv} | plot: {curve_png})")
