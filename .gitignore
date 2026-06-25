@@ -209,3 +209,6 @@ python/**/__pycache__/
 python/**/*.egg-info/
 .pytest_cache/
 .feature-workflow/java.env
+
+# central per-repo /feature artifacts (local; accumulate across features)
+.feature-workflow/
