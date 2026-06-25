@@ -1,0 +1,12 @@
+<p><strong>The ask:</strong> v4 proved the structured GNN encoder is not the bottleneck, yet the
+structured net (23.0%) still sat below the blind baseline (28.9%) on Medium. The remaining suspect is
+the <em>training regime</em>: every round trains a brand-new net on ~16 games and throws away all prior
+learning. v5 tests whether <strong>not resetting</strong> finally clears blind.</p>
+<p><strong>How this solves it:</strong> keep one <code>(net, optimizer)</code> pair alive across the
+round loop — round 0 builds it fresh, every later round warm-starts from the prior round's weights AND
+carries Adam's moment state — and run 16 rounds (v4 ran 8) so skill can accumulate. A memory-only
+<em>micro-batching</em> change to the dense forward/backward lifts the v4 OOM that had forced the
+encoder down to the <code>small</code> rung, enabling a <code>medium</code>-rung capacity comparison.
+Then re-run the v4 Medium eval and report the two z-tests (vs v4 23.0%, vs blind 28.9%). The RL math
+(GAE, PPO clip, objective, grad-clip) is frozen byte-for-byte; only initialization and forward
+<em>traversal</em> change.</p>

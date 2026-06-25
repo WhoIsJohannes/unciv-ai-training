@@ -1,0 +1,892 @@
+{
+  "assignments": {
+    "skeptic": "openai/gpt-5.5",
+    "architect": "anthropic/claude-opus-4.8",
+    "practitioner": "google/gemini-3.1-pro-preview",
+    "product_manager": "deepseek/deepseek-v4-pro",
+    "qa_testing": "openai/gpt-5.5",
+    "security_red_team": "deepseek/deepseek-v4-pro",
+    "domain_fidelity": "anthropic/claude-opus-4.8",
+    "cost_efficiency": "google/gemini-3.1-pro-preview"
+  },
+  "findings": [
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Add a no-new-framework constraint for experiment execution",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "The brief commits to an 8\u201312 hour autonomous experiment but does not explicitly prohibit building a new experiment orchestration layer. That is exactly the kind of pressure that produces a bespoke runner, job state machine, or monitoring wrapper nobody wants to maintain.",
+      "rationale": "There is already a driver precedent and an existing `--resume` seam. The design should force reuse of those instead of inventing infrastructure for one research run.",
+      "suggested_addition": "Execution constraint: do not build a new experiment orchestrator, daemon, scheduler, or job-state abstraction. Reuse `python/run_acceptance.sh` / `unciv_train.run_loop --resume` patterns, with at most a thin shell script for the two required arms and analysis commands.",
+      "supporting_roles": [
+        "cost_efficiency",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical",
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "Build + run it all autonomously. Implement, run the full experiment in background (~3\u20135h/arm), babysit with `--resume`, write RESULTS.md in-session",
+        "Driver precedent `python/run_acceptance.sh`"
+      ],
+      "event_id": "90c02753-4ef1-49ed-abd9-a6bb74bc34f3"
+    },
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Keep continual state as plumbing, not a trainer abstraction",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "The brief says to keep `(net, opt)` alive across rounds, but it does not constrain the implementation shape. Without that constraint, this can easily become a `TrainerState`, `CheckpointManager`, or strategy hierarchy for one optimizer and one training loop.",
+      "rationale": "The existing seam is small: Adam is created in one actor-critic core and `train_round()` returns the net. The maintainable change is to thread the optimizer through that seam, not redesign the trainer.",
+      "suggested_addition": "Implementation constraint: make the smallest signature change needed to pass optional existing `net` / `opt` into the actor-critic training path and return the updated optimizer. Do not introduce trainer/session/checkpoint manager classes unless there are at least two real call sites needing different behavior.",
+      "supporting_roles": [
+        "architect",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "Must keep `(net, opt)` alive in-process across rounds; sidecar `opt_round_{r}.pt`; reload net+opt on `--resume`.",
+        "`_optimize_actor_critic` 115\u2013194; **Adam at train.py:136** (lift point)"
+      ],
+      "event_id": "4b7c5953-b5dc-4374-92df-5fe2a24f6b95"
+    },
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Fail fast on incompatible checkpoints; no migration layer",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Light scan summary",
+      "description": "Resume now needs torch weights plus Adam state, but the brief does not say what happens if the user resumes with a different rung, variant, schema, map size, or model shape. The dangerous outcome is a compatibility/migration layer for experimental checkpoints.",
+      "rationale": "These checkpoints are run artifacts, not a public storage format. Supporting old or mismatched optimizer state is complexity with very little payoff.",
+      "suggested_addition": "Checkpoint policy: optimizer resume is best-effort for the exact same run configuration only. Save minimal metadata needed to validate variant/rung/dims/schema/round, and fail with a clear error on mismatch; do not implement checkpoint migrations or partial optimizer-state repair.",
+      "supporting_roles": [
+        "qa_testing",
+        "domain_fidelity"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "resume 194\u2013200 loads only the ONNX gen model, never torch state/opt",
+        "sidecar `opt_round_{r}.pt`; reload net+opt on `--resume`"
+      ],
+      "event_id": "7b960c51-51cf-4cd1-8f1f-d91cba0ced83"
+    },
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Micro-batching needs one helper, not a batching framework",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "The brief requires micro-batching but does not put boundaries around the implementation. This can turn into DataLoaders, batch strategy objects, generic tensor traversal utilities, and configuration knobs before we know we need any of them.",
+      "rationale": "The current trainer builds one rich batch and calls one `forward_fn`. The simplest maintainable fix is a small slicing helper around that existing structure, with the math left alone.",
+      "suggested_addition": "Micro-batch constraint: implement one straightforward helper that slices the existing rich-batch tensors along the step dimension and accumulates the same loss terms. No DataLoader conversion, no strategy classes, and no generic batching framework. The only user-facing knob should be the minimum needed to avoid OOM, e.g. `--micro-batch-steps`.",
+      "supporting_roles": [
+        "qa_testing",
+        "cost_efficiency"
+      ],
+      "supporting_lenses": [
+        "technical",
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "Micro-batch traversal only; per-update math byte-verbatim",
+        "`build_rich_batch` once + `forward_fn`"
+      ],
+      "event_id": "31fd53c9-03cb-4a58-9645-8f5c1a10f4b8"
+    },
+    {
+      "role_id": "skeptic",
+      "role_lens": "yagni",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Declare that failed results do not trigger tuning scope creep",
+      "severity": "major",
+      "primary_lens": "cross_cutting",
+      "target_file": "brief.md",
+      "target_section": "Feature (1-line)",
+      "description": "The feature includes re-testing whether structured GNN clears the blind baseline, but the brief does not say what happens if it does not. That omission invites ad hoc hyperparameter changes, extra arms, and one-more-run behavior after the implementation is done.",
+      "rationale": "This is a build of continual training plus a defined experiment, not an open-ended research sprint. Future maintainers should not inherit random tuning changes made to rescue a metric.",
+      "suggested_addition": "Experiment boundary: run only the specified small-rung and medium-rung 16-round Medium arms plus the stated ceiling evals/benchmarks. If the structured model still does not clear the blind baseline, record that in `RESULTS.md`; do not add unplanned hyperparameter sweeps, architecture tweaks, or extra experimental arms in this feature.",
+      "supporting_roles": [
+        "product_manager",
+        "cost_efficiency",
+        "domain_fidelity"
+      ],
+      "supporting_lenses": [
+        "business",
+        "technical"
+      ],
+      "source_excerpts": [
+        "re-test whether the structured GNN clears the blind baseline (28.9%) on Medium",
+        "Two full 16-round Medium arms: small rung (primary, AC1/AC2) + medium rung (AC3)."
+      ],
+      "event_id": "932ab4a0-237e-41e9-803c-b6bd5f7dcb49"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Warm-start across rounds conflicts with per-round manual_seed determinism",
+      "severity": "critical",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "The brief mandates carrying (net, opt) alive across rounds while train_actor_critic_structured calls torch.manual_seed(seed) and reconstructs StructuredPolicyValueNet per round (scan \u00a72). Once weights and Adam state persist, the per-round seed no longer re-establishes a deterministic starting state \u2014 it seeds RNG mid-trajectory of a stateful process. The determinism/reproducibility lens is named non-negotiable, yet warm-start fundamentally changes what 'seed' guarantees.",
+      "rationale": "Continual training and per-round seeding are two different reproducibility models; shipping both without deciding which one wins produces runs that are neither bit-reproducible nor cleanly resumable.",
+      "suggested_addition": "Add a 'Determinism model under continual training' decision: state explicitly that reproducibility is now defined as (fixed initial seed + deterministic optimizer state reload), NOT per-round re-seeding. Specify whether manual_seed(seed) is still called per round (and if so, what it is allowed to govern \u2014 gen sampling only, not net init), and define the exact (net, opt, RNG) tuple that --resume must restore to guarantee a resumed run == an uninterrupted run.",
+      "supporting_roles": [
+        "domain_fidelity",
+        "practitioner",
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "Must keep `(net, opt)` alive in-process across rounds; sidecar `opt_round_{r}.pt`; reload net+opt on `--resume`.",
+        "train_actor_critic_structured 278\u2013317 (manual_seed + `StructuredPolicyValueNet(...,**rung)`"
+      ],
+      "event_id": "6b3963e7-e554-4f4c-a4b1-e43d07f59321"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Resume contract is now multi-artifact but the consistency invariant is unspecified",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "Resume today derives start_round from curve.csv row count and loads only the ONNX gen model (scan \u00a71). v5 adds opt_round_{r}.pt and net state reload, so a resume now depends on three artifacts (curve.csv, ckpt_round_{r}.pt, opt_round_{r}.pt) staying mutually consistent \u2014 but the round loop writes them at different lines (229 ckpt, plus new opt write) with no atomicity or version stamp described.",
+      "rationale": "If the process dies between writing the checkpoint and the optimizer sidecar, --resume will silently reload a net with a mismatched optimizer moment estimates \u2014 exactly the 'Adam-state poisoning' failure the council flagged, and it will look like a training run, not a crash.",
+      "suggested_addition": "Specify the resume consistency contract: (1) write ckpt + opt + curve-row as one logical commit (e.g. write opt and ckpt to temp names, fsync, then append the curve.csv row last as the commit marker); (2) on --resume, validate that ckpt_round_{r}.pt and opt_round_{r}.pt both exist for start_round-1 and abort with a clear error if either is missing or stale; (3) optionally stamp round number into both sidecars and assert match on load.",
+      "supporting_roles": [
+        "practitioner",
+        "qa_testing"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "Resume (194\u2013200): reads curve.csv \u2192 `start_round=len(rows)`; loads `policy_round_{start-1}.onnx` as gen model **but NEVER loads the torch state_dict or optimizer**",
+        "sidecar `opt_round_{r}.pt`; reload net+opt on `--resume`."
+      ],
+      "event_id": "9a993cea-f291-44a9-88ee-7bf0d2dfcd80"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Adam is constructed inside the per-round optimize function \u2014 lifting it changes the function's ownership boundary",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Light scan summary",
+      "description": "The lift point (train.py:136) builds Adam over net.parameters() inside _optimize_actor_critic, the FROZEN-math core shared by blind/rich/structured (scan \u00a72). Hoisting the optimizer to live across rounds means _optimize_actor_critic must now RECEIVE an optimizer rather than own it, which changes its signature and its contract with all three callers \u2014 but the brief frames this as a localized 'lift point' rather than an interface change.",
+      "rationale": "Changing who owns the optimizer is a separation-of-concerns shift: the round loop becomes the optimizer's lifecycle owner while the math core stays a pure step-applier. If that ownership split isn't drawn explicitly, callers other than the structured path (blind/rich, which are out of scope) can silently break or diverge.",
+      "suggested_addition": "State the ownership boundary explicitly: _optimize_actor_critic receives `opt: torch.optim.Optimizer` as a parameter (the round loop owns construction/persistence); the per-update math (144\u2013192) stays byte-verbatim. Define what the blind/rich callers pass (a fresh per-call Adam to preserve their current behavior) so the FROZEN core's contract change is provably behavior-preserving for out-of-scope variants.",
+      "supporting_roles": [
+        "domain_fidelity",
+        "practitioner"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "**Adam built at line 136** (`opt = torch.optim.Adam(net.parameters(), lr=lr)`) \u2014 the line to LIFT OUT.",
+        "Two Adam constructions total: **train.py:84** ... and **train.py:136** ... (the v5 target)."
+      ],
+      "event_id": "e924c9cb-c3a5-430b-b83f-a17c6644cce2"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Micro-batch traversal vs GAE-computed-once-per-round may not be order-independent",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "GAE is computed once per round from a V-snapshot (scan \u00a72, 144\u2013156) and the per-update math is byte-verbatim. Micro-batching the dense Medium forward/backward splits one full-batch gradient into accumulated sub-batches; the numerical-equivalence AC6 only holds if gradient accumulation reproduces the full-batch gradient exactly (no per-sub-batch normalization, BatchNorm, or advantage re-normalization across chunk boundaries).",
+      "rationale": "norm_adv and any batch-mean reduction inside the FROZEN loss are computed over the full batch; if micro-batching recomputes those per chunk, the result diverges from full-batch and AC6 fails \u2014 and the brief asserts byte-verbatim math without acknowledging that micro-batching is precisely a math-affecting change unless advantage stats and loss reductions are pre-aggregated.",
+      "suggested_addition": "Add an explicit equivalence condition for micro-batching: advantage normalization (norm_adv) and any loss/value reductions MUST be computed over the full batch BEFORE chunking (or the per-chunk gradients summed and divided by total count, not mean-per-chunk). State that micro-batching is forward/backward-traversal-only with accumulated grads, and that AC6's numerical-equivalence test must compare micro-batched vs full-batch on a Medium-sized synthetic batch at the round level, not just a single update.",
+      "supporting_roles": [
+        "domain_fidelity",
+        "qa_testing"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "Micro-batch traversal only; per-update math byte-verbatim; numerical-equivalence + warm-start parity tests required (AC6).",
+        "GAE computed ONCE per round from V-snapshot (144\u2013156); epoch loop 163\u2013192."
+      ],
+      "event_id": "e082a68b-8f03-43da-b92d-658bf20cd44c"
+    },
+    {
+      "role_id": "architect",
+      "role_lens": "structure",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Divergence guard restores net state but says nothing about restoring optimizer state",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Light scan summary",
+      "description": "The NaN guard (train.py:139/179\u2013183/188) deep-copies and restores net.state_dict() on divergence, then re-checkpoints safe_state per epoch. With a persistent Adam, a NaN-producing update also poisons the optimizer's moment estimates \u2014 but the brief's guard discussion only covers net weights (deepcopy of state_dict), not opt.state_dict.",
+      "rationale": "Restoring weights while keeping a corrupted optimizer state means the next step re-applies poisoned momentum/variance estimates, defeating the divergence guard precisely when continual training makes it matter most.",
+      "suggested_addition": "Extend the divergence-guard contract for v5: on NaN/divergence, snapshot and restore BOTH net.state_dict() AND opt.state_dict() together as one safe point. Add a test asserting that after an injected-NaN step, the restored (net, opt) pair is bit-identical to the pre-step snapshot.",
+      "supporting_roles": [
+        "domain_fidelity",
+        "qa_testing",
+        "practitioner"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "`safe_state = deepcopy(net.state_dict())` at 139; NaN guard at 179\u2013183 restores safe_state + sets `diverged`",
+        "divergence guard 139/179\u2013183/188"
+      ],
+      "event_id": "27b5536b-1c41-450d-803a-38150dd23600"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Non-atomic PyTorch checkpoint saves risk unrecoverable corruption",
+      "severity": "critical",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "The design relies on `--resume` to recover multi-hour runs, but `torch.save` is not atomic. If the process is killed (e.g., OOM, node preemption, manual restart) mid-write, `opt_round_{r}.pt` or `ckpt_round_{r}.pt` will be corrupted, breaking the resume mechanism and losing hours of compute.",
+      "rationale": "A reliable resume mechanism is the only defense against transient infrastructure failures in long-running jobs. If the checkpoint itself becomes the single point of failure, the operational cost of babysitting this pipeline skyrockets.",
+      "suggested_addition": "Implement atomic writes for all PyTorch checkpoints: save to `opt_round_{r}.pt.tmp` and use `os.replace()` to move it to the final filename. Apply this to both the net and optimizer states.",
+      "supporting_roles": [
+        "practitioner",
+        "architect"
+      ],
+      "supporting_lenses": [
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "Babysit with `--resume`",
+        "sidecar `opt_round_{r}.pt`; reload net+opt on `--resume`"
+      ],
+      "event_id": "a68820be-b5d5-4fea-bdf9-471a4d262c4f"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Divergence guard fails to rollback Adam state, causing permanent poisoning",
+      "severity": "critical",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "The existing divergence guard restores `net.state_dict()` on NaN, but the design introduces continual Adam state. If the optimizer state isn't also rolled back, its momentum buffers will retain NaNs/Infs, causing immediate and permanent divergence on the very next step.",
+      "rationale": "Blast radius containment. A transient numerical spike must be fully rolled back; partial rollbacks lead to unrecoverable zombie states that silently waste compute until the job finishes with garbage results.",
+      "suggested_addition": "Update the divergence guard (lines 139/179-183) to `deepcopy` and restore BOTH `net.state_dict()` and `opt.state_dict()` when a NaN is detected.",
+      "supporting_roles": [
+        "domain_fidelity",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "divergence guard 139/179\u2013183/188",
+        "carry Adam optimizer state across rounds"
+      ],
+      "event_id": "f116f1ee-6a5f-497e-9c56-42d8767c1cf3"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Unbounded disk growth from optimizer checkpoints",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "Adam state is typically 2-3x the size of the model weights. Saving `opt_round_{r}.pt` every round for 16 rounds across multiple arms without an explicit cleanup policy risks disk exhaustion on the training node.",
+      "rationale": "Unbounded disk writes are a classic cause of silent, late-stage pipeline failures (e.g., crashing at round 14 of 16 because the disk is 100% full). Capacity must be explicitly managed.",
+      "suggested_addition": "Extend the existing `--keep-shards` cleanup logic (lines 274-277) to also delete stale `opt_round_{r}.pt` files, keeping only the most recent N rounds.",
+      "supporting_roles": [
+        "cost_efficiency",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "sidecar `opt_round_{r}.pt`",
+        "shard cleanup (274\u2013277)"
+      ],
+      "event_id": "9e33869c-8282-426a-a2eb-f92400780f0c"
+    },
+    {
+      "role_id": "practitioner",
+      "role_lens": "production-readiness",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "In-process state carryover risks memory fragmentation and OOM",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "Keeping `(net, opt)` alive in-process across 16 rounds of heavy trajectory processing risks PyTorch memory fragmentation or accidental reference holding, which would defeat the micro-batching OOM mitigations.",
+      "rationale": "Long-running stateful Python processes are highly susceptible to memory leaks. We must defensively clear memory between major loop iterations to ensure the pipeline can scale to 16+ rounds without degrading.",
+      "suggested_addition": "Add explicit garbage collection (`gc.collect()`) and memory clearing (e.g., explicitly deleting trajectory tensors and calling `torch.cuda.empty_cache()` if applicable) at the end of each round in `run_loop.py` before the next generation phase begins.",
+      "supporting_roles": [
+        "practitioner",
+        "architect"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "Must keep `(net, opt)` alive in-process across rounds",
+        "micro-batch the dense Medium forward/backward to lift the v4 OOM gate"
+      ],
+      "event_id": "4ac0896d-470d-477c-9e32-bb8c34351636"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcomes",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Success metric is unclear: what does \"clears the blind baseline\" mean?",
+      "severity": "critical",
+      "primary_lens": "user",
+      "target_file": "specs/2026-06-25-selfplay-v5/discovery-output.md",
+      "target_section": "Feature (1-line)",
+      "description": "The brief's only outcome statement is \"re-test whether the structured GNN clears the blind baseline (28.9%)\"\". It does not define \"clears\" \u2014 no minimum win rate, no statistical significance threshold, no round-by-round convergence criterion. Without a concrete success definition, there's no way to decide if the experiment is worth acting on or if the feature did its job.",
+      "rationale": "A PM needs a measurable success metric to gate whether the work shipped value and to inform a go/no-go decision on investing further in continual training. A vague goal risks the team accepting marginal results as success or, worse, chasing asymptotic improvements that don't justify the compute cost.",
+      "suggested_addition": "Add a crisp success metric: \"Success = after 16 rounds of continual Medium training, the structured GNN achieves a ceiling-eval win rate \u2265 30% (i.e., a statistically significant improvement over the 28.9% blind baseline, p<0.05, using the standard 200-game z-test).\" This replaces the qualitative \"clears\" and gives a clear stopping rule.",
+      "supporting_roles": [
+        "practitioner",
+        "domain_fidelity"
+      ],
+      "supporting_lenses": [
+        "business"
+      ],
+      "source_excerpts": [
+        "re-test whether the structured GNN clears the blind baseline (28.9%) on Medium"
+      ],
+      "event_id": "5f591ff5-281c-45cb-b349-aaf0105e7667"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcomes",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "No prioritization: all capabilities treated as launch\u2011blocking",
+      "severity": "critical",
+      "primary_lens": "user",
+      "target_file": "specs/2026-06-25-selfplay-v5/discovery-output.md",
+      "target_section": "Implications for design/build",
+      "description": "The brief lists warm\u2011start, Adam carry, micro\u2011batching, and a full medium\u2011rung arm (AC3) as the execution scope, but none are labelled as P0/P1/P2. This forces an \"all or nothing\" effort; if a piece runs into trouble (e.g., micro\u2011batching numerical drift), the team doesn't know whether to cut it or block everything.",
+      "rationale": "PMs use prioritization to de\u2011risk delivery. Without it, the team will over\u2011invest in a secondary goal while the primary value (weight carryover alone) could have shipped earlier and delivered learnings. A minimum\u2011viable\u2011experiment (MVE) must be defined.",
+      "suggested_addition": "Assign priorities: P0 (must\u2011succeed) = warm\u2011start net weights + carry Adam state across rounds (plus the necessary minimal changes to run_loop to enable in\u2011process carry). P1 (strongly desired, deferrable if risky) = micro\u2011batch traversal for the Medium OOM lift, with acceptance that it can be dropped if it breaks numerical\u2011equivalence. P2 = the 16-round medium\u2011rung arm (AC3) \u2014 run it only after P0 results look promising, or run it as a low\u2011priority background job.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [],
+      "source_excerpts": [
+        "Two full 16-round Medium arms: small rung (primary, AC1/AC2) + medium rung (AC3). Each ~3\u20135h. Plus 200-game ceiling evals + bench-onnx.",
+        "Micro-batch traversal only; per-update math byte-verbatim; numerical-equivalence + warm-start parity tests required (AC6)."
+      ],
+      "event_id": "8c220927-e917-4680-949d-4f7b6e45c17f"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcomes",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Non\u2011negotiable constraints are not stated",
+      "severity": "critical",
+      "primary_lens": "user",
+      "target_file": "specs/2026-06-25-selfplay-v5/discovery-output.md",
+      "target_section": "Context category (backend)",
+      "description": "The brief freezes the Kotlin ONNX bridge but says nothing about constraints on the Python trainer itself \u2014 no wall\u2011clock budget, no requirement to preserve deterministic behavior for a given seed, no guardrail against regressing the 23.0% structured small\u2011rung from v4. These are the load\u2011bearing promises to the researcher.",
+      "rationale": "Without explicit non\u2011negotiables, the engineers may unknowingly violate a constraint that a PM considers obvious (e.g., \"must not increase round wall\u2011clock time by more than 20%\") and only discover it after the 8\u2011hour full run. The brief and the experiment results become un-actionable.",
+      "suggested_addition": "Add a Non\u2011Negotiable Constraints section:\n- Determinism: given fixed seed inputs, results (win rates, loss curves) must be bit\u2011identical to the diagram of a run that started from the same net/opt checkpoint.\n- Throughput: per\u2011round wall\u2011clock time (excluding gen/eval) must not grow more than 10% from the current from\u2011scratch trainer on the same hardware, because gen+eval dominate and a slowdown lengthens the experiment dangerously.\n- No regression: the structured small\u2011rung win rate after 8 rounds must be within \u00b11 percentage point of v4 (23.0%).",
+      "supporting_roles": [
+        "qa_testing",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "Kotlin ONNX bridge is FROZEN/do-not-touch.",
+        "Implications for design/build"
+      ],
+      "event_id": "2db4bf6d-c34b-41a7-840a-46f72a48cfcb"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcomes",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "What\u2019s out of scope is not defined",
+      "severity": "major",
+      "primary_lens": "user",
+      "target_file": "specs/2026-06-25-selfplay-v5/discovery-output.md",
+      "target_section": "Feature (1-line) / Implications",
+      "description": "The brief describes what to build but never states what is explicitly NOT in scope. There's no \"What This Brief Is NOT\" section. This invites scope creep \u2014 the team may try to extend continual training to blind/rich variants, change the model architecture, or tweak the reward schedule.",
+      "rationale": "In an L\u2011sized, multi\u2011hour backend feature, undrawn boundaries are a primary cause of run\u2011away iteration and missed deadlines. A PM would pre\u2011empt that by enumerating the things the experiment will not touch.",
+      "suggested_addition": "Add a \"What This Brief Is NOT\" list:\n- This feature does NOT change the StructuredPolicyValueNet architecture or token\u2011vocab sizes.\n- It does NOT extend continual training to the blind\u2011critic or rich\u2011critic variants \u2014 those are separate follow\u2011on experiments.\n- It does NOT alter the GAE computation, divergence guard, or the per\u2011update math \u2014 those are verbatim from v4.\n- It does NOT modify the ONNX export path (except for any metadata needed to carry version info).",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "per-update math byte-verbatim; numerical-equivalence + warm-start parity tests required (AC6)",
+        "structured GNN clears the blind baseline on Medium"
+      ],
+      "event_id": "3be06149-daf6-4181-be87-d8923aea1d6e"
+    },
+    {
+      "role_id": "product_manager",
+      "role_lens": "outcomes",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Adam optimizer state carryover assumes stability \u2014 risk unacknowledged",
+      "severity": "major",
+      "primary_lens": "user",
+      "target_file": "specs/2026-06-25-selfplay-v5/discovery-output.md",
+      "target_section": "Implications for design/build",
+      "description": "The brief plans to carry Adam state across rounds, but Adam's momentum and variance buffers may accumulate stale information over many training rounds, causing convergence to stall or even degrade. The brief does not treat this as a risk, nor does it propose a detection or mitigation strategy beyond the existing NaN guard.",
+      "rationale": "A PM would want explicit risk acknowledgment and at least a lightweight monitoring mechanism in the experiment \u2014 for instance, logging the variance of Adam's second\u2011moment estimates per round and an auto\u2011reset policy if win rate plateaus. Otherwise the team will spend hours running a full experiment that fails silently and learn nothing.",
+      "suggested_addition": "Add a Risk/Mitigation subsection: \"Risk: Adam state staleness may slow convergence or cause degraded final performance after many rounds. Mitigation: log Adam state summary statistics (min/mean/max of exp_avg and exp_avg_sq) after each round; if the win\u2011rate slope over the last 5 rounds is negative and statistically significant, optionally reset the optimizer to fresh Adam while keeping the net weights, and log the event.\"",
+      "supporting_roles": [
+        "domain_fidelity",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "Must keep (net, opt) alive in-process across rounds; sidecar opt_round_{r}.pt; reload net+opt on --resume.",
+        "divergence guard 139/179\u2013183/188 (existing)"
+      ],
+      "event_id": "4d5ba3f9-089d-4ac9-9fad-bfec1c354090"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Acceptance criteria are referenced but not defined",
+      "severity": "critical",
+      "primary_lens": "technical",
+      "target_file": "discovery-output.md",
+      "target_section": "Implications for design/build",
+      "description": "The brief references AC1, AC2, AC3, and AC6, but the actual acceptance criteria are not included. From this document alone I cannot tell what numeric result, statistical threshold, or artifact set constitutes a pass for the primary and medium-rung arms.",
+      "rationale": "QA cannot write a test plan or close the feature if the pass/fail criteria are only named, not specified. This is especially risky for an ML experiment where results are noisy and 'clears the baseline' can mean several different things.",
+      "suggested_addition": "Add an explicit Acceptance Criteria section:\n- AC1: Small-rung structured Medium 16-round run completes with no OOM/divergence and produces curve.csv, metrics.jsonl, ckpt_round_15.pt, opt_round_15.pt, policy_round_15.onnx, and RESULTS.md.\n- AC2: Ceiling eval uses 200 games, seed 4242424, turn-cap 250, threads 12; pass condition is structured winrate > blind baseline 28.9% with stated z-test p-value threshold of ___.\n- AC3: Medium-rung 16-round comparison completes under the same eval protocol; pass/fail threshold is ___.\n- AC6: Unit/parity tests listed below pass in CI/local pytest before the experiment is accepted.",
+      "supporting_roles": [
+        "product_manager",
+        "domain_fidelity"
+      ],
+      "supporting_lenses": [
+        "business",
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "re-test whether the structured GNN clears the blind baseline (28.9%) on Medium.",
+        "Micro-batch traversal only; per-update math byte-verbatim; numerical-equivalence + warm-start parity tests required (AC6)."
+      ],
+      "event_id": "d175b253-92e4-4e2a-9a6f-2c95672c35ac"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Micro-batch numerical-equivalence test has no oracle",
+      "severity": "critical",
+      "primary_lens": "technical",
+      "target_file": "discovery-output.md",
+      "target_section": "Implications for design/build",
+      "description": "The brief says micro-batching must preserve per-update math, but it does not define what equality means, which tensors are compared, or which deterministic fixture sizes must be covered. Without explicit tolerances and comparison points, different implementations could all claim equivalence.",
+      "rationale": "This is the highest-risk correctness change: micro-batching can silently change gradients, Adam moments, clipping, entropy, or advantage normalization. QA needs a deterministic full-batch-vs-micro-batch oracle before the OOM fix is accepted.",
+      "suggested_addition": "Add a required test: `python/tests/test_microbatch.py` builds a deterministic structured Medium-like batch with fixed seed, including neighbor_index/mask and max spatial count near 1261. Run `_optimize_actor_critic` once with full batch and once with `--micro-batch-steps` values [1, 2, 8]; assert loss/stat fields, final parameters, and Adam state tensors match within `rtol=___`, `atol=___`, and no NaN/Inf values appear. Define whether exact equality or float tolerance is expected on CPU.",
+      "supporting_roles": [
+        "domain_fidelity",
+        "architect"
+      ],
+      "supporting_lenses": [
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "micro-batch the dense Medium forward/backward to lift the v4 OOM gate",
+        "Micro-batch traversal only; per-update math byte-verbatim; numerical-equivalence + warm-start parity tests required (AC6)."
+      ],
+      "event_id": "6d3ab2e4-fe5e-45ee-a6a6-7aaf409eefc5"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Resume/warm-start correctness lacks an interruption test",
+      "severity": "critical",
+      "primary_lens": "technical",
+      "target_file": "discovery-output.md",
+      "target_section": "Light scan summary",
+      "description": "The brief identifies that resume currently loads only ONNX and that v5 must carry `(net,opt)`, but it does not define the observable test proving resume is equivalent to an uninterrupted run. It also does not state which checkpoint round is authoritative when `ckpt_round_r.pt`, `opt_round_r.pt`, curve rows, and exported ONNX disagree.",
+      "rationale": "Optimizer carryover is the core feature; a resume path that silently drops Adam moments would look successful while invalidating the experiment. QA needs a deterministic stop/resume parity test to catch this.",
+      "suggested_addition": "Add a required resume acceptance test: run a tiny deterministic 3-round actor-critic job uninterrupted, then run the same job with process stop after round 1 and `--resume`; assert final torch state_dict, Adam state_dict, exported ONNX logits on a fixed sample, curve.csv rows, and metrics.jsonl fields match within defined tolerances. Define failure behavior when `opt_round_{r}.pt` is missing/corrupt or does not match `ckpt_round_{r}.pt`: fail fast with a clear error, not silently restart Adam.",
+      "supporting_roles": [
+        "domain_fidelity",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "resume 194\u2013200 loads only the ONNX gen model, never torch state/opt. ckpt_round_{r}.pt written (229) but never read.",
+        "Must keep `(net, opt)` alive in-process across rounds; sidecar `opt_round_{r}.pt`; reload net+opt on `--resume`."
+      ],
+      "event_id": "c2df7f80-7e70-4a26-a107-9491f565cc35"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Experiment pass/fail thresholds are underspecified",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "discovery-output.md",
+      "target_section": "Feature / Implications for design/build",
+      "description": "The brief says to run two 16-round Medium arms and determine whether the model clears the 28.9% blind baseline, but it does not define the statistical test, confidence level, minimum effect size, or how to handle inconclusive results. It also mentions `bench-onnx \u22650.70` only indirectly in the scan, not as a formal acceptance gate with units.",
+      "rationale": "ML acceptance must distinguish a real pass from noise, timeout, or cherry-picked results. Without predefined thresholds, QA cannot determine whether RESULTS.md is accepted or merely descriptive.",
+      "suggested_addition": "Add experiment decision rules: ceiling eval must use exactly 200 games, seed 4242424, turn-cap 250, threads 12, and compare against blind baseline 58/200 using `_two_proportion_z`. Define pass as one-sided p <= ___ and winrate >= ___, fail as winrate <= 28.9% or p > ___, and inconclusive behavior if the run completes but misses significance. Define `bench-onnx` gate as metric name, command, dataset/input size, unit, and threshold.",
+      "supporting_roles": [
+        "product_manager",
+        "cost_efficiency",
+        "domain_fidelity"
+      ],
+      "supporting_lenses": [
+        "business",
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "re-test whether the structured GNN clears the blind baseline (28.9%) on Medium.",
+        "Two full 16-round Medium arms: small rung (primary, AC1/AC2) + medium rung (AC3)."
+      ],
+      "event_id": "bc19123f-76c5-4de3-a3ad-ca36163d68a5"
+    },
+    {
+      "role_id": "qa_testing",
+      "role_lens": "testability",
+      "model": "openai/gpt-5.5",
+      "round": 1,
+      "title": "Edge cases for checkpoint and divergence handling are missing",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "discovery-output.md",
+      "target_section": "Implications for design/build",
+      "description": "The brief does not specify expected behavior for missing optimizer sidecars, corrupt checkpoints, shape/rung mismatches, schema changes, partial round output, or NaN divergence after Adam state has been carried forward. These are the exact failure modes introduced by persistent training state.",
+      "rationale": "If edge cases are not specified before implementation, they will be handled inconsistently or not tested at all. For this feature, silent fallback to fresh optimizer or stale checkpoint would invalidate the experiment while appearing to run successfully.",
+      "suggested_addition": "Add an Error/Edge Case section:\n- Missing/corrupt `opt_round_r.pt` on `--resume`: fail fast with actionable error.\n- `ckpt_round_r.pt` and `opt_round_r.pt` round mismatch: fail fast.\n- model/rung/schema/dims mismatch: fail fast before generation starts.\n- partial latest round artifacts: resume from last fully complete round only, with definition of complete artifacts.\n- divergence/NaN: restore safe network state and define whether Adam state is restored, reset, or the run is marked failed.",
+      "supporting_roles": [
+        "practitioner",
+        "architect"
+      ],
+      "supporting_lenses": [
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "sidecar `opt_round_{r}.pt`; reload net+opt on `--resume`.",
+        "divergence guard 139/179\u2013183/188"
+      ],
+      "event_id": "ca922774-bea8-426f-b91f-aed147df1de7"
+    },
+    {
+      "role_id": "security_red_team",
+      "role_lens": "red-team",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Torch checkpoint loading via pickle allows arbitrary code execution on resume",
+      "severity": "critical",
+      "primary_lens": "technical",
+      "target_file": "discovery-output.md",
+      "target_section": "Implications for design/build",
+      "description": "The design calls for saving optimizer state via `torch.save` and loading it on `--resume`. Since `torch.load` defaults to pickle-based deserialization, a corrupted or adversarial `opt_round_{r}.pt` file can execute arbitrary code when the training script resumes, potentially giving an attacker full control of the host.",
+      "rationale": "Pickle deserialization is a classic RCE vector. In a research environment where checkpoint files may be shared or stored in writable directories, this exposes a significant risk with minimal mitigation cost.",
+      "suggested_addition": "Require that `torch.load(..., weights_only=True)` be used when loading optimizer state (and document that if not possible, the file must be trusted and integrity-checked). Add a pre-load checksum (SHA-256) verification against a stored digest to detect tampering before deserialization.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "security"
+      ],
+      "source_excerpts": [
+        "sidecar opt_round_{r}.pt; reload net+opt on --resume",
+        "resume 194\u2013200 loads only the ONNX gen model, never torch state/opt. ... must keep (net,opt) alive in-process + sidecar opt_round_{r}.pt"
+      ],
+      "event_id": "f5f9f353-a40e-4913-aa6e-c327eb23bf70"
+    },
+    {
+      "role_id": "security_red_team",
+      "role_lens": "red-team",
+      "model": "deepseek/deepseek-v4-pro",
+      "round": 1,
+      "title": "Unvalidated --out argument allows writing checkpoints to arbitrary filesystem locations",
+      "severity": "major",
+      "primary_lens": "technical",
+      "target_file": "discovery-output.md",
+      "target_section": "Implications for design/build",
+      "description": "The training script writes checkpoint files, ONNX exports, and logs under a user-specified `--out` directory with no sanitization. An attacker who can control the `--out` argument (e.g., via CI/CD pipeline or shared automation) could cause the script to overwrite sensitive files such as `/etc/cron.d/payload`.",
+      "rationale": "Path traversal is a typical red-team finding; the lack of validation opens the door to write-based attacks that could compromise system integrity.",
+      "suggested_addition": "Validate that the resolved `--out` path is a directory inside a designated workspace (e.g., must start with a known base path) and refuse to run if it would write outside that boundary. Log the final resolved path for auditability.",
+      "supporting_roles": [
+        "architect",
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "security",
+        "robustness"
+      ],
+      "source_excerpts": [
+        "python -m unciv_train.run_loop ... --out <dir> --resume",
+        "Keep (net, opt) alive in-process across rounds; sidecar opt_round_{r}.pt; reload net+opt on --resume."
+      ],
+      "event_id": "86976d7c-b716-4f8b-959e-b7d7913af71f"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain-correctness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Carrying Adam state across rounds may violate the on-policy assumption",
+      "severity": "major",
+      "primary_lens": "business",
+      "target_file": "brief.md",
+      "target_section": "Feature (1-line)",
+      "description": "The brief treats 'carry Adam optimizer state across rounds' as obviously correct continual training, but each round generates a fresh on-policy trajectory batch. Adam's first/second-moment estimates were accumulated against gradients from a *different* data distribution (the previous round's policy), and the divergence guard at train.py:139/188 re-checkpoints net weights per epoch without touching the optimizer moments.",
+      "rationale": "In PPO, the optimizer state straddling distinct on-policy collection rounds is a real domain decision with known failure modes (stale momentum amplifying off-distribution gradients) \u2014 it is NOT a free lunch, and the brief asserts it as the fix without stating the domain rationale or the guard against moment poisoning.",
+      "suggested_addition": "Add a domain-rationale subsection: state explicitly why warm-starting Adam moments is sound for round-to-round on-policy collection here (e.g. policy drift per round is small, lr is fixed, no advantage-scale shift), and define what happens to optimizer moments when the divergence guard fires mid-round \u2014 does the restored safe_state also roll back Adam's moment buffers, or do poisoned moments persist into the next epoch? Specify the intended behavior as an AC.",
+      "supporting_roles": [
+        "practitioner",
+        "skeptic"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "carry Adam optimizer state across rounds",
+        "divergence guard 139/179\u2013183/188"
+      ],
+      "event_id": "04efa435-2d2e-4f0c-906c-d6fc1a90ad3e"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain-correctness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Divergence-guard interaction with warm-start net weights is undefined",
+      "severity": "major",
+      "primary_lens": "business",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "The brief says to reload net+opt on --resume and keep (net,opt) alive across rounds, but does not define the semantics when a round diverges. The existing guard restores `safe_state` (the start-of-round weights). With warm-starting, the start-of-round weights ARE the previous round's output \u2014 so a diverged round silently produces a checkpoint identical to the prior round, and the next round warm-starts from it.",
+      "rationale": "This is a domain-correctness landmine: a diverged round in continual mode means the experiment quietly stops learning while still emitting rounds, and the winrate curve would plateau in a way indistinguishable from genuine convergence \u2014 corrupting the AC1/AC2 conclusion about whether the GNN beats 28.9%.",
+      "suggested_addition": "Specify the diverged-round contract under continual training: (a) does `diverged=1` abort the run, skip the round, or carry forward unchanged weights+opt; (b) is opt_round_{r}.pt written for a diverged round; (c) how RESULTS.md must flag any diverged round so a plateau isn't misread as convergence. Make this an explicit AC.",
+      "supporting_roles": [
+        "qa_testing",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "reload net+opt on `--resume`",
+        "divergence guard 139/179\u2013183/188"
+      ],
+      "event_id": "12e23a84-48ca-4a82-8fbf-e208494f3668"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain-correctness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Micro-batching changes gradient semantics unless accumulation is exact",
+      "severity": "major",
+      "primary_lens": "business",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "The brief says 'Micro-batch traversal only; per-update math byte-verbatim' and demands a numerical-equivalence test (AC6). But GAE is computed ONCE per round from a V-snapshot over the full batch (scan \u00a72, lines 144\u2013156), and advantage normalization (`norm_adv`) is a full-batch statistic. Micro-batching the forward/backward while keeping a single optimizer step requires gradient accumulation with correct per-microbatch weighting; the brief does not state whether advantage norm and the loss reduction (mean vs sum) are computed over the full batch or per-microbatch.",
+      "rationale": "If advantage normalization or the loss mean is taken per-microbatch instead of full-batch, the math is NOT byte-verbatim and the PPO update silently changes \u2014 exactly the silent-failure mode the domain lens exists to catch. 'Traversal only' is doing a lot of undefended work here.",
+      "suggested_addition": "Explicitly state the invariant: GAE and advantage normalization are computed over the FULL batch BEFORE micro-batching; micro-batches accumulate gradients with the correct normalization (e.g. weight each microbatch loss by its fraction of total positions) so the summed gradient equals the full-batch gradient bit-for-bit. AC6's equivalence test must assert this against the pre-micro-batch path, not just 'runs without OOM'.",
+      "supporting_roles": [
+        "practitioner",
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "Micro-batch traversal only; per-update math byte-verbatim",
+        "GAE computed ONCE per round from V-snapshot"
+      ],
+      "event_id": "63fdd629-3456-4343-99bf-25fee53e2acf"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain-correctness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "Warm-start parity test (AC6) tests the wrong invariant for continual training",
+      "severity": "major",
+      "primary_lens": "business",
+      "target_file": "brief.md",
+      "target_section": "Implications for design/build",
+      "description": "AC6 reuses the existing torch\u2194ONNX logit-parity precedent ('round-r torch weights == round r-1 exported ONNX'). That validates export fidelity, not continual-training correctness. The genuinely new domain behavior \u2014 that round r's net actually STARTS from round r-1's weights+opt rather than re-initializing \u2014 has no stated test. The scan notes the current code calls StructuredPolicyValueNet(...) fresh at line 303.",
+      "rationale": "The core claim of v5 is 'warm-start'. Without a test asserting that round r's initial parameters equal round r-1's final parameters (and opt moments match), the build could regress to from-scratch silently and still pass all existing parity tests \u2014 reproducing the exact v4 bottleneck the feature exists to fix.",
+      "suggested_addition": "Add an explicit AC: a test that runs 2 rounds and asserts round-2's initial net.state_dict() and optimizer moment buffers are bit-identical to round-1's final state (modulo the new data batch). Distinguish this 'continuity' test from the export-parity test; do not conflate them under one AC6.",
+      "supporting_roles": [
+        "qa_testing"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "warm-start parity tests required (AC6)",
+        "reuse for the AC6 \"round-r torch weights == round r-1 exported ONNX\" check"
+      ],
+      "event_id": "1d215974-c3b0-46db-a6fa-d6d2abdb7ccd"
+    },
+    {
+      "role_id": "domain_fidelity",
+      "role_lens": "domain-correctness",
+      "model": "anthropic/claude-opus-4.8",
+      "round": 1,
+      "title": "The baseline being beaten (28.9% blind) may not be an apples-to-apples target",
+      "severity": "minor",
+      "primary_lens": "business",
+      "target_file": "brief.md",
+      "target_section": "Feature (1-line)",
+      "description": "The success criterion is 're-test whether the structured GNN clears the blind baseline (28.9%)'. The scan shows v4 blind=28.9% (58/200) and structured small-rung=23.0% (47/204) used the SAME turn-cap=250 \u2014 good. But the brief should state the win condition in domain terms: does 'clears' mean point estimate above 28.9%, or statistically significant via the one-sided z-test (analyze.py:46\u201355) at the 200-game ceiling? These are different business conclusions.",
+      "rationale": "Whether the GNN 'wins' is the entire deliverable. A point estimate of 29% over 200 games is not a significant improvement over 28.9%; conflating 'higher number' with 'beats baseline' would let the experiment claim success on noise.",
+      "suggested_addition": "Define the AC1/AC2 win condition precisely: 'structured medium ceiling winrate exceeds 28.9% AND the one-sided two-proportion z-test (analyze._two_proportion_z, 200 games each) yields p < 0.05'. State the blind baseline's n and seed so both arms are evaluated on identical conditions.",
+      "supporting_roles": [
+        "qa_testing",
+        "skeptic"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "re-test whether the structured GNN clears the blind baseline (28.9%) on Medium",
+        "_two_proportion_z` 46\u201355"
+      ],
+      "event_id": "82e80de7-ae3e-4282-a753-77ed15ed6d37"
+    },
+    {
+      "role_id": "cost_efficiency",
+      "role_lens": "compute-cost",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Compute Leak Risk: Orphaned JVM Subprocesses on OOM",
+      "severity": "critical",
+      "primary_lens": "business",
+      "target_file": "discovery-output.md",
+      "target_section": "Implications for design/build",
+      "description": "The feature introduces micro-batching to 'lift the v4 OOM gate', acknowledging memory pressure. If the Python orchestrator OOMs or crashes during the 8-12 hour autonomous run, the 12-thread JVM/Gradle subprocesses may be orphaned and continue running indefinitely.",
+      "rationale": "Orphaned multi-threaded processes on large compute instances are a classic source of surprising cloud bills, silently burning CPU hours until the instance is manually killed.",
+      "suggested_addition": "Add a strict OS-level cleanup mechanism (e.g., `prctl(PR_SET_PDEATHSIG, SIGKILL)` on Linux, or a robust `atexit` / `psutil` process tree teardown) to guarantee all JVM subprocesses are terminated if the Python trainer crashes.",
+      "supporting_roles": [
+        "architect",
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical",
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "micro-batch the dense Medium forward/backward to lift the v4 OOM gate",
+        "gen + eval are JVM gradle subprocesses... Total ~8\u201312h autonomous compute."
+      ],
+      "event_id": "d5872bae-c164-44df-92c8-f4ac0b99e38f"
+    },
+    {
+      "role_id": "cost_efficiency",
+      "role_lens": "compute-cost",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Missing Circuit Breaker for Wasted Compute",
+      "severity": "major",
+      "primary_lens": "business",
+      "target_file": "discovery-output.md",
+      "target_section": "Implications for design/build",
+      "description": "The plan commits to two full 16-round arms (~8-12 hours total) autonomously. There is no mention of halting the experiment if the model diverges early or if throughput drops below a usable threshold.",
+      "rationale": "Unattended multi-hour jobs must have a cost ceiling and fail-fast mechanisms. Continuing to train and evaluate a diverged model for 10+ hours is pure compute waste.",
+      "suggested_addition": "Implement a circuit breaker in the autonomous driver: immediately abort the run (and skip remaining rounds/arms) if the `diverged` flag is triggered in `train.py`, or if `bench-onnx` throughput falls below the 0.70 threshold.",
+      "supporting_roles": [
+        "practitioner"
+      ],
+      "supporting_lenses": [
+        "technical"
+      ],
+      "source_excerpts": [
+        "Two full 16-round Medium arms... Total ~8\u201312h autonomous compute.",
+        "divergence guard 139/179\u2013183/188"
+      ],
+      "event_id": "65713033-f4a3-4a23-816c-6a6eec31256a"
+    },
+    {
+      "role_id": "cost_efficiency",
+      "role_lens": "compute-cost",
+      "model": "google/gemini-3.1-pro-preview",
+      "round": 1,
+      "title": "Lack of Cost-per-Experiment Telemetry",
+      "severity": "minor",
+      "primary_lens": "business",
+      "target_file": "discovery-output.md",
+      "target_section": "Implications for design/build",
+      "description": "The experiment tracks ML metrics (winrate, loss, throughput) but does not aggregate or report the total compute cost (CPU-hours) of the runs in the final results.",
+      "rationale": "To maintain right-sized infrastructure and cost-proportional-to-value, researchers must see the compute cost of their architectural choices (e.g., small vs. medium rung).",
+      "suggested_addition": "Calculate and log total CPU-hours (wall-clock time \u00d7 threads) for each arm. Append this cost-per-unit metric to `metrics.jsonl` and prominently display it in `RESULTS.md`.",
+      "supporting_roles": [
+        "product_manager"
+      ],
+      "supporting_lenses": [
+        "cross_cutting"
+      ],
+      "source_excerpts": [
+        "new per-round fields (rung/throughput) go to metrics.jsonl.",
+        "write RESULTS.md in-session"
+      ],
+      "event_id": "21c4e35d-8473-4b3a-b9c9-5c98e000c7cc"
+    }
+  ]
+}

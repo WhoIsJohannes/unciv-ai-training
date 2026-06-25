@@ -1,0 +1,20 @@
+<p><strong>New:</strong> a private loss helper <code>_ac_loss_terms</code> and an atomic-save helper
+<code>_atomic_torch_save</code> in the trainer/driver; the chunked traversal branch inside
+<code>_optimize_actor_critic</code>; an <code>opt_round_{r}.pt</code> sidecar per round; a
+<code>--micro-batch-steps</code> arg; the <code>python/run_v5.sh</code> driver; two pytest files.</p>
+<p><strong>Touched:</strong> <code>train.py</code> (optimizer injection, opt-aware divergence guard,
+warm/resume in the 3 trainers, return the optimizer) and <code>run_loop.py</code> (carry the pair
+across the loop, atomic ckpt+opt saves, resume net+opt, extra metrics.jsonl fields). The single
+<code>train_round</code> caller (@226) is updated for the 4-tuple return.</p>
+<p><strong>Untouched but relied on (FROZEN):</strong> <code>compute_gae</code>, the per-update algebra
+(PPO clip / value MSE / entropy / objective / grad-clip 10.0), <code>_masked_logp</code>/
+<code>_entropy</code>, the encoder + heads + <code>RUNGS</code>, <code>build_rich_batch</code> (its
+<code>[B,…]</code> per-row layout is what makes chunking sound), the terminal-only ±1 reward, the
+ONNX export contract (<code>export_rich</code>, contract_version=3) and the entire Kotlin bridge
+(<code>OnnxPolicy.kt</code> gates, <code>SampleSchema.kt</code> VERSION=3, <code>bench-onnx</code>),
+and <code>CURVE_COLS</code>.</p>
+<p><strong>Calls in / calls out:</strong> <code>run_loop.run</code> → <code>train_round</code> →
+trainer → <code>_optimize_actor_critic</code> (now receives <code>optimizer</code> + optional
+<code>forward_chunk_fn</code>). Export/eval/gen paths are unchanged and still consume only the exported
+ONNX — so warm-start stays fully on-policy (the warm net == the net that generated the round's data).
+The contract + bridge see ZERO change: no contract bump, byte-unchanged reader.</p>

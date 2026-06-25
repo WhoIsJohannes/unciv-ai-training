@@ -1,0 +1,49 @@
+diff --git a/python/unciv_train/MAP.md b/python/unciv_train/MAP.md
+index 1ca4f810b..099618931 100644
+--- a/python/unciv_train/MAP.md
++++ b/python/unciv_train/MAP.md
+@@ -2,23 +2,27 @@
+ 
+ # python/unciv_train
+ 
+-> 9 source file(s) in python/unciv_train.
++> 11 source file(s) in python/unciv_train.
+ 
+ - `__init__.py` — Documents the package purpose: self-play policy training, ONNX export, and round-loop evaluation for Unciv learning curves.
+   <!-- map sha:27adfe002203e45208653e4af4eeffa5c28eb94f symbols: -->
+-- `analyze.py` — Compares acceptance experiment curves, computes convergence and ceiling statistics, runs final evaluations, and writes reports and overlay plots.
+-  <!-- map sha:858398951d0c4a51ef0cd73617e8b84c91d9618b symbols:_read_curve,_stddev,_two_proportion_z,_overlay,main -->
+-- `contract.py` — Defines Python-side ONNX tensor names, metadata keys, schema-derived dimensions, token specs, and provenance helpers matching the JVM contract.
+-  <!-- map sha:b1589262c93245c32c784deafc362f22beca4327 symbols:Dims,_schema,dims_from_schema,fingerprint_from_schema,schema_version_from_schema,token_specs_from_schema -->
+-- `dataset.py` — Loads trajectory shards, validates schema/ruleset provenance, extracts learner steps, masks, rewards, and rich observation blocks for training.
+-  <!-- map sha:bd55a47c89b6dd57fd8c1f9adbe4d2c500e7cf9a symbols:ProvenanceError,TrainStep,TrainTrajectory,_learner_slot,load_training_steps,_rich_step_blocks,load_trajectories -->
+-- `export_onnx.py` — Exports blind or rich trained policy networks to policy-only ONNX with fixed outputs and JVM-readable contract metadata.
+-  <!-- map sha:02b815cbcf4e12cfbc4ec181624cccb4de59617c symbols:_PolicyOnly,_RichPolicyOnly,export,export_rich -->
+-- `features.py` — Builds padded rich multi-tensor batches from trajectory observation blocks, including token masks for spatial and entity sets.
+-  <!-- map sha:9d768793923b69325caf1fdb89d15e42ba720da9 symbols:_pad_token_set,build_rich_batch,build_rich_single -->
+-- `model.py` — Implements blind MLP and rich token-pooling actor-critic networks producing tech logits, policy logits, and training-only value estimates.
+-  <!-- map sha:e8434ee12a922c98bf5d5334737905a810cd5711 symbols:_small_init_value_head,PolicyNet,masked_pool,_TokenEncoder,RichPolicyValueNet -->
+-- `run_loop.py` — Orchestrates self-play generation, training, ONNX export, evaluation, curve plotting, and verdict reporting across repeated rounds.
+-  <!-- map sha:35454376b32da7b5bdf244dad8da90b205a24185 symbols:gradle_selfplay,generate,evaluate,train_round,verdict,plot,_read_existing_rows,main -->
+-- `train.py` — Implements masked-action policy optimization using REINFORCE baseline and blind/rich actor-critic training with GAE.
+-  <!-- map sha:be7eabf869d83ce8d70f0bda4a013a497d162716 symbols:_masked_logp,_entropy,compute_gae,train_reinforce,_optimize_actor_critic,_stack_traj,train_actor_critic_blind,train_actor_critic_rich -->
++- `analyze.py` — Analyzes acceptance-run curves, computes stability/significance metrics, performs final ceiling evaluation, and writes comparison reports and overlay plots.
++  <!-- map sha:0d4e1627a25edd6fd62b67d834533908f7e23cd9 symbols:_read_curve,_stddev,_two_proportion_z,_overlay,main -->
++- `analyze_v5.py` — Evaluates a v5 continual-training arm against fixed v4/v2 baselines, extracting final ONNX and curve winrates for acceptance reporting.
++  <!-- map sha:9531b944be117f897f9deca65d684557b750d07e symbols:_last_onnx,_curve_winrates,main -->
++- `contract.py` — Defines the Python ONNX/schema contract, deriving tensor dimensions, metadata, token specs, vocab counts, and fingerprints from generated schema files.
++  <!-- map sha:5bc56c2116fe42bd3d6b094c6f88c3731a4694d8 symbols:Dims,_schema,dims_from_schema,fingerprint_from_schema,schema_version_from_schema,spatial_channels_from_schema,token_specs_from_schema,vocab_counts_from_schema -->
++- `dataset.py` — Loads validated self-play trajectory shards into learner training steps or rich trajectories with observations, actions, masks, returns, and provenance checks.
++  <!-- map sha:466f0e9e605d7098b3beb3a9602f530b29d17a10 symbols:ProvenanceError,TrainStep,TrainTrajectory,_learner_slot,load_training_steps,_rich_step_blocks,load_trajectories -->
++- `export_onnx.py` — Exports trained blind or rich policy networks to atomic ONNX files with fixed outputs and schema/contract provenance metadata.
++  <!-- map sha:205901f3ae2beff7b361d2e86e4c7139dfeb80aa symbols:_atomic_save,_PolicyOnly,_RichPolicyOnly,export,export_rich -->
++- `features.py` — Builds padded rich/structured model input batches from observation blocks, including entity token masks and optional hex neighbor graph tensors.
++  <!-- map sha:3223cbe3066d802dc5435d36aa877e87c1fbe58f symbols:_pad_token_set,_read_mapdims,_neighbor_graph_for,build_rich_batch,build_rich_single -->
++- `hexgraph.py` — Constructs fixed degree-six hex adjacency indices and masks from tile coordinates, matching JVM world-wrap and off-map behavior.
++  <!-- map sha:56cd35d7a2bed1929421449946d912aa190d7110 symbols:build_neighbor_graph -->
++- `model.py` — Implements blind, rich pooled, and structured attention/GNN policy-value networks with masked pooling and separate tech, policy, and value heads.
++  <!-- map sha:3e1a167f6915700694c4b7d2308b23f860d30f77 symbols:_small_init_value_head,PolicyNet,masked_pool,_TokenEncoder,RichPolicyValueNet,_masked_mean,_SpatialEmbed,_GatherGNNLayer,_EntityEncoder,_masked_softmax_attend,_MHA,_AttnBlock,StructuredPolicyValueNet -->
++- `run_loop.py` — Orchestrates round-based self-play generation, training, ONNX export, evaluation, curve plotting, checkpointing, and verdict reporting via Gradle calls.
++  <!-- map sha:b72bf71d10f8cd6a0e8d125d4df4df5219be55f0 symbols:gradle_selfplay,generate,evaluate,_atomic_torch_save,_load_warm,train_round,verdict,plot,_read_existing_rows,main -->
++- `train.py` — Trains policies from recorded trajectories using REINFORCE or actor-critic with GAE, legal-action masking, entropy, and blind/rich/structured variants.
++  <!-- map sha:582faac4a619b272798bf5e01975357817026710 symbols:_masked_logp,_entropy,compute_gae,train_reinforce,_optimize_actor_critic,_stack_traj,train_actor_critic_blind,train_actor_critic_rich,train_actor_critic_structured -->

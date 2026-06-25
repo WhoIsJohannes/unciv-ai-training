@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "roles": [
+    { "id": "skeptic", "display_name": "Skeptic", "lens": "yagni", "persona_file": "council/roles/skeptic.txt", "model": "openai/gpt-5.5" },
+    { "id": "architect", "display_name": "Architect", "lens": "structure", "persona_file": "council/roles/architect.txt", "model": "anthropic/claude-opus-4.8" },
+    { "id": "practitioner", "display_name": "Practitioner (SRE)", "lens": "production-readiness", "persona_file": "council/roles/practitioner.txt", "model": "google/gemini-3.1-pro-preview" },
+    { "id": "qa_testing", "display_name": "QA / Test", "lens": "testability", "persona_file": "council/roles/qa_testing.txt", "model": "openai/gpt-5.5" },
+    { "id": "security_red_team", "display_name": "Security Red Team", "lens": "red-team", "persona_file": "council/roles/security_red_team.txt", "model": "deepseek/deepseek-v4-pro" },
+    { "id": "domain_fidelity", "display_name": "Domain Fidelity (RL/PPO)", "lens": "domain-correctness", "persona_file": "council/roles/domain_fidelity.txt", "model": "anthropic/claude-opus-4.8" },
+    { "id": "cost_efficiency", "display_name": "Cost Efficiency", "lens": "compute-cost", "persona_file": "council/roles/cost_efficiency.txt", "model": "google/gemini-3.1-pro-preview" }
+  ]
+}

@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "schema_version": "1",
+  "mode": "BUILD",
+  "size": "L",
+  "base": "master",
+  "pr_target": "master",
+  "counts": { "edited": 2, "created": 3, "deleted": 0 },
+  "blast_radius": "Python trainer only (train.py, run_loop.py) + new driver/tests; Kotlin bridge + ONNX contract byte-unchanged.",
+  "test_status": "RED-first",
+  "council": "intake 34 triaged; plan-review 34 triaged → 4 revisions applied (--continual flag, byte-verbatim else-branch, collapsed resume API, RESULTS round-8 disentangling); APPROVE w/ revisions",
+  "change_archetypes": ["delta", "interface", "decisions"],
+  "review_focus": [
+    { "item": "Micro-batch size-weighting (n_c/N) + shared _ac_loss_terms helper == whole-batch within fp tol", "why": "AC6 numerical equivalence; wrong weighting silently biases the gradient", "confidence": "high", "anchor": "pr-substance" },
+    { "item": "Divergence guard restores opt.state_dict() too, not just net weights", "why": "a diverged round would poison the persistent Adam moments", "confidence": "high", "anchor": "pr-substance" },
+    { "item": "Warm rounds skip manual_seed; continual is default-on with no toggle", "why": "re-seeding would re-init weights; determinism depends on round-0-only seeding", "confidence": "high", "anchor": "pr-systemfit" },
+    { "item": "Resume requires curve.csv + ckpt + opt sidecar, fail-fast, weights_only=True", "why": "multi-artifact consistency; no silent fresh optimizer; no pickle RCE", "confidence": "high", "anchor": "pr-substance" },
+    { "item": "Whole-batch path byte-identical when micro_batch_steps is 0/>=N (apples-to-apples small-rung arm)", "why": "AC1 vs v4 23.0% requires only the regime to change", "confidence": "high", "anchor": "pr-substance" }
+  ],
+  "system_fit": {
+    "new": ["python/run_v5.sh", "python/tests/test_microbatch.py", "python/tests/test_continual_resume.py"],
+    "touched": ["python/unciv_train/train.py", "python/unciv_train/run_loop.py"],
+    "untouched_relied_on": ["compute_gae", "_masked_logp/_entropy", "StructuredPolicyValueNet+RUNGS", "build_rich_batch", "export_onnx.export_rich (contract_version=3)", "OnnxPolicy.kt/SampleSchema.kt bridge", "CURVE_COLS"],
+    "consumers": ["analyze.py (ceiling eval + _two_proportion_z)", "SelfPlayRunner.kt bench-onnx"],
+    "edges": [
+      { "from": "run_loop.run", "to": "train_round", "label": "net,opt carry" },
+      { "from": "train_round", "to": "train_actor_critic_structured", "label": "warm/resume" },
+      { "from": "train_actor_critic_structured", "to": "_optimize_actor_critic", "label": "inject optimizer + forward_chunk_fn" },
+      { "from": "_optimize_actor_critic", "to": "_ac_loss_terms", "label": "both paths" },
+      { "from": "run_loop.run", "to": "opt_round_r.pt", "label": "atomic save" }
+    ]
+  },
+  "top_decisions": [
+    { "decision": "In-process (net,opt) carryover gated by --continual flag (default True)", "rejected": "no-toggle hardcode (lost attribution+rollback; plan-council FND-0006/0029)", "confidence": "high" },
+    { "decision": "Inject optimizer constructed once alongside the net", "rejected": "reconstruct+reload each round", "confidence": "high" },
+    { "decision": "Whole-batch path byte-verbatim in else-branch; chunk path new code; equivalence tested", "rejected": "shared loss helper (conflicts byte-verbatim freeze; plan-council FND-0002)", "confidence": "high" },
+    { "decision": "Divergence guard restores net AND optimizer state", "rejected": "net-only restore (unsound under persistent opt)", "confidence": "high" },
+    { "decision": "Resume API collapsed to (net,opt); run_loop does disk-load, fail-fast, weights_only=True", "rejected": "4 nullable trainer params (plan-council FND-0001); pickle-trusting load", "confidence": "high" }
+  ],
+  "risks": [
+    { "n": 1, "text": "Micro-batch path subtly diverges from whole-batch (wrong weighting / fp drift)", "ls": "L×H", "mitigation": "shared _ac_loss_terms; test_microbatch.py asserts loss+grad-norm+weights match within atol≈1e-5; small-rung arm uses no-op (byte-identical)" },
+    { "n": 2, "text": "Continual training diverges/collapses mid-run, wasting hours of compute", "ls": "M×M", "mitigation": "opt-aware divergence guard rolls back net+opt to last-good; diverged flag in curve.csv; babysat run; --resume restart-safe" },
+    { "n": 3, "text": "Warm-start still doesn't clear blind (28.9%) — the regime wasn't the bottleneck either", "ls": "M×M", "mitigation": "this is a legitimate experiment outcome; AC2 reports the result PLAINLY either way with z/p; the curve over 16 rounds shows the trajectory" }
+  ],
+  "human_actions": [],
+  "rollback": "git revert the two trainer commits; ckpt/opt sidecars + run dirs are under runs/ (gitignored), delete to reclaim disk. Contract unchanged so no model regen needed.",
+  "change_inventory": [
+    { "path": "python/unciv_train/train.py", "change": "edit", "why": "inject optimizer, opt-aware guard, _ac_loss_terms helper, micro-batch path, warm/resume in 3 trainers", "group": "trainer-core", "heart": true },
+    { "path": "python/unciv_train/run_loop.py", "change": "edit", "why": "carry (net,opt) across loop, atomic ckpt+opt saves, resume net+opt fail-fast, --micro-batch-steps, metrics fields", "group": "driver" },
+    { "path": "python/run_v5.sh", "change": "new", "why": "two-arm experiment driver (small + medium rung), ceiling evals, bench-onnx", "group": "driver" },
+    { "path": "python/tests/test_microbatch.py", "change": "new", "why": "numerical-equivalence: micro-batch vs whole-batch", "group": "tests" },
+    { "path": "python/tests/test_continual_resume.py", "change": "new", "why": "warm-from-memory==warm-from-disk + AC6 parity (warm net==gen ONNX)", "group": "tests" }
+  ],
+  "verification": [
+    "pytest python/tests/test_microbatch.py — micro-batch == whole-batch within atol",
+    "pytest python/tests/test_continual_resume.py — resume equivalence + AC6 parity",
+    "pytest python/tests — full suite green (no regression)",
+    "python -m unciv_train.analyze --root runs/structured-Medium --ceiling-games 200 --eval-seed 4242424 — z-test vs v4 23.0% and vs blind 28.9%",
+    "./gradlew selfPlay --args='bench-onnx <final.onnx> 200 Medium 12 777000' — ratio>=0.70 PASS"
+  ],
+  "out_of_scope": [
+    "New action heads (units/cities/great-person/vote stay heuristic)",
+    "Self-play (opponent stays fixed RandomPolicy)",
+    "Reward shaping",
+    "Encoder changes",
+    "Cross-round replay buffer (DEFERRED — needs behavior-logp recording first)"
+  ],
+  "open_questions": [],
+  "compact": false
+}

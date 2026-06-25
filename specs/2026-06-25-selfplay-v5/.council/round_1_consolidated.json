@@ -1,0 +1,842 @@
+[
+  {
+    "id": "FND-0001",
+    "cluster_key": "7a392be1faa3",
+    "title": "Trainer resume API has too many nullable states",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "3. Warm/resume net+opt in the trainers (train.py)",
+    "description": "The proposed trainer signatures add four nullable state parameters to three trainers, creating a state matrix the next developer has to reason through: fresh, resume, warm in-memory, optimizer fresh, optimizer loaded, optimizer reused, and invalid mixes. The brief says what the happy paths are, but not what happens for mixed inputs like `net not None` plus `resume_ckpt`, or `optimizer not None` plus `resume_opt`.",
+    "rationale": "This is exactly how simple training code turns into a bug farm: optional parameters encode workflow state implicitly. The design should force one clear path before implementation, not rely on every caller remembering the right combination.",
+    "suggested_addition": "Add a short invariant to the brief: `train_round` must normalize state before dispatch and reject mixed modes. Exactly one of `{fresh, warm_in_memory, resume_from_disk}` is allowed; `net + resume_ckpt` and `optimizer + resume_opt` are errors. If possible, keep disk-resume logic in `run_loop.py` and pass concrete `net`/`optimizer` into the trainers after construction/loading, rather than teaching every trainer about checkpoint files.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Each trainer takes `net=None, optimizer=None, resume_ckpt=None, resume_opt=None, micro_batch_steps=None`",
+      "`net not None` \u2192 **warm in-memory**: reuse, skip seed + construction"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0002",
+    "cluster_key": "fb9380579d0f",
+    "title": "\u201cByte-identical\u201d conflicts with refactoring loss into a helper",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "2. Micro-batch the dense traversal (train.py)",
+    "description": "The brief promises the whole-batch path is a no-op and byte-identical, while also requiring the current loss expressions to be factored into `_ac_loss_terms` and used by the whole-batch path. Those cannot both be true in any meaningful code-review sense.",
+    "rationale": "This kind of impossible acceptance wording makes implementers either over-contort the code or claim equivalence they did not actually preserve. Pick the simple requirement: either leave the old path literally alone, or accept a small refactor and test numerical equivalence.",
+    "suggested_addition": "Replace the byte-identical claim with one of these explicit choices: `Option A: when micro_batch_steps is falsy, execute the existing whole-batch code path with minimal edits; duplicate the loss expressions if needed to avoid touching proven code.` Or: `Option B: refactor both paths through _ac_loss_terms; whole-batch behavior must be numerically equivalent within test tolerance, not byte-identical.`",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Factor the three loss-term expressions into ONE private helper `_ac_loss_terms(...)` ... used by BOTH the whole-batch and chunked paths",
+      "When `micro_batch_steps` is falsy or \u2265 n \u2192 the **whole-batch path runs exactly as today** (no-op; byte-identical for Tiny/small arms)."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0003",
+    "cluster_key": "b5edbc84f081",
+    "title": "ONNX parity in resume test is acceptance creep",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "6. Tests (pytest, python/tests/)",
+    "description": "`test_continual_resume.py` is asked to prove memory-vs-disk optimizer resume equivalence and also compare the warm net at round start to the prior exported ONNX. That drags the frozen export/parity stack into a test for trainer state carryover, making the test slower and more brittle than the feature requires.",
+    "rationale": "The ONNX bridge is explicitly frozen; using it as proof for this change is extra machinery with a high maintenance cost. The core bug risk is losing weights or Adam state across resume, and that can be tested directly with PyTorch state dicts.",
+    "suggested_addition": "Split this requirement: `test_continual_resume.py` should only assert PyTorch in-memory continuation equals checkpoint+optimizer reload continuation, including optimizer state tensors. Do not require ONNX/JVM parity in this test. If AC6 still needs coverage, add a tiny existing-parity smoke test that reuses the current export parity helpers and runs once, separate from resume equivalence.`",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`test_continual_resume.py` \u2014 **warm-from-memory == warm-from-disk**...",
+      "Plus the **AC6 parity** check: the warm net at the start of round r produces logits matching the round r-1 *exported ONNX* within atol"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0004",
+    "cluster_key": "4da0aadc3734",
+    "title": "AC6 parity equates warm net to exported ONNX, but export drops the value head",
+    "severity": "major",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "6. Tests / test_continual_resume.py",
+    "description": "The AC6 parity check asserts the warm net at round r produces logits matching the round r-1 exported ONNX, but the ONNX export uses `_RichPolicyOnly` which drops the value head and outputs exactly {OUTPUT_TECH, OUTPUT_POLICY}. The carried-forward net retains its value head with continually-updated weights, so 'warm net == gen net' only holds for the policy/tech heads \u2014 the value head has no ONNX counterpart and its continual state is invisible to this parity gate.",
+    "rationale": "If the parity invariant is stated as 'warm net == gen net' without scoping it to the exported heads, the test either over-claims (implying value-head carryover is verified, which it isn't) or will be written against the wrong surface; the on-policy-carryover claim it's meant to prove only concerns the policy distribution anyway.",
+    "suggested_addition": "Scope the AC6 parity assertion explicitly to the exported heads: 'warm net's tech/policy logits == round r-1 exported ONNX (atol), value head excluded from parity (no ONNX counterpart; its continual state is exercised by test_continual_resume's opt-state equivalence instead).' State that on-policy carryover is a policy-distribution claim, not a value-head claim.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "the warm net at the start of round r produces logits matching the round r-1 *exported ONNX* within atol (proves warm net == gen net \u2192 on-policy carryover; FND-0030)",
+      "export outputs exactly {OUTPUT_TECH, OUTPUT_POLICY}"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0005",
+    "cluster_key": "5760f4f8c6d5",
+    "title": "Divergence guard restore semantics differ between whole-batch and chunked paths",
+    "severity": "major",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "2. Micro-batch the dense traversal",
+    "description": "In the whole-batch path the divergence guard checks `isfinite(loss)` BEFORE `backward()`/`step()`, so a NaN round never touches grads. The chunked path computes per-chunk backward (accumulating grads) and only checks the accumulated detached loss for finiteness AFTER all chunks have run `loss_c.backward()`. The brief asserts 'same semantics' but the chunked path can accumulate NaN/Inf grads into `.grad` buffers before the guard fires, and a non-finite chunk loss mid-accumulation is never individually detected.",
+    "rationale": "Equivalence of the divergence guard is load-bearing for the AC6/numerical-equivalence claim and for optimizer-state correctness; if a chunk produces NaN the accumulated grad is already poisoned and the 'no step + restore net+opt' branch must guarantee the next epoch starts from clean grads (zero_grad) \u2014 this is implicit, not stated.",
+    "suggested_addition": "Specify the chunked guard precisely: (a) accumulate per-chunk losses and check `isfinite` on the running sum after each chunk OR after all chunks, (b) on non-finite, skip `clip_grad_norm_`/`step()`, restore net+opt from snapshot, AND ensure `optimizer.zero_grad()` clears the poisoned accumulated grads before the next epoch, (c) add a test asserting a deliberately-NaN chunk triggers identical restore behavior to a NaN whole-batch loss.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "After all chunks: check the accumulated detached loss is finite (divergence guard, same semantics \u2014 no step + restore net+opt on NaN)",
+      "on the NaN branch (@180) also `optimizer.load_state_dict(safe_opt)`"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0006",
+    "cluster_key": "1e264c1cf85c",
+    "title": "Continual default removes the from-scratch escape hatch needed to attribute the result",
+    "severity": "major",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "4. Persist + carry across the loop",
+    "description": "The brief makes continual the DEFAULT with 'no toggle \u2014 v4 from-scratch lives in git history.' But the entire WHY is a controlled comparison: continual vs from-scratch, holding micro-batching and turn-cap constant. With no in-codebase toggle, the only way to reproduce the from-scratch arm is to check out v4 \u2014 which lacks micro-batching and the `_ac_loss_terms` refactor, so the comparison is no longer apples-to-apples for the medium rung.",
+    "rationale": "Removing the toggle collapses two independent variables (continual-vs-fresh AND v4-vs-v5 code) into one, so a positive v5 result cannot be cleanly attributed to continual training rather than the micro-batch/refactor changes \u2014 undermining the experiment's core inferential claim.",
+    "suggested_addition": "Either (a) keep a `--from-scratch` flag in v5 that re-inits net+opt each round (one branch in the warm/resume logic already being written) so both arms run on identical code, or (b) explicitly document in RESULTS that the continual-vs-v4 comparison holds code constant only for the small rung (where micro-batch is a no-op) and is confounded for the medium rung.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "continual is the DEFAULT (no toggle \u2014 v5 IS the continual version; v4 from-scratch lives in git history)",
+      "small rung ran clean on Medium in v4, so micro-batch is a no-op here \u2192 only the regime changed"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0007",
+    "cluster_key": "81469ae65cb1",
+    "title": "forward_chunk_fn ownership and adv-indexing contract are split across train.py boundary",
+    "severity": "minor",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "3. Warm/resume net+opt in the trainers",
+    "description": "The trainers build `forward_chunk_fn(lo,hi)` (closing over full-batch inputs), while `_optimize_actor_critic` owns the once-computed batch-wide adv/ret/old_logp that must be INDEXED `[lo:hi]` per chunk. The contract that the chunk indices used to slice `forward_chunk_fn` are the SAME indices used to slice adv/old_logp is implicit \u2014 a mismatch (e.g. snapshot pass chunking by K but epoch pass chunking differently, or padding boundaries) would silently misalign advantages with steps and produce a plausible-but-wrong gradient.",
+    "rationale": "This is exactly the kind of leaky-abstraction seam (forward slicing in the trainer, adv slicing in the optimizer) where a per-chunk index contract lives in two files and drifts; the bug would not crash and would not be caught by finiteness checks \u2014 only by the numerical-equivalence test, IF its K divides n evenly.",
+    "suggested_addition": "State a single authoritative chunk-index generator inside `_optimize_actor_critic` used identically for snapshot pass, epoch pass forward slicing, and adv/ret/old_logp indexing. Require the numerical-equivalence test to use a K that does NOT evenly divide n (so a trailing partial chunk exercises the size-weighting and index alignment).",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "adv is normalized batch-wide (train.py:159) \u2014 so it is computed once and INDEXED per chunk, never recomputed",
+      "Build `forward_chunk_fn`: structured/rich `lambda lo,hi: net({k: v[lo:hi] for k,v in inputs.items()})`"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0008",
+    "cluster_key": "eef2e62d6622",
+    "title": "Resume fail-fast checks file presence but not rung/dims compatibility of the carried net+opt",
+    "severity": "minor",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "4. Persist + carry across the loop / Resume",
+    "description": "The resume guard requires curve.csv + ckpt + opt sidecar to be present and fails fast if missing, but the brief only checks presence \u2014 not that the checkpoint's architecture (rung, dims, token_specs, vocab) matches the arch being constructed for this resumed run. decisions.md FND-0007/0003 explicitly called for 'rung/dims-compatible' but the HOW section dropped this.",
+    "rationale": "Loading a small-rung opt_round_N.pt into a medium-rung Adam (or a dims-mismatched state_dict) either errors cryptically or, worse for the optimizer state, silently mismatches moment tensors to the wrong params \u2014 a continual-training-specific corruption that presence checks won't catch and that bites only after a successful-looking load.",
+    "suggested_addition": "Extend the resume fail-fast to verify the resumed checkpoint is arch-compatible: assert the constructed net's rung/dims/token_specs match what produced ckpt_round_{N-1}.pt (persist a small arch fingerprint alongside the sidecar, or rely on strict `load_state_dict` and surface its error with a clear 'rung mismatch' message). This restores the decisions.md FND-0007/0003 intent.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "require curve.csv + `ckpt_round_{start-1}.pt` + `opt_round_{start-1}.pt` all present (**fail-fast** with a clear message if a sidecar is missing",
+      "rung/dims-compatible; fail-fast with clear error"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0009",
+    "cluster_key": "50ed3c1eef36",
+    "title": "Missing rollback toggle for continual training",
+    "severity": "critical",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "4. Persist + carry across the loop (run_loop.py)",
+    "description": "The design explicitly removes the ability to run the v4 'from-scratch' behavior, relying entirely on git history for rollback.",
+    "rationale": "Never replace a working production system with a stateful rewrite without a runtime escape hatch. If this 12-hour job OOMs or diverges in a way tests didn't catch, operators need a flag to revert to known-good behavior without a code rollback.",
+    "suggested_addition": "Add a `--no-continual` (or `--reset-every-round`) CLI flag that forces `net=None` and `optimizer=None` at the start of every round, preserving the v4 behavior as a safe operational fallback.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "continual is the DEFAULT (no toggle \u2014 v5 IS the continual version; v4 from-scratch lives in git history)."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0010",
+    "cluster_key": "e1babb6ccd26",
+    "title": "Unbounded disk growth from per-round optimizer state",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "4. Persist + carry across the loop (run_loop.py)",
+    "description": "The loop saves `ckpt_round_{r}.pt` and `opt_round_{r}.pt` every round. For a 16-round job, this generates 32 files per run with no cleanup mechanism.",
+    "rationale": "Unbounded disk writes in an unattended multi-hour loop is a classic Sev-2 trigger. The system must clean up after itself to be production-ready, especially since optimizer states can be large.",
+    "suggested_addition": "Implement a rolling window for checkpoints. After successfully saving round `r`, delete `ckpt_round_{r-2}.pt` and `opt_round_{r-2}.pt` (or tie this retention to the existing `--keep-shards` parameter).",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Save BOTH ckpt_round_{r}.pt (replaces the bare save @229) AND new opt_round_{r}.pt each round."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0011",
+    "cluster_key": "51d6974e9e76",
+    "title": "Risk of PyTorch memory fragmentation over 12-hour lifecycle",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "2. Micro-batch the dense traversal (train.py)",
+    "description": "The design keeps `net` and `optimizer` alive in memory for 12+ hours across 16 rounds, but doesn't explicitly manage Python/PyTorch garbage collection for the large full-batch tensors between rounds.",
+    "rationale": "Long-running PyTorch processes often suffer from memory fragmentation or lingering tensor references. A slow leak of the large `val0` or `adv` tensors will cause an OOM at hour 10, wasting massive compute.",
+    "suggested_addition": "Add explicit `del` statements for large intermediate tensors (`val0`, `adv`, `ret`, `old_logp`) at the end of `_optimize_actor_critic`, followed by an explicit `gc.collect()` to guarantee memory is reclaimed before the next round.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "GAE/adv/returns: computed ONCE on the full flattened val0",
+      "loss_c.backward() (accumulate, frees the chunk graph)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0012",
+    "cluster_key": "bfeee2f24fcc",
+    "title": "Unmanaged Gradle daemon lifecycle risks hanging the job",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "5. Experiment driver python/run_v5.sh",
+    "description": "The experiment driver relies on Gradle subprocesses running sequentially for hours to saturate the box, but doesn't specify daemon management.",
+    "rationale": "Gradle daemons are notorious for leaking memory and zombieing over long periods. If a daemon hangs silently in hour 8, the Python parent process might block indefinitely, requiring manual operator intervention and losing progress.",
+    "suggested_addition": "Ensure the Gradle invocations in the driver or Python script explicitly use `--no-daemon` to guarantee process isolation and termination, or explicitly kill the daemon between rounds.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Two arms, run SEQUENTIALLY (14 cores; 12 gradle threads saturate the box)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0013",
+    "cluster_key": "0f9e6c59b235",
+    "title": "Missing explicit success metrics for experiment arms",
+    "severity": "critical",
+    "primary_lens": "outcomes",
+    "target_file": "brief.md",
+    "target_section": "WHAT / WHY",
+    "description": "The brief says the goal is to 'finally clears blind' but does not define a specific, measurable success criterion for each arm (e.g., win rate threshold, statistical significance). Without this, the team cannot determine if the experiment succeeded or when to stop.",
+    "rationale": "As a PM, I need a clear definition of done. The experiment's outcome must be measurable to decide whether to ship the continual training change.",
+    "suggested_addition": "Add a 'Success Criteria' section: 'Arm A (small rung) must achieve a win rate > 28.9% with p<0.05 (one-sided z-test) against RandomPolicy on Medium map. Arm B (medium rung) is a capacity comparison; success is completing the run without OOM and reporting the win rate, but no specific threshold is required for this arm.'",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "v5 tests whether *not resetting* (warm-start weights + carried Adam state, over more rounds) finally clears blind.",
+      "re-run the v4 Medium comparison."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0014",
+    "cluster_key": "af0e5703155b",
+    "title": "No prioritization of capabilities \u2014 everything appears P0",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "brief.md",
+    "target_section": "HOW / Plan items",
+    "description": "The brief lists two experiment arms and micro-batching as capabilities, but does not indicate which are must-have for the v5 release vs. nice-to-have. If the medium-rung arm (Arm B) fails or takes too long, it's unclear whether that blocks shipping the continual training change.",
+    "rationale": "As a PM, I need to know the priority to make trade-off decisions under time/resource constraints. Without it, the team may waste effort on lower-priority items.",
+    "suggested_addition": "Add a 'Priority' subsection: 'P0 (must-ship): Arm A (small rung) must complete and demonstrate improvement over v4 baseline. P1 (should-ship if possible): Arm B (medium rung) is a capacity demonstration; if it fails due to OOM or time, it does not block the v5 release. Micro-batching is a P0 enabler for Arm B but is not required for Arm A.'",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Arm A \u2014 primary (AC1/AC2)",
+      "Arm B \u2014 medium-rung (AC3)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0015",
+    "cluster_key": "963a0a1c5ccb",
+    "title": "No fallback plan if experiment fails to meet success criteria",
+    "severity": "major",
+    "primary_lens": "outcomes",
+    "target_file": "brief.md",
+    "target_section": "WHY / Out of scope",
+    "description": "The brief assumes the continual training change will improve performance, but does not address what happens if Arm A fails to clear the blind baseline. Should the code still be merged? Should we iterate on hyperparameters? The lack of a decision tree creates risk of wasted effort or indecision.",
+    "rationale": "As a PM, I need to know the go/no-go criteria and next steps for each outcome. Without it, the team may ship a change that doesn't deliver value or get stuck in analysis paralysis.",
+    "suggested_addition": "Add a 'Decision Tree' section: 'If Arm A achieves win rate > 28.9% with p<0.05: merge continual training as default, proceed to self-play experiments. If Arm A beats 23.0% but not 28.9%: discuss whether the improvement is sufficient to merge; consider hyperparameter tuning. If Arm A fails to beat 23.0%: do not merge; investigate root cause.'",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "v5 tests whether *not resetting* ... finally clears blind."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0016",
+    "cluster_key": "818388a7a2ab",
+    "title": "Deferred replay buffer lacks impact assessment",
+    "severity": "minor",
+    "primary_lens": "outcomes",
+    "target_file": "brief.md",
+    "target_section": "Out of scope (NON-GOALS)",
+    "description": "The brief defers the replay buffer but does not explain why it's deferred or what impact its absence has on the v5 experiment's validity or future work. This could lead to technical debt that surprises later.",
+    "rationale": "As a PM, I need to understand the trade-offs of deferring features. If the replay buffer is critical for scaling to self-play, its deferral might limit the value of v5.",
+    "suggested_addition": "Add a note: 'Replay buffer is deferred because it requires behavior-logp recording, which is not yet implemented. Its absence means v5 cannot test off-policy corrections; this is acceptable for the current on-policy PPO setup but will be needed for future self-play experiments.'",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "no replay buffer (DEFERRED \u2014 gated on behavior-logp recording; one-line note in RESULTS)."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0017",
+    "cluster_key": "ead6116bcb4c",
+    "title": "Micro-batching success not defined independently of medium-rung experiment",
+    "severity": "minor",
+    "primary_lens": "outcomes",
+    "target_file": "brief.md",
+    "target_section": "HOW \u2014 Micro-batch the dense traversal",
+    "description": "The micro-batching capability is described as an enabler for the medium-rung experiment, but its own success criteria are not defined. If the medium-rung experiment fails for reasons unrelated to micro-batching (e.g., hyperparameters), it's unclear whether micro-batching is considered a success.",
+    "rationale": "As a PM, I want to decouple the infrastructure capability from the experiment outcome. Micro-batching should be validated independently to ensure it can be reused.",
+    "suggested_addition": "Add a 'Micro-batching success criteria': 'The micro-batching implementation is successful if: (1) the numerical equivalence test passes (loss/grad-norm within atol=1e-5), (2) the medium-rung experiment completes without OOM, and (3) the throughput is within 2x of the whole-batch path for small batches.'",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "micro-batching newly enables this; would OOM in v4"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0018",
+    "cluster_key": "21e1aa505181",
+    "title": "Acceptance criteria are referenced but not formally defined",
+    "severity": "critical",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "Experiment driver `python/run_v5.sh` / Tests",
+    "description": "The brief references AC1, AC2, AC3, AC6, and AC7, but does not provide a canonical acceptance-criteria table defining exact pass/fail outcomes. Some thresholds are implied in different sections, but QA cannot tell which are release gates versus reported experiment outputs.",
+    "rationale": "I need to write Given/When/Then tests and a final signoff checklist from the brief alone. If AC IDs are not explicitly defined, the team can later reinterpret whether v5 passed even if the code and experiment ran.",
+    "suggested_addition": "Add a `## Acceptance criteria` section:\n- AC1: Primary small-rung structured Medium 16-round run completes and final/ceiling winrate beats v4 structured 23.0% with one-sided z-test p<0.05.\n- AC2: Report comparison versus blind baseline 28.9%; specify whether beating blind at p<0.05 is a required gate or informational.\n- AC3: Medium-rung structured Medium 16-round run completes with `--micro-batch-steps 256` without OOM on the stated test machine.\n- AC4/AC5: Define any resume/checkpoint or metrics gates if intended.\n- AC6: Warm net at start of round r matches round r-1 exported ONNX logits within stated tolerance.\n- AC7: Frozen invariants remain unchanged: reward, heads, ONNX outputs, CURVE_COLS.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "**Arm A \u2014 primary (AC1/AC2)**",
+      "Plus the **AC6 parity** check... Assert invariants (AC7)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0019",
+    "cluster_key": "8512686c34b2",
+    "title": "Micro-batch equivalence test data is underspecified",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "Tests (pytest, python/tests/) / Micro-batch the dense traversal",
+    "description": "`test_microbatch.py` defines the oracle and tolerance, but not the minimum fixture coverage needed to prove the chunking math. QA would have to invent trajectories, masks, rewards, and chunk boundaries, which risks a passing test that misses the real failure modes.",
+    "rationale": "Micro-batching has edge-sensitive correctness: non-divisible chunk sizes, variable trajectory lengths, invalid action masks, and batch-wide advantage normalization are exactly where equivalence can silently break.",
+    "suggested_addition": "Specify the required micro-batch fixture coverage:\n- Total `N` not divisible by `micro_batch_steps`, so final chunk has different size.\n- At least two trajectories with different `traj_lens`.\n- Both positive and negative terminal rewards.\n- Tech and policy masks containing at least one invalid action per head.\n- Structured/rich batch tensors are built once at full-batch padding size and sliced, never rebuilt per chunk.\n- Assertions compare loss, grad norm, post-step weights, and optimizer state within `atol=1e-5`.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`test_microbatch.py` \u2014 **numerical equivalence**: same net (cloned init) + same injected optimizer, one optimize pass whole-batch vs micro-batched (small K) \u2192 loss + grad-norm + post-step weights match within atol\u22481e-5.",
+      "adv is normalized batch-wide (train.py:159) \u2014 so it is computed once and INDEXED per chunk, never recomputed."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0020",
+    "cluster_key": "ea92c3d3a413",
+    "title": "Resume failure cases lack concrete acceptance tests",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "Persist + carry across the loop (run_loop.py)",
+    "description": "The brief says resume should fail fast when sidecars are missing, but does not define the negative test matrix or exact expected behavior for corrupt, incompatible, or pre-v5 checkpoints. It also does not define what error text or exit status qualifies as a 'clear message'.",
+    "rationale": "Resume bugs are high-risk because a silent fresh optimizer invalidates the experiment while still producing plausible curves. QA needs explicit negative cases to prevent false-positive experimental results.",
+    "suggested_addition": "Add resume acceptance tests:\n- Given `curve.csv` indicates `start_round>0` and `opt_round_{start-1}.pt` is missing, when `--resume` runs, then the process exits non-zero before generation/training and prints `missing optimizer checkpoint` with the expected path.\n- Given `ckpt_round_{start-1}.pt` is missing, same fail-fast behavior.\n- Given checkpoint architecture/rung/dims do not match the requested run, fail before training with an incompatibility message.\n- Given a pre-v5 run with only ONNX files exists, fail rather than constructing a fresh optimizer.\n- Given both ckpt and opt exist, only the first resumed iteration loads from disk; subsequent rounds reuse in-memory net/opt.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "when `start_round>0`, require curve.csv + `ckpt_round_{start-1}.pt` + `opt_round_{start-1}.pt` all present (**fail-fast** with a clear message if a sidecar is missing \u2014 no silent fresh optimizer",
+      "`test_continual_resume.py` \u2014 **warm-from-memory == warm-from-disk**"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0021",
+    "cluster_key": "83f7d8b515c0",
+    "title": "OOM and performance gates lack a reproducible environment budget",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "WHAT / Experiment driver `python/run_v5.sh`",
+    "description": "The brief claims micro-batching enables the medium rung on Medium without OOM, but does not state the machine profile, RAM/VRAM ceiling, max RSS target, or timeout that defines success. `bench-onnx` has a ratio gate, but training capacity itself has no measurable resource gate.",
+    "rationale": "Without an environment and memory budget, 'does not OOM' is not reproducible: it may pass on a developer box and fail in CI or on the intended experiment host. QA cannot distinguish a product failure from an undersized runner.",
+    "suggested_addition": "Add a capacity gate:\n- Test host: specify CPU, RAM, GPU/VRAM if applicable, and PyTorch device.\n- AC3 passes if `--rung medium --micro-batch-steps 256` completes 16 rounds on Medium with peak RSS below `<X> GB` and no CUDA/CPU OOM.\n- Single training epoch timeout: `<Y>` minutes; full arm timeout: `<Z>` hours.\n- Record peak memory and duration per round in `metrics.jsonl` or RESULTS.md.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Add **micro-batching** to the dense whole-round forward/backward so the structured encoder's *medium* rung can train on Medium (maxn\u22481261) without the v4 OOM.",
+      "**Arm B \u2014 medium-rung (AC3)**: same but `--rung medium --micro-batch-steps 256`"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0022",
+    "cluster_key": "a8f5ca11e115",
+    "title": "Live Gradle/ONNX integration testing is not separated from fast QA",
+    "severity": "major",
+    "primary_lens": "testability",
+    "target_file": "brief.md",
+    "target_section": "Experiment driver `python/run_v5.sh` / Tests",
+    "description": "The brief requires generation, evaluation, ceiling eval, ONNX parity, and `bench-onnx`, but does not define which checks run in normal pytest/CI versus live multi-hour Gradle integration jobs. There is no mocking or stub strategy for `generate`, `evaluate`, or `bench-onnx` paths.",
+    "rationale": "If integration tests require live Gradle subprocesses and multi-hour runs, QA cannot run them on every change. If they are skipped, critical resume/export/parity paths may only be tested during the final experiment.",
+    "suggested_addition": "Add a test-tiering section:\n- Unit pytest: no Gradle; uses synthetic trajectories and local torch/ONNX checks.\n- Integration pytest or script: mocks/stubs `generate()` and `evaluate()` to validate round-loop resume, atomic saves, metrics writes, and checkpoint threading without JVM calls.\n- Full experiment: live Gradle generation/eval, ceiling eval, and `bench-onnx`; tagged/manual/background only.\n- Define required CI command for each tier and which tier is blocking before the multi-hour run starts.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "**Ceiling eval** (both arms): `python -m unciv_train.analyze --root runs/<arm> --ceiling-games 200 ...`",
+      "**bench-onnx**: `./gradlew selfPlay --args=\"bench-onnx runs/structured-Medium/policy_round_15.onnx 200 Medium 12 777000\"` \u2192 gate ratio\u22650.70."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0023",
+    "cluster_key": "42d912afa27b",
+    "title": "Command injection risk in `run_v5.sh` due to unquoted arguments",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "5. Experiment driver `python/run_v5.sh`",
+    "description": "The shell script passes `--out`, `--rung`, and other arguments directly without quoting. If any argument is derived from an environment variable or user input containing spaces or shell metacharacters, it could lead to command injection.",
+    "rationale": "Shell scripts are a common injection vector; even if the current invocation is hardcoded, future parameterization (e.g., CI pipelines) could introduce untrusted input.",
+    "suggested_addition": "All variable expansions in `run_v5.sh` must be double-quoted (`\"$VAR\"`) to prevent word splitting and globbing. Use `set -euo pipefail` and consider `printf '%q'` for paths if they are ever sourced externally.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "`--out runs/structured-Medium --resume`",
+      "`--rung medium --micro-batch-steps 256 --out runs/structured-medium-Medium --resume`"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0024",
+    "cluster_key": "7bd7b1a09721",
+    "title": "Potential symlink race in `_atomic_torch_save` if temp file is predictable",
+    "severity": "critical",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "4. Persist + carry across the loop (run_loop.py)",
+    "description": "The brief mentions \"tmp\u2192`os.replace`\" but does not specify how the temporary file is created. If it uses a predictable name in the same directory (e.g., `target + '.tmp'`), an attacker with write access to that directory could create a symlink to an arbitrary file, causing `os.replace` to overwrite it.",
+    "rationale": "Atomic save via temp file is a classic TOCTOU vulnerability if not implemented with `tempfile.mkstemp` in a safe directory or `O_TMPFILE`.",
+    "suggested_addition": "The `_atomic_torch_save` helper must create the temporary file using `tempfile.NamedTemporaryFile(dir=os.path.dirname(target), delete=False)` or `tempfile.mkstemp` to guarantee a unique, unpredictable name. Never use a fixed suffix like `.tmp`.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "new `_atomic_torch_save(obj, path)` (tmp\u2192`os.replace`)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0025",
+    "cluster_key": "b44a9e069a30",
+    "title": "ONNX models loaded without integrity check, enabling model substitution attacks",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "4. Persist + carry across the loop (run_loop.py) and 5. Experiment driver",
+    "description": "The resume path loads `policy_round_{start-1}.onnx` and the analysis loads `policy_round_{last}.onnx` without any cryptographic integrity check. An attacker who can modify the checkpoint directory could replace the ONNX file with a malicious model that exploits ONNX runtime vulnerabilities.",
+    "rationale": "ONNX runtime has a history of security vulnerabilities; loading untrusted models can lead to code execution. Even in a local research setting, if checkpoints are shared or stored on network filesystems, this is a real risk.",
+    "suggested_addition": "Consider storing a SHA-256 hash of each exported ONNX file alongside the checkpoint, and verifying it before loading. At minimum, document that ONNX files should be treated as untrusted and loaded only from trusted storage.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "resume (194-200): reads curve.csv \u2192 `start_round=len(rows)`; loads `policy_round_{start-1}.onnx` as gen model",
+      "Ceiling eval (128-131): loads `policy_round_{last}.onnx`"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0026",
+    "cluster_key": "ef82e4a4a4d3",
+    "title": "`--out` argument allows writing to arbitrary filesystem locations",
+    "severity": "minor",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "5. Experiment driver `python/run_v5.sh`",
+    "description": "The `--out` argument accepts any path, and the script writes checkpoints, ONNX models, and metrics there. If run with elevated privileges, a malicious path like `/etc/cron.d/evil` could overwrite system files.",
+    "rationale": "While this is a local research tool, defense-in-depth suggests validating that the output directory is within an expected base path (e.g., under `runs/`).",
+    "suggested_addition": "Validate that `--out` resolves to a subdirectory of the project's `runs/` directory or another allowlisted location. Reject paths containing `..` or absolute paths outside the allowlist.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "`--out runs/structured-Medium`"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0027",
+    "cluster_key": "3899f2c7e3c1",
+    "title": "Continual warm-start breaks PPO on-policy anchor for rounds 1..15",
+    "severity": "critical",
+    "primary_lens": "domain-correctness",
+    "target_file": "brief.md",
+    "target_section": "WHY (the ask)",
+    "description": "The brief asserts on-policy correctness holds because 'old_logp is recomputed from the current (warm) net, whose weights == the gen weights.' But the round-r net is warm-started from round r-1's POST-TRAINING weights, while the round-r games were generated by round r-1's EXPORTED ONNX (= r-1 post-training weights too). The AC6 parity test only checks warm-net == r-1 exported gen net at the START of round r \u2014 this only holds if r-1's training did NOT mutate weights after the export, which it does NOT here (export happens after train_round). This needs to be stated as an explicit invariant, not assumed.",
+    "rationale": "PPO's importance ratio is only valid if the policy whose old_logp is snapshotted is the SAME policy that generated the data. If warm-start carries weights that diverge from the gen policy, the ratio is biased and the entire training signal is corrupted \u2014 a silent domain bug that passes all finite-loss tests.",
+    "suggested_addition": "Add an explicit invariant under WHY: 'The net carried into round r must be byte-identical to the weights exported as policy_round_{r-1}.onnx (the gen policy for round r). Verify the export@run_loop happens AFTER train_round returns and BEFORE any weight mutation, so warm_net at round-r start == gen policy. AC6 parity (warm net logits == r-1 ONNX logits) is the guardrail; state which weights are exported (post-train r-1) and that no further .step() touches them before round r generation.'",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "old_logp` is still recomputed from the current (warm) net each round, and that net's weights == the weights that generated the round's data",
+      "the warm net at the start of round r produces logits matching the round r-1 *exported ONNX* within atol (proves warm net == gen net \u2192 on-policy carryover"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0028",
+    "cluster_key": "3efedc51da72",
+    "title": "Divergence-guard opt rollback may desync from the gen policy that produced the data",
+    "severity": "major",
+    "primary_lens": "domain-correctness",
+    "target_file": "brief.md",
+    "target_section": "1. Lift the optimizer out of `_optimize_actor_critic`",
+    "description": "On a NaN divergence the guard restores net+opt to the last-good snapshot WITHIN the round and returns. With a persistent net, the round's returned weights are then NOT the post-training weights but the mid-round last-good rollback \u2014 which still differs from the gen policy. The brief does not state what gets exported/carried after a diverged round, nor whether a diverged round should still advance the round counter and export a (rolled-back) policy.",
+    "rationale": "In continual training a diverged round must not silently advance the loop with weights that no longer correspond to anything coherent; the domain semantics of 'what policy generated next round's games' must be preserved or the on-policy chain is broken across the divergence event.",
+    "suggested_addition": "Specify diverged-round semantics: 'On divergence (diverged=True), the round returns the rolled-back (last-good) net+opt. State explicitly whether the loop (a) exports this rolled-back net as policy_round_{r}.onnx and continues, or (b) treats divergence as a hard stop. Either way, the warm net carried into r+1 must equal the policy exported for r+1 generation \u2014 re-assert the on-policy invariant across the divergence boundary.'",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "on the NaN branch (@180) also `optimizer.load_state_dict(safe_opt)`",
+      "the divergence guard rolls weights back to last-good (not to random)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0029",
+    "cluster_key": "e6c4d66be0fb",
+    "title": "v5 changes TWO variables vs v4 (regime + more rounds), confounding the hypothesis test",
+    "severity": "major",
+    "primary_lens": "domain-correctness",
+    "target_file": "brief.md",
+    "target_section": "WHY (the ask)",
+    "description": "v4 ran 8 rounds (from the v4 invocation in the scan); v5 runs 16 rounds AND continual warm-start. If structured clears blind in v5, the brief cannot attribute the win to 'not resetting' vs simply 'twice the rounds / twice the games.' The hypothesis 'v5 tests whether not-resetting clears blind' is confounded by the round-count change.",
+    "rationale": "The entire WHY is a causal claim about the training regime. Conflating rounds and warm-start means the experiment cannot answer the question it poses \u2014 a from-scratch 16-round arm is the missing control.",
+    "suggested_addition": "Add to run_v5.sh / RESULTS scope an explicit decision: 'Either (a) include a from-scratch 16-round structured arm as a control to isolate warm-start from round-count, or (b) explicitly disclaim in RESULTS that v5 vs v4 conflates rounds(8\u219216) with continual, and frame the z-test against blind (28.9%) \u2014 an absolute-ceiling claim \u2014 as the primary result rather than a clean ablation of the regime.'",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "v5 tests whether *not resetting* (warm-start weights + carried Adam state, over more rounds) finally clears blind",
+      "z-tests (vs v4 23.0%, vs blind 28.9%)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0030",
+    "cluster_key": "970b6efd0f86",
+    "title": "Batch-wide advantage normalization changes meaning under continual + larger Medium batches",
+    "severity": "major",
+    "primary_lens": "domain-correctness",
+    "target_file": "brief.md",
+    "target_section": "2. Micro-batch the dense traversal",
+    "description": "The brief correctly freezes batch-wide adv normalization and indexes it per chunk. But the domain implication is unexamined: with ~16 games \u00d7 Medium trajectories, the per-round batch mixes steps from games with very different outcomes (terminal-only \u00b11 reward). Normalizing advantage across the WHOLE round batch is a modeling choice that interacts with warm-start \u2014 it is not a no-op carried over from v4 just because the formula is frozen.",
+    "rationale": "Terminal-only \u00b11 reward with batch-wide GAE normalization means a round with mostly losses produces systematically negative-then-renormalized advantages; under continual training this bias compounds across rounds in a way single-round-reset training masked. This is a domain-correctness question, not a numerics question.",
+    "suggested_addition": "Add a note under FROZEN or WHY: 'Batch-wide advantage normalization (train.py:159) is preserved verbatim. Confirm this is intended under continual training given terminal-only \u00b11 reward \u2014 i.e., the per-round win/loss mix determines the advantage sign distribution. Record per-round ret_pos (already in CURVE_COLS) and flag if a long losing streak biases the carried Adam moments.'",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "adv is normalized batch-wide (train.py:159) \u2014 so it is computed once and INDEXED per chunk, never recomputed",
+      "terminal-only \u00b11 reward unchanged"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0031",
+    "cluster_key": "b5f070c92965",
+    "title": "Replay-buffer deferral leaves on-policy data starvation unaddressed for 16 continual rounds",
+    "severity": "minor",
+    "primary_lens": "domain-correctness",
+    "target_file": "brief.md",
+    "target_section": "Out of scope (NON-GOALS)",
+    "description": "Each round still trains on only ~16 games and the brief notes replay is deferred 'gated on behavior-logp recording.' But the core v5 thesis is that prior learning was being discarded; warm-starting weights+Adam keeps the PARAMETERS but each PPO update still sees only the current round's ~16 games of experience. The brief does not state whether the data-discarding half of the original problem is even in scope, or only the weight-discarding half.",
+    "rationale": "The diagnosis was 'every round trains a brand-new net on ~16 games and discards all prior learning.' v5 fixes 'brand-new net' but not 'discards prior experience' \u2014 a domain expert would want the brief to be explicit that only the parameter-continuity half is being tested, so a null result isn't misread as 'continual doesn't help.'",
+    "suggested_addition": "Add to NON-GOALS or WHY: 'v5 addresses parameter/optimizer continuity ONLY; the per-round experience set stays at ~16 fresh games (no replay). If v5 still fails to clear blind, this isolates whether weight-discarding OR data-discarding was the dominant bottleneck \u2014 frame the result accordingly so a null is interpreted as motivating the deferred replay buffer, not refuting continual training.'",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "every round trains a brand-new net on ~16 games and discards all prior learning",
+      "no replay buffer (DEFERRED \u2014 gated on behavior-logp recording; one-line note in RESULTS)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0032",
+    "cluster_key": "8da180972f89",
+    "title": "Unconditional ceiling eval wastes compute on diverged models",
+    "severity": "major",
+    "primary_lens": "compute-cost",
+    "target_file": "brief.md",
+    "target_section": "5. Experiment driver python/run_v5.sh",
+    "description": "The driver script unconditionally runs a 200-game ceiling eval for both arms. If the 16-round training diverged or failed to learn, this eval consumes significant compute (tens of minutes to hours) to measure a broken model.",
+    "rationale": "Compute should be proportional to value. Running expensive evaluations on known-bad artifacts is pure waste, especially in multi-hour jobs.",
+    "suggested_addition": "Add a bash-level check in `run_v5.sh` before invoking `analyze.py`: read the last line of `curve.csv` and skip the ceiling eval if `diverged == True`.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Ceiling eval (both arms): python -m unciv_train.analyze --root runs/<arm> --ceiling-games 200"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0033",
+    "cluster_key": "af6cad723bc8",
+    "title": "Missing circuit breaker between sequential multi-hour arms",
+    "severity": "major",
+    "primary_lens": "compute-cost",
+    "target_file": "brief.md",
+    "target_section": "5. Experiment driver python/run_v5.sh",
+    "description": "Arm B (medium-rung, ~3-5 hours) runs sequentially after Arm A. There is no check to see if Arm A succeeded. If the continual training logic is fundamentally broken, Arm B will blindly execute and waste another 3-5 hours.",
+    "rationale": "While a complex auto-abort framework was rejected (YAGNI), a simple bash exit-code check between multi-hour sequential jobs is standard FinOps practice to prevent cascading compute waste.",
+    "suggested_addition": "Add a simple gate in `run_v5.sh` after Arm A: if Arm A's final round diverged or catastrophically failed, `exit 1` to prevent Arm B from wasting compute on a broken regime.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Two arms, run SEQUENTIALLY (14 cores; 12 gradle threads saturate the box)",
+      "Arm B \u2014 medium-rung (AC3): same but --rung medium"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0034",
+    "cluster_key": "14f2681ad486",
+    "title": "Hardcoded micro-batch size risks severe compute underutilization",
+    "severity": "major",
+    "primary_lens": "compute-cost",
+    "target_file": "brief.md",
+    "target_section": "5. Experiment driver python/run_v5.sh",
+    "description": "Arm B hardcodes `--micro-batch-steps 256` to avoid OOM. If this chunk size is overly conservative, it will starve the CPU/GPU of vectorized work, drastically increasing the wall-clock time and instance cost of the 16-round run.",
+    "rationale": "Right-sizing infrastructure means maximizing hardware utilization. Trading memory for compute is necessary, but an untuned static scalar often leaves 50%+ of compute capacity idle.",
+    "suggested_addition": "Document the memory-profiling basis for `256`. If it's a guess, add a fast dry-run step to `run_v5.sh` (or instructions for the operator) to find the maximum safe `micro_batch_steps` before kicking off the multi-hour job.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Arm B \u2014 medium-rung (AC3): same but --rung medium --micro-batch-steps 256"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  }
+]

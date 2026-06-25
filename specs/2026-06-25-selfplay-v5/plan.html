@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-jE+yTHdCUhW8LHfIJj4Z9HG+RahbFqx3bDYZVH7N1hU='; img-src data:">
+<title>Plan review — selfplay-v5: Continual Training</title>
+<style>
+:root{--bg:#f5f6f8;--panel:#fff;--panel2:#f1f3f6;--ink:#1a1f27;--muted:#5b626e;--line:#e2e6ec;
+--accent:#1c5fd6;--mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+--h:#cf222e;--m:#8a5a00;--l:#1f7a37;--new:#1f883d;--edit:#9a6700;--del:#cf222e;--human:#1c5fd6;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:980px;margin:0 auto;padding:20px 20px 80px}
+.wrap.compact{padding:14px 16px 60px}
+.compact .panel{padding:10px 12px;margin:0 0 9px}
+.mono{font-family:var(--mono)}
+code{font-family:var(--mono);font-size:12.5px;background:var(--panel2);padding:1px 4px;border-radius:3px}
+.skip{position:absolute;left:-999px;top:0;background:var(--accent);color:#fff;padding:8px 12px;border-radius:0 0 6px 0;z-index:10}
+.skip:focus{left:0}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:14px 16px;margin:0 0 14px}
+h1{font:600 19px var(--mono);margin:0 0 2px}
+h2{font:700 12px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 8px}
+.lead{color:var(--muted);font-size:13px;margin:0 0 12px}
+.kv{color:var(--muted);font-size:12.5px}
+.strip{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:0 0 14px;padding:8px 10px;background:var(--panel);border:1px solid var(--line);border-radius:7px}
+.pill{font:600 11px var(--mono);padding:2px 9px;border-radius:4px;border:1px solid var(--line);color:var(--muted)}
+.pill.ok{color:var(--l);border-color:#bfe2c8}.pill.warn{color:var(--m);border-color:#ead9a6}
+table{width:100%;border-collapse:collapse;font-size:13px}
+caption{text-align:left;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;padding:0 0 6px}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+details{border:1px solid var(--line);border-radius:7px;margin:0 0 9px;padding:0 14px;background:var(--panel)}
+summary{cursor:pointer;padding:10px 0;font-weight:600;color:var(--muted)}summary::marker{color:var(--accent)}
+details[open] summary{color:var(--ink)}details[open]{padding-bottom:12px}
+pre{white-space:pre-wrap;word-break:break-word;font-size:12px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:10px;overflow-x:auto}
+.figure{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:10px;overflow-x:auto;margin:8px 0 0}
+figcaption.diag-cap{color:var(--muted);font-size:11.5px;margin-top:6px;text-align:center}
+.diag-note{color:var(--del);font-weight:600;font-size:13px;margin:6px 2px}
+.toolbar{display:flex;justify-content:flex-end;margin:10px 0 8px}
+button.btn{font:600 11px var(--mono);background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:6px 11px;cursor:pointer;color:var(--accent)}
+.pr-nonce-p{border:1.5px solid var(--accent)}
+.pr-nonce{font:700 22px var(--mono);color:var(--accent);user-select:all;background:var(--panel2);border:1px dashed var(--accent);border-radius:5px;padding:9px 15px;display:inline-block}
+.mc{display:inline-block;font:700 10px var(--mono);padding:1px 6px;border-radius:3px}
+.mc.H{color:var(--h)}.mc.M{color:var(--m)}.mc.L{color:var(--l)}
+.b-new{color:var(--new)}.b-edit{color:var(--edit)}
+.substance{border:1.5px solid var(--accent)}
+.substance>h2{color:var(--accent)}
+.scrutinize{border-left:3px solid var(--m);background:#fffaf0}
+.pr-banner{border:1.5px solid var(--del);background:#fdeff0}
+.pr-banner h2{color:var(--del)}
+.banner .fix{color:var(--ink);font-size:12.5px;margin:2px 0 0}
+.ha{border-left:3px solid var(--human)}
+.heart{display:inline-block;font:700 9px var(--mono);color:var(--del);border:1px solid var(--del);border-radius:3px;padding:0 4px;margin-left:6px}
+.grp{font:700 11px var(--mono);color:var(--ink);margin:10px 0 2px}
+.focuslbl{font-weight:700;color:var(--m)}
+.audit .h{color:var(--muted);font-size:11.5px}
+</style></head><body><main class="wrap">
+<a class="skip" href="#pr-substance">skip to what you're reviewing</a><h1>selfplay-v5: Continual Training</h1><p class="lead">This is an AI's plan for a code change. Read <strong>what it will build</strong> (top), check <strong>what it flags</strong>, then scroll to the bottom and paste the approval code to start the build.</p><div class="strip" aria-label="plan status"><span class="pill">BUILD</span><span class="pill">size L</span><span class="pill">base master</span><span class="pill">2 edited · 3 created</span><span class="pill ok">council APPROVE (revisions applied)</span><span class="pill warn">test RED (tests planned)</span></div>
+<section id="pr-orient" class="panel"><h2>What's changing &amp; why</h2><p><strong>The ask:</strong> v4 proved the structured GNN encoder is not the bottleneck, yet the
+structured net (23.0%) still sat below the blind baseline (28.9%) on Medium. The remaining suspect is
+the <em>training regime</em>: every round trains a brand-new net on ~16 games and throws away all prior
+learning. v5 tests whether <strong>not resetting</strong> finally clears blind.</p>
+<p><strong>How this solves it:</strong> keep one <code>(net, optimizer)</code> pair alive across the
+round loop — round 0 builds it fresh, every later round warm-starts from the prior round&#x27;s weights AND
+carries Adam&#x27;s moment state — and run 16 rounds (v4 ran 8) so skill can accumulate. A memory-only
+<em>micro-batching</em> change to the dense forward/backward lifts the v4 OOM that had forced the
+encoder down to the <code>small</code> rung, enabling a <code>medium</code>-rung capacity comparison.
+Then re-run the v4 Medium eval and report the two z-tests (vs v4 23.0%, vs blind 28.9%). The RL math
+(GAE, PPO clip, objective, grad-clip) is frozen byte-for-byte; only initialization and forward
+<em>traversal</em> change.</p>
+</section>
+<section id="pr-substance" class="panel substance"><h2>★ What you&#x27;re reviewing — the behavior change + the interfaces + the decisions</h2><h3>Changed interfaces (signatures)</h3>
+<pre><code># train.py — optimizer INJECTED (was constructed inline @136); + slice-aware forward + chunk size
+_optimize_actor_critic(net, forward_fn, *, optimizer, forward_chunk_fn=None, micro_batch_steps=None,
+                       a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos,
+                       epochs, lr, gamma, lam, value_coef, entropy_coef, clip_eps, norm_adv) -&gt; (net, stats)
+
+# train.py — NEW private helper: the EXACT current loss expressions, one definition, both paths
+_ac_loss_terms(tl, pl, val, a_tech, a_policy, m_tech, m_policy, adv, ret, old_logp, clip_eps)
+    -&gt; (policy_loss, value_loss, ent)
+
+# train.py — each trainer: warm (net/opt) + returns the optimizer  [collapsed API, R3]
+train_actor_critic_structured(trajectories, dims, token_specs, vocab_counts, rung, *, epochs, lr, seed,
+    gamma, lam, value_coef, entropy_coef, clip_eps, norm_adv,
+    net=None, optimizer=None, micro_batch_steps=None) -&gt; (net, stats, optimizer)
+# (train_actor_critic_rich / _blind get the same added params, for symmetry)
+
+# run_loop.py — threads the persistent pair; returns it (gated by args.continual)
+train_round(variant, data, dims, schema_path, args, seed, *,
+            net=None, optimizer=None) -&gt; (net, stats, mode, optimizer)
+
+# run_loop.py — NEW: atomic ckpt write (tmp -&gt; os.replace) + disk-resume loader
+_atomic_torch_save(obj, path) -&gt; None
+_load_warm(variant, dims, token_specs, vocab_counts, rung, out, start, lr) -&gt; (net, optimizer)
+</code></pre>
+
+<h3>Behavioral delta — micro-batch epoch (pseudocode; math frozen, traversal chunked)</h3>
+<pre><code>opt.zero_grad()
+if micro_batch_steps and micro_batch_steps &lt; N:          # chunked path
+    loss_total = 0.0
+    for (lo, hi) in chunks_of(N, micro_batch_steps):
+        tl, pl, val = forward_chunk_fn(lo, hi)            # net(sliced inputs) — per-row independent
+        pol_c, val_c, ent_c = _ac_loss_terms(tl, pl, val.reshape(-1),
+                                  a_tech[lo:hi], a_policy[lo:hi], m_tech[lo:hi], m_policy[lo:hi],
+                                  adv[lo:hi], ret[lo:hi], old_logp[lo:hi], clip_eps)   # SAME expressions
+        loss_c = (pol_c + value_coef*val_c - entropy_coef*ent_c) * ((hi-lo)/N)         # size-weight
+        loss_c.backward()                                 # accumulate grad, free chunk graph
+        loss_total += loss_c.detach()
+    loss = loss_total
+else:                                                     # whole-batch path — UNCHANGED from v4
+    tl, pl, val = forward_fn()
+    pol, val_l, ent = _ac_loss_terms(...)                 # full batch
+    loss = pol + value_coef*val_l - entropy_coef*ent
+    loss.backward()
+if not torch.isfinite(loss):                              # divergence guard (now opt-aware)
+    net.load_state_dict(safe_state); opt.load_state_dict(safe_opt); stats[&quot;diverged&quot;]=True; return
+grad_norm = clip_grad_norm_(net.parameters(), max_norm=10.0)   # once, on accumulated grad
+opt.step(); safe_state = deepcopy(net.state_dict()); safe_opt = deepcopy(opt.state_dict())
+</code></pre>
+<p>adv/ret/old_logp are computed ONCE on the full flattened batch (adv is normalized batch-wide) and
+only <em>indexed</em> per chunk. Size-weighting <code>(hi-lo)/N</code> makes the summed per-chunk
+<code>.mean()</code>s equal the whole-batch <code>.mean()</code> within fp tolerance.</p>
+
+<h3>Decision log (locked)</h3>
+<dl>
+<dt>D1 — In-process carryover, gated by a <code>--continual</code> flag (default True) [revised by plan council]</dt>
+<dd>Carry <code>(net, opt)</code> as plain locals across loop iterations. <code>--continual false</code>
+restores per-round fresh net+opt (v4 from-scratch) for rollback + a clean regime A/B.
+<em>Rejected:</em> no-toggle hardcode (gave up attribution + rollback; plan-council FND-0006/0009/0029).
+Confidence: high.</dd>
+<dt>D2 — Optimizer constructed once, alongside the net; injected into the core</dt>
+<dd>Lift <code>Adam(...)</code> out of <code>_optimize_actor_critic</code> (train.py:136) so moment
+state persists. <em>Rejected:</em> reconstruct-and-reload each round (loses in-process simplicity,
+risks drift). Confidence: high.</dd>
+<dt>D3 — Micro-batch: whole-batch path stays BYTE-VERBATIM; chunk path is new code [revised by plan council]</dt>
+<dd>Keep train.py:144-192 verbatim in an <code>else:</code> branch (the wrap = permitted traversal
+change); the <code>if micro_batch_steps&lt;n</code> branch re-expresses the same arithmetic on slices,
+size-weighted <code>n_c/N</code>. Equivalence GUARDED by <code>test_microbatch.py</code>, not by
+sharing code. <em>Rejected:</em> a shared <code>_ac_loss_terms</code> helper (conflicts with the
+byte-verbatim freeze; plan-council FND-0002). Confidence: high.</dd>
+<dt>D4 — Divergence guard restores net AND optimizer</dt>
+<dd>Snapshot/restore <code>opt.state_dict()</code> alongside <code>safe_state</code>, else a diverged
+round poisons the persistent moments. <em>Rejected:</em> net-only restore (current code — unsound
+under a persistent optimizer; FND-0010/0012). Confidence: high.</dd>
+<dt>D5 — Resume API collapsed to (net, optimizer); run_loop does the disk-load, fail-fast, <code>weights_only=True</code> [revised by plan council]</dt>
+<dd>Trainers take only <code>net=/optimizer=</code>; run_loop&#x27;s <code>_load_warm</code> builds arch +
+loads <code>ckpt</code>+<code>opt</code> sidecars (requires both, rung/dims-compatible — load errors
+loudly on mismatch). <em>Rejected:</em> 4 nullable trainer params incl. resume_ckpt/resume_opt
+(plan-council FND-0001); pickle-trusting loads (FND-0025). Confidence: high.</dd>
+</dl>
+</section>
+<section id="pr-scrutinize" class="panel scrutinize"><h2>⚠ What to scrutinize</h2><ul><li><a href="#pr-substance">Micro-batch size-weighting (n_c/N) + shared _ac_loss_terms helper == whole-batch within fp tol</a> — AC6 numerical equivalence; wrong weighting silently biases the gradient <span class="kv">(confidence: high)</span></li><li><a href="#pr-substance">Divergence guard restores opt.state_dict() too, not just net weights</a> — a diverged round would poison the persistent Adam moments <span class="kv">(confidence: high)</span></li><li><a href="#pr-systemfit">Warm rounds skip manual_seed; continual is default-on with no toggle</a> — re-seeding would re-init weights; determinism depends on round-0-only seeding <span class="kv">(confidence: high)</span></li><li><a href="#pr-substance">Resume requires curve.csv + ckpt + opt sidecar, fail-fast, weights_only=True</a> — multi-artifact consistency; no silent fresh optimizer; no pickle RCE <span class="kv">(confidence: high)</span></li><li><a href="#pr-substance">Whole-batch path byte-identical when micro_batch_steps is 0/&gt;=N (apples-to-apples small-rung arm)</a> — AC1 vs v4 23.0% requires only the regime to change <span class="kv">(confidence: high)</span></li></ul></section>
+<section id="pr-risks" class="panel"><h2>Risks</h2><table><caption>risks</caption><tr><th scope="col">#</th><th scope="col">risk</th><th scope="col">L×S</th><th scope="col">mitigation</th></tr><tr><td>1</td><td>Micro-batch path subtly diverges from whole-batch (wrong weighting / fp drift)</td><td>L×H</td><td>shared _ac_loss_terms; test_microbatch.py asserts loss+grad-norm+weights match within atol≈1e-5; small-rung arm uses no-op (byte-identical)</td></tr><tr><td>2</td><td>Continual training diverges/collapses mid-run, wasting hours of compute</td><td>M×M</td><td>opt-aware divergence guard rolls back net+opt to last-good; diverged flag in curve.csv; babysat run; --resume restart-safe</td></tr><tr><td>3</td><td>Warm-start still doesn&#x27;t clear blind (28.9%) — the regime wasn&#x27;t the bottleneck either</td><td>M×M</td><td>this is a legitimate experiment outcome; AC2 reports the result PLAINLY either way with z/p; the curve over 16 rounds shows the trajectory</td></tr></table></section>
+<section id="pr-top-decisions" class="panel"><h2>Top decisions</h2><table><caption>decision · rejected alternative · confidence</caption><tr><th scope="col">decision</th><th scope="col">rejected alternative</th><th scope="col">confidence</th></tr><tr><td>In-process (net,opt) carryover gated by --continual flag (default True)</td><td>no-toggle hardcode (lost attribution+rollback; plan-council FND-0006/0029)</td><td>high</td></tr><tr><td>Inject optimizer constructed once alongside the net</td><td>reconstruct+reload each round</td><td>high</td></tr><tr><td>Whole-batch path byte-verbatim in else-branch; chunk path new code; equivalence tested</td><td>shared loss helper (conflicts byte-verbatim freeze; plan-council FND-0002)</td><td>high</td></tr><tr><td>Divergence guard restores net AND optimizer state</td><td>net-only restore (unsound under persistent opt)</td><td>high</td></tr><tr><td>Resume API collapsed to (net,opt); run_loop does disk-load, fail-fast, weights_only=True</td><td>4 nullable trainer params (plan-council FND-0001); pickle-trusting load</td><td>high</td></tr></table></section>
+<section id="pr-systemfit" class="panel"><h2>★ How it fits the system</h2><p><strong>New:</strong> a private loss helper <code>_ac_loss_terms</code> and an atomic-save helper
+<code>_atomic_torch_save</code> in the trainer/driver; the chunked traversal branch inside
+<code>_optimize_actor_critic</code>; an <code>opt_round_{r}.pt</code> sidecar per round; a
+<code>--micro-batch-steps</code> arg; the <code>python/run_v5.sh</code> driver; two pytest files.</p>
+<p><strong>Touched:</strong> <code>train.py</code> (optimizer injection, opt-aware divergence guard,
+warm/resume in the 3 trainers, return the optimizer) and <code>run_loop.py</code> (carry the pair
+across the loop, atomic ckpt+opt saves, resume net+opt, extra metrics.jsonl fields). The single
+<code>train_round</code> caller (@226) is updated for the 4-tuple return.</p>
+<p><strong>Untouched but relied on (FROZEN):</strong> <code>compute_gae</code>, the per-update algebra
+(PPO clip / value MSE / entropy / objective / grad-clip 10.0), <code>_masked_logp</code>/
+<code>_entropy</code>, the encoder + heads + <code>RUNGS</code>, <code>build_rich_batch</code> (its
+<code>[B,…]</code> per-row layout is what makes chunking sound), the terminal-only ±1 reward, the
+ONNX export contract (<code>export_rich</code>, contract_version=3) and the entire Kotlin bridge
+(<code>OnnxPolicy.kt</code> gates, <code>SampleSchema.kt</code> VERSION=3, <code>bench-onnx</code>),
+and <code>CURVE_COLS</code>.</p>
+<p><strong>Calls in / calls out:</strong> <code>run_loop.run</code> → <code>train_round</code> →
+trainer → <code>_optimize_actor_critic</code> (now receives <code>optimizer</code> + optional
+<code>forward_chunk_fn</code>). Export/eval/gen paths are unchanged and still consume only the exported
+ONNX — so warm-start stays fully on-policy (the warm net == the net that generated the round&#x27;s data).
+The contract + bridge see ZERO change: no contract bump, byte-unchanged reader.</p>
+<table><caption>components touched and how they relate</caption><tr><th scope="col">component</th><th scope="col">kind</th><th scope="col">relationship</th></tr><tr><td class="mono">python/run_v5.sh</td><td>new</td><td>new</td></tr><tr><td class="mono">python/tests/test_microbatch.py</td><td>new</td><td>new</td></tr><tr><td class="mono">python/tests/test_continual_resume.py</td><td>new</td><td>new</td></tr><tr><td class="mono">python/unciv_train/train.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">python/unciv_train/run_loop.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">compute_gae</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">_masked_logp/_entropy</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">StructuredPolicyValueNet+RUNGS</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">build_rich_batch</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">export_onnx.export_rich (contract_version=3)</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">OnnxPolicy.kt/SampleSchema.kt bridge</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">CURVE_COLS</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">analyze.py (ceiling eval + _two_proportion_z)</td><td>consumers</td><td>consumer / reader</td></tr><tr><td class="mono">SelfPlayRunner.kt bench-onnx</td><td>consumers</td><td>consumer / reader</td></tr></table><figure class="figure"><svg viewBox="0 0 706 413" width="100%" role="img" aria-label="dependency and data-flow diagram" aria-describedby="pr-diag-desc"><title>dependency and data-flow diagram</title><desc id="pr-diag-desc">Nodes: python/run_v5.sh (new), python/tests/test_microbatch.py (new), python/tests/test_continual_resume.py (new), python/unciv_train/train.py (edit), python/unciv_train/run_loop.py (edit), compute_gae (ctx), _masked_logp/_entropy (ctx), StructuredPolicyValueNet+RUNGS (ctx), build_rich_batch (ctx), export_onnx.export_rich (contract_version=3) (ctx), OnnxPolicy.kt/SampleSchema.kt bridge (ctx), CURVE_COLS (ctx), analyze.py (ceiling eval + _two_proportion_z) (ctx), SelfPlayRunner.kt bench-onnx (ctx). Edges: run_loop.run→train_round: net,opt carry; train_round→train_actor_critic_structured: warm/resume; train_actor_critic_structured→_optimize_actor_critic: inject optimizer + forward_chunk_fn; _optimize_actor_critic→_ac_loss_terms: both paths; run_loop.run→opt_round_r.pt: atomic save.</desc><defs><marker id="pr-arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#69707d"/></marker></defs><rect class="node" x="16" y="16" width="180" height="46" rx="5" fill="#eaf6ee" stroke="#1f883d"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="43">python/run_v5.sh</tspan></text><rect class="node" x="246" y="16" width="180" height="48" rx="5" fill="#eaf6ee" stroke="#1f883d"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="37">python/tests/test_micr</tspan><tspan x="258" dy="15">obatch.py</tspan></text><rect class="node" x="476" y="16" width="180" height="48" rx="5" fill="#eaf6ee" stroke="#1f883d"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="37">python/tests/test_cont</tspan><tspan x="488" dy="15">inual_resume.py</tspan></text><rect class="node" x="16" y="92" width="180" height="48" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="113">python/unciv_train/tra</tspan><tspan x="28" dy="15">in.py</tspan></text><rect class="node" x="246" y="92" width="180" height="48" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="113">python/unciv_train/run</tspan><tspan x="258" dy="15">_loop.py</tspan></text><rect class="node" x="476" y="92" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="119">compute_gae</tspan></text><rect class="node" x="16" y="168" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="195">_masked_logp/_entropy</tspan></text><rect class="node" x="246" y="168" width="180" height="48" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="189">StructuredPolicyValueN</tspan><tspan x="258" dy="15">et+RUNGS</tspan></text><rect class="node" x="476" y="168" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="195">build_rich_batch</tspan></text><rect class="node" x="16" y="244" width="180" height="48" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="265">export_onnx.export_ric</tspan><tspan x="28" dy="15">h (contract_version=3)</tspan></text><rect class="node" x="246" y="244" width="180" height="48" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="265">OnnxPolicy.kt/SampleSc</tspan><tspan x="258" dy="15">hema.kt bridge</tspan></text><rect class="node" x="476" y="244" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="271">CURVE_COLS</tspan></text><rect class="node" x="16" y="320" width="180" height="63" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="341">analyze.py (ceiling</tspan><tspan x="28" dy="15">eval +</tspan><tspan x="28" dy="15">_two_proportion_z)</tspan></text><rect class="node" x="246" y="320" width="180" height="48" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="341">SelfPlayRunner.kt</tspan><tspan x="258" dy="15">bench-onnx</tspan></text><g class="legend"><rect x="16" y="394" width="11" height="11" rx="2" fill="#eaf6ee" stroke="#1f883d"/><text x="32" y="403" font-size="10" font-family="monospace" fill="#69707d">new</text><rect x="68" y="394" width="11" height="11" rx="2" fill="#fdf6e3" stroke="#9a6700"/><text x="84" y="403" font-size="10" font-family="monospace" fill="#69707d">edit</text><rect x="126" y="394" width="11" height="11" rx="2" fill="#ffffff" stroke="#9aa3b0"/><text x="142" y="403" font-size="10" font-family="monospace" fill="#69707d">context</text></g></svg><figcaption class="diag-cap">system-fit — what the change connects to</figcaption></figure></section>
+<section id="pr-walkthrough" class="panel"><h2>Worked walkthrough</h2><p><em>Illustrative mock values — not measured; sanity-check against the design above. Shapes, not
+metrics.</em></p>
+<p>Trace round <code>r=5</code> of the small-rung Medium arm (continual ON), then one micro-batch chunk.</p>
+<ol>
+<li><strong>Loop top (run_loop.run):</strong> <code>warm_net, warm_opt</code> hold round 4&#x27;s trained
+net + Adam state. <code>generate()</code> uses the round-4 exported ONNX (<code>policy_round_4.onnx</code>)
+to play 16 games → shard with ~<code>N≈2,400</code> decision steps.</li>
+<li><strong>train_round → train_actor_critic_structured:</strong> <code>net is not None</code> → reuse
+<code>warm_net</code> (NO <code>manual_seed</code>, NO re-construction); <code>optimizer is not None</code>
+→ reuse <code>warm_opt</code> (exp_avg / exp_avg_sq from round 4 intact). <code>build_rich_batch</code>
+→ <code>inputs</code> dict, e.g. <code>spatial [2400, 1261, 13]</code>, <code>neighbor_index
+[2400, 1261, 6]</code>, masks, etc. (all axis-0 = N=2400).</li>
+<li><strong>Snapshot (no_grad):</strong> small rung on Medium fits → whole-batch path
+(<code>micro_batch_steps=0</code>). <code>val0 [2400]</code>, <code>old_logp [2400]</code>; GAE over
+<code>traj_lens</code> → <code>adv [2400]</code> (normalized batch-wide), <code>ret [2400]</code>.</li>
+<li><strong>Epoch (×8):</strong> <code>opt.zero_grad()</code>; <code>forward_fn()</code> → loss via
+<code>_ac_loss_terms</code> → <code>loss.backward()</code>; finite? → <code>clip_grad_norm_(…,10.0)</code>
+→ <code>opt.step()</code> (Adam moments continue evolving from round 4, not reset). e.g.
+<code>loss≈0.83, grad_norm≈2.1</code>.</li>
+<li><strong>Persist:</strong> <code>_atomic_torch_save(net.state_dict(), ckpt_round_5.pt)</code> +
+<code>_atomic_torch_save(opt.state_dict(), opt_round_5.pt)</code>; export
+<code>policy_round_5.onnx</code> (value head dropped, contract_version=3); eval 80 games → curve.csv
+row (<code>winrate≈0.27</code>) + metrics.jsonl (<code>continual=true, warm_start=true,
+micro_batch_steps=0</code>). <code>warm_net, warm_opt = net, opt</code> → feed round 6.</li>
+</ol>
+<p><strong>Now the medium-rung arm, one micro-batch chunk</strong> (<code>--micro-batch-steps 256</code>,
+N=2400 → 10 chunks): chunk <code>[512:768]</code> → <code>forward_chunk_fn(512,768)</code> =
+<code>net({k: v[512:768] for k,v in inputs.items()})</code> → <code>tl,pl,val</code> for 256 rows →
+<code>_ac_loss_terms(…, adv[512:768], ret[512:768], old_logp[512:768], …)</code> →
+<code>loss_c = (pol_c + 0.5*val_c − 0.01*ent_c) * (256/2400)</code> → <code>loss_c.backward()</code>
+(grad accumulates, 256-row graph freed before the next chunk — this is the OOM relief). After 10
+chunks: one <code>clip_grad_norm_</code> + one <code>opt.step()</code>. Sum of the ten size-weighted
+chunk losses == the whole-batch loss within ~1e-5 (the <code>test_microbatch.py</code> assertion).</p>
+</section>
+<details id="pr-change-map"><summary>Change map — 5 item(s), grouped by concern</summary><div class="grp">trainer-core</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">python/unciv_train/train.py<span class="heart">heart of the change</span></td><td>edit</td><td>inject optimizer, opt-aware guard, _ac_loss_terms helper, micro-batch path, warm/resume in 3 trainers</td></tr></table><div class="grp">driver</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">python/unciv_train/run_loop.py</td><td>edit</td><td>carry (net,opt) across loop, atomic ckpt+opt saves, resume net+opt fail-fast, --micro-batch-steps, metrics fields</td></tr><tr><td class="mono">python/run_v5.sh</td><td>new</td><td>two-arm experiment driver (small + medium rung), ceiling evals, bench-onnx</td></tr></table><div class="grp">tests</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">python/tests/test_microbatch.py</td><td>new</td><td>numerical-equivalence: micro-batch vs whole-batch</td></tr><tr><td class="mono">python/tests/test_continual_resume.py</td><td>new</td><td>warm-from-memory==warm-from-disk + AC6 parity (warm net==gen ONNX)</td></tr></table></details>
+<section id="pr-operational" class="panel ha"><h2>Human actions required</h2><p class="kv">None — no post-merge human action required.</p></section><details><summary>Verification · rollback · out-of-scope</summary><h2>Verification</h2><ul><li>pytest python/tests/test_microbatch.py — micro-batch == whole-batch within atol</li><li>pytest python/tests/test_continual_resume.py — resume equivalence + AC6 parity</li><li>pytest python/tests — full suite green (no regression)</li><li>python -m unciv_train.analyze --root runs/structured-Medium --ceiling-games 200 --eval-seed 4242424 — z-test vs v4 23.0% and vs blind 28.9%</li><li>./gradlew selfPlay --args=&#x27;bench-onnx &lt;final.onnx&gt; 200 Medium 12 777000&#x27; — ratio&gt;=0.70 PASS</li></ul><h2>Rollback</h2><p>git revert the two trainer commits; ckpt/opt sidecars + run dirs are under runs/ (gitignored), delete to reclaim disk. Contract unchanged so no model regen needed.</p><h2>Explicitly not changing</h2><ul><li>New action heads (units/cities/great-person/vote stay heuristic)</li><li>Self-play (opponent stays fixed RandomPolicy)</li><li>Reward shaping</li><li>Encoder changes</li><li>Cross-round replay buffer (DEFERRED — needs behavior-logp recording first)</li></ul></details>
+<section id="pr-audit" class="panel audit"><h2>Audit &amp; sources</h2><p class="kv">The substance above is an LLM-authored summary — the source of truth is plan.md / decisions.md. The content hash lets a developer confirm the verbatim copy below matches what was approved.</p><table><tr><th scope="col">source</th><th scope="col">path</th><th scope="col">content hash</th></tr><tr><td><a href="plan.md">plan.md</a></td><td class="mono">specs/2026-06-25-selfplay-v5/plan.md</td><td class="mono h">967ff1fc00491072</td></tr><tr><td><a href="decisions.md">decisions.md</a></td><td class="mono">specs/2026-06-25-selfplay-v5/decisions.md</td><td class="mono h">f921d1fc96349f65</td></tr><tr><td><a href=".plan-meta.json">.plan-meta.json</a></td><td class="mono">specs/2026-06-25-selfplay-v5/.plan-meta.json</td><td class="mono h">b544857b615cad3e</td></tr></table></section>
+<div class="toolbar"><button class="btn" id="pr-expand" type="button" aria-expanded="false">expand all</button></div>
+<details><summary>Verbatim source — plan.md + decisions.md</summary><h2>plan.md</h2><pre># Plan — selfplay-v5: Continual Training
+
+## WHAT
+Make self-play RL training **continual**: keep a persistent `(net, optimizer)` pair alive across the
+round loop so each round warm-starts from the previous round&#x27;s weights AND carries Adam moment state,
+instead of re-initializing a fresh net + fresh optimizer every round. Add **micro-batching** to the
+dense whole-round forward/backward so the structured encoder&#x27;s *medium* rung can train on Medium
+(maxn≈1261) without the v4 OOM. Then re-run the v4 Medium comparison.
+
+## WHY (the ask)
+v4 proved the structured GNN encoder is NOT the bottleneck (it cleared the rich-pool baseline,
+p=0.014), yet the correctly-built structured net still sat at 23.0% — BELOW the blind baseline
+(28.9%). The remaining suspect is the **training regime**: every round trains a brand-new net on ~16
+games and discards all prior learning. v5 tests whether *not resetting* (warm-start weights + carried
+Adam state, over more rounds) finally clears blind. Research confirms carrying the full Adam triple
+across rounds is a validated continual-RL technique (faster, smoother) and is NOT washed out at our
+~128 total update steps.
+
+## HOW (design, all in `python/unciv_train/`)
+
+### 1. Lift the optimizer out of `_optimize_actor_critic` + inject it (train.py)
+- Delete the inline `opt = torch.optim.Adam(net.parameters(), lr=lr)` (train.py:136). Add a required
+  `optimizer` parameter; use it directly. The per-update math (advantage snapshot, PPO clip, value MSE,
+  entropy, combined objective, grad-clip max_norm=10.0, `opt.step()`) stays IDENTICAL.
+- **Opt-aware divergence guard** (FND-0010/0012): at init also `safe_opt = copy.deepcopy(optimizer.state_dict())`
+  (alongside safe_state @139); on the NaN branch (@180) also `optimizer.load_state_dict(safe_opt)`;
+  re-checkpoint `safe_opt` after each successful epoch (@188). Guard logic otherwise unchanged.
+
+### 2. Micro-batch the dense traversal (train.py) — math frozen, traversal chunked
+- **R2 (council FND-0002): NO loss helper.** Keep the whole-batch per-update body (train.py:144-192)
+  BYTE-VERBATIM, wrapped in an `else:` branch (the wrap is the permitted &quot;forward TRAVERSAL change&quot;).
+  The micro-batch path is NEW code (a new `if micro_batch_steps and micro_batch_steps &lt; n:` branch)
+  that re-expresses the SAME loss arithmetic on slices. Numerical equivalence is guarded by
+  `test_microbatch.py`, not by sharing code.
+- Add `forward_chunk_fn(lo, hi)` (slice-aware forward) + `micro_batch_steps` params to
+  `_optimize_actor_critic`. When `micro_batch_steps` is falsy or ≥ n → the **whole-batch path runs
+  exactly as today** (no-op; byte-identical for Tiny/small arms). When set &lt; n → chunked path:
+  - **Snapshot pass**: under `no_grad`, loop K-step chunks computing `val0`/`old_logp` per chunk and
+    `torch.cat` them. Detached → memory relief, math-identical.
+  - **GAE/adv/returns**: computed ONCE on the full flattened `val0` (UNCHANGED). adv is normalized
+    batch-wide (train.py:159) — so it is computed once and INDEXED per chunk, never recomputed.
+  - **Epoch pass**: `optimizer.zero_grad()`; for each chunk forward→`_ac_loss_terms` on the chunk&#x27;s
+    slices→`loss_c = (policy_loss_c + value_coef*value_loss_c - entropy_coef*ent_c) * (n_c/N)`→
+    `loss_c.backward()` (accumulate, frees the chunk graph). After all chunks: check the accumulated
+    detached loss is finite (divergence guard, same semantics — no step + restore net+opt on NaN);
+    else `clip_grad_norm_(net.parameters(), 10.0)` once on the accumulated grad → `optimizer.step()`.
+  - Size-weighting `n_c/N` makes the summed per-chunk `.mean()`s equal the whole-batch `.mean()`
+    (research: correct gradient-accumulation weighting); equivalence holds within fp tolerance.
+
+### 3. Warm net+opt in the trainers (train.py) — symmetry across structured/_rich/_blind
+**R3 (council FND-0001): collapsed API** — each trainer takes only `net=None, optimizer=None,
+micro_batch_steps=None` (NO resume_ckpt/resume_opt; disk-resume lives in run_loop, below):
+- `net is None` → **fresh**: `torch.manual_seed(seed)` + construct net.
+- `net not None` → **warm**: reuse the passed net, skip seed + construction (FND-0006 determinism).
+  (Disk-resumed rounds arrive here as a warm net that run_loop already built + loaded.)
+- Optimizer: `optimizer is None` → construct `Adam(net.parameters(), lr)` (once, round 0). Else reuse.
+- Build `forward_chunk_fn`: structured/rich `lambda lo,hi: net({k: v[lo:hi] for k,v in inputs.items()})`
+  (every build_rich_batch tensor is `[B,…]` on axis 0 — confirmed per-row-independent, no cross-step
+  op); blind `lambda lo,hi: net(obs[lo:hi])`. Return `(net, stats, optimizer)`.
+
+### 4. Persist + carry across the loop (run_loop.py)
+- `train_round(...)` gains `net=None, optimizer=None`; threads them through; returns
+  `(net, stats, mode, optimizer)`. Single caller @226 updated.
+- **R1 (council FND-0006/0009): `--continual` flag (default True).** When True (the v5 mode): `run()`
+  holds `warm_net=warm_opt=None` before the loop; each iteration calls `train_round(..., seed=r,
+  net=warm_net, optimizer=warm_opt)` then `warm_net, warm_opt = net, opt` (carry forward). Round 0
+  fresh; r&gt;0 warm. When `--continual false`: pass `net=None, optimizer=None` every round → per-round
+  fresh net+opt (v4 from-scratch), for rollback + a clean regime A/B.
+- **Atomic saves** (FND-0011): new `_atomic_torch_save(obj, path)` (tmp→`os.replace`). Save BOTH
+  `ckpt_round_{r}.pt` (replaces the bare save @229) AND new `opt_round_{r}.pt` each round. Prune
+  `ckpt/opt` .pt older than the keep window (FND-0010; small files, low-pri).
+- **Resume (R3, run_loop.py:194-200):** when `start_round&gt;0` &amp; continual, a small helper
+  `_load_warm(variant, dims, token_specs, vocab_counts, rung, out, start, lr)` builds the arch +
+  `load_state_dict(torch.load(ckpt_round_{start-1}.pt, weights_only=True))` (FND-0025) + builds the
+  optimizer + loads `opt_round_{start-1}.pt`. Requires BOTH sidecars present &amp; rung/dims-compatible
+  (**fail-fast** with a clear message; load_state_dict errors on shape mismatch — FND-0003/0007/0008).
+  The warm (net,opt) seed the loop; the trainer just sees a warm net.
+- `--micro-batch-steps` arg (default 0 = no-op). metrics.jsonl write (@261-266) gains
+  `continual`, `warm_start=(continual and r&gt;0)`, `micro_batch_steps`, plus existing throughput — NOT
+  curve.csv (CURVE_COLS frozen).
+
+### 5. Experiment driver `python/run_v5.sh` (mirrors run_acceptance.sh)
+Two arms, run SEQUENTIALLY (14 cores; 12 gradle threads saturate the box):
+- **Arm A — primary (AC1/AC2)**: `--variant structured --map-size Medium --rounds 16 --gen-games 16
+  --eval-games 80 --turn-cap 250 --threads 12 --rung small --epochs 8 --lr 1e-3 --gamma 0.99 --lam 0.95
+  --value-coef 0.5 --entropy-coef 0.01 --clip-eps 0.2 --gen-seed 1000 --eval-seed 999000
+  --micro-batch-steps 0 --out runs/structured-Medium --resume`. (small rung ran clean on Medium in v4,
+  so micro-batch is a no-op here → only the regime changed.)
+- **Arm B — medium-rung (AC3)**: same but `--rung medium --micro-batch-steps 256 --out
+  runs/structured-medium-Medium --resume` (micro-batching newly enables this; would OOM in v4).
+- **Ceiling eval** (both arms): `python -m unciv_train.analyze --root runs/&lt;arm&gt; --ceiling-games 200
+  --turn-cap 250 --threads 12 --eval-seed 4242424` → uses `_two_proportion_z` (one-sided, p&lt;0.05).
+- **bench-onnx**: `./gradlew selfPlay --args=&quot;bench-onnx runs/structured-Medium/policy_round_15.onnx 200
+  Medium 12 777000&quot;` → gate ratio≥0.70.
+
+### 6. Tests (pytest, python/tests/)
+- `test_microbatch.py` — **numerical equivalence**: same net (cloned init) + same injected optimizer,
+  one optimize pass whole-batch vs micro-batched (small K) → loss + grad-norm + post-step weights match
+  within atol≈1e-5. Oracle = the whole-batch path (FND-0021).
+- `test_continual_resume.py` — **warm-from-memory == warm-from-disk**: train round 0, save ckpt+opt
+  (atomic), then (a) continue round 1 warm in-memory vs (b) reload ckpt+opt from disk → continue round 1;
+  assert identical resulting weights + opt state (FND-0022, no gradle needed). Plus the **AC6 parity**
+  check: the warm net at the start of round r produces logits matching the round r-1 *exported ONNX*
+  within atol (proves warm net == gen net → on-policy carryover; FND-0030).
+- Assert invariants (AC7): terminal-only ±1 reward unchanged; MODELED_HEADS == {tech,policy}; export
+  outputs exactly {OUTPUT_TECH, OUTPUT_POLICY} (extend/lean on existing test_gae/test_parity).
+
+## Walkthrough
+See `## Walkthrough` in the plan.html body. One round through the continual loop + one micro-batch
+chunk, with illustrative shapes.
+
+## FROZEN / not touched
+`compute_gae`, the per-update algebra (PPO clip, value MSE, entropy, objective, grad-clip 10.0),
+`_masked_logp`/`_entropy`, the encoder + heads + RUNGS, terminal-only ±1 reward, the ONNX export
+contract + Kotlin bridge (contract_version=3, byte-unchanged), CURVE_COLS.
+
+## Out of scope (NON-GOALS)
+No new action heads, no self-play (opponent stays RandomPolicy), no reward shaping, no encoder changes,
+no replay buffer (DEFERRED — gated on behavior-logp recording; one-line note in RESULTS).
+
+## Plan items
+- [AI_CODE] train.py: inject optimizer, opt-aware guard, `_ac_loss_terms` helper, micro-batch path.
+- [AI_CODE] train.py: warm/resume in the 3 trainers; return optimizer.
+- [AI_CODE] run_loop.py: thread net/opt through train_round; carry across loop; atomic ckpt+opt saves;
+  resume net+opt with fail-fast; `--micro-batch-steps`; metrics.jsonl fields.
+- [AI_CODE] python/run_v5.sh experiment driver.
+- [AI_CODE] tests: test_microbatch.py, test_continual_resume.py (+ AC6 parity), invariant asserts.
+- [AI_RESEARCH] Run both arms (16 rounds each), ceiling evals (200 games @4242424), bench-onnx.
+- [AI_CODE] RESULTS.md: continual curve (16 rounds), z-tests (vs v4 23.0%, vs blind 28.9%),
+  medium-rung result, bench verdict, replay-deferred note. **R4 (council FND-0029/0027):** also report
+  v5&#x27;s round-8 winrate vs v4-from-scratch@8 (23.0%) to disentangle regime from round-count, and note
+  warm-start makes `old_logp` == the gen policy (more on-policy-correct than v4&#x27;s random-init anchor).
+  Report a null/negative result PLAINLY if it occurs (the experiment answers the question either way).
+</pre><h2>decisions.md</h2><pre># Decisions — selfplay-v5 (Continual Training)
+
+## Phase 1 (discovery)
+- **D-Q1 Execution scope** → Build + run the full experiment autonomously (background, ~3–5h/arm, babysit with `--resume`), write RESULTS.md in-session. ACs closed in-session. [user clarification, Step 3]
+- **D-Q2 Medium-rung scope (AC3)** → Full 16-round medium-rung run as a capacity comparison vs the small-rung primary arm. [user clarification, Step 3]
+- **D-turncap** turn-cap=250 + threads=12 to match v4 apples-to-apples (undocumented in prompt; sourced from `python/run_acceptance.sh`). [Claude interpretation, scan finding]
+
+## Phase 2 (design)
+
+### Step 5 intake council roster rationale
+- **Core 6** (always-on): skeptic, architect, practitioner, product_manager, qa_testing, security_red_team.
+- **+domain_fidelity**: RL/PPO is a specialist domain where the wrong abstraction is a silent failure (biased importance ratio, broken on-policy assumption, Adam-state poisoning). Load-bearing. Modeled on Opus (deep).
+- **+cost_efficiency**: multi-hour compute, micro-batching to fit memory, throughput gate (bench-onnx ≥0.70). Relevant.
+- **Skipped**: end_user/power_user/new_user_onboarding/support_agent (no UI; &quot;user&quot; = researcher), data_privacy_legal/compliance (no PII/regulated data), ethics_responsible_ai (game-AI research, no user-impacting harm), finance/b2b_buyer/marketing/investor (no monetization/GTM), accessibility/i18n (no frontend).
+- Roster size 8 (L cap ≤14). Vendor-diverse: Opus / Gemini / GPT / DeepSeek spread across roles.
+
+### Step 5 intake council triage (34 findings: 11 critical, 21 major, 2 minor)
+Council reviewed `discovery-output.md` only (not the full decisive prompt), so the scope/PM cluster is largely artifact.
+
+**A. ADOPT into plan (genuine build-improvers, default-rigor):**
+- FND-0011 → **atomic checkpoint saves** (ckpt + opt sidecar via tmp→os.replace, mirroring export_onnx atomic write).
+- FND-0012/0010/0028 → **snapshot/restore `opt.state_dict()` in the divergence guard** (already deliverable #2/#5).
+- FND-0006 → **skip `manual_seed` on warm rounds** (already; confirmed by scan #4/#7).
+- FND-0007/0003 → **resume consistency invariant**: require curve.csv + ckpt_round_{N-1}.pt + opt_round_{N-1}.pt all present &amp; rung/dims-compatible; fail-fast with clear error; if opt sidecar absent (pre-v5 run) fail loudly (no silent fresh-optimizer).
+- FND-0025 → **`torch.load(weights_only=True)`** on resume (already mandated by prompt; enforce).
+- FND-0021/0009/0029 → micro-batch **size-weighted accumulation** (chunk loss × n_c/N) + GAE/adv/old_logp computed ONCE &amp; indexed per chunk; **numerical-equivalence test** with the whole-batch path as oracle (atol≈1e-5 on loss + grad-norm).
+- FND-0022 → **interruption/resume-equivalence test** (interrupt at round k + --resume == uninterrupted, identical curve).
+- FND-0030 → reinterpret AC6 parity as **warm net == prior-round exported gen net** (tech/policy/embedding initializers) — proves on-policy carryover.
+- FND-0001/0002/0004 → **YAGNI**: minimal plumbing (plain (net,opt) locals threaded through), ONE chunk-forward helper, no abstraction/framework.
+- FND-0013 → **disk hygiene**: prune old ckpt/opt .pt beyond a keep window (small files; low-pri).
+- FND-0034 → throughput/timing already → metrics.jsonl (cost telemetry).
+
+**B. DISMISS — already defined in the full prompt (council saw only the summary):**
+- FND-0015/0023 success metric &amp; thresholds: defined — beat 23.0% at p&lt;0.05 (one-sided z) + report vs 28.9% (AC1/AC2).
+- FND-0020 ACs: 7 ACs defined. FND-0018 out-of-scope: NON-GOALS section. FND-0017 non-negotiables: FROZEN section. FND-0016 prioritization: ACs are ordered.
+- FND-0031 apples-to-apples: fixed seed 4242424 / same map / same RandomPolicy opponent / turn-cap 250 — it IS apples-to-apples.
+
+**C. DISMISS — refuted by research/design:**
+- FND-0027 &quot;Adam carryover violates on-policy&quot;: FALSE — `old_logp` is recomputed from the current (warm) net, whose weights == the gen weights; carryover changes only init. (Research-confirmed.)
+- FND-0019 Adam stability: handled by the divergence guard (now opt-aware).
+- FND-0026 `--out` arbitrary write: operator-controlled local research tool; not a threat surface. Note only.
+- FND-0032/0033 circuit-breaker for wasted compute: babysat run + `diverged` flag in curve.csv; no auto-abort framework (FND-0001 YAGNI). Note only.
+- FND-0014 in-process memory: small/medium-rung net+opt are tiny; the big alloc is the batch (micro-batching handles it).
+
+### Step 11 plan-council triage (34 findings: 5 critical, 23 major, 6 minor) → 4 plan revisions
+**REVISIONS applied to plan.md (council-driven):**
+- **R1 (FND-0006/0009/0029)** — add `--continual` flag (default True). Default = v5 continual mode;
+  `--continual false` restores per-round fresh net+opt (v4 from-scratch) for rollback + clean A/B.
+  Reverses the earlier D1 &quot;no toggle&quot;.
+- **R2 (FND-0002)** — NO `_ac_loss_terms` helper. Keep train.py:144-192 whole-batch path BYTE-VERBATIM
+  inside an `else:` branch (wrapping in else = the permitted &quot;traversal change&quot;); the micro-batch path
+  is NEW code with the same expressions, size-weighted. Equivalence guarded by test_microbatch.py.
+  Reverses the earlier D3 helper.
+- **R3 (FND-0001)** — collapse the resume API: trainers take only `net=None, optimizer=None,
+  micro_batch_steps=None` (3 added params). run_loop does the disk-load (build arch + load_state_dict,
+  weights_only=True) via a small helper and passes warm (net,opt) objects — no resume_ckpt/resume_opt
+  in the trainer signature. load_state_dict naturally errors on rung/dims mismatch (FND-0008) → wrap
+  with a clear message.
+- **R4 (FND-0029/0027)** — RESULTS must (a) report v5 round-8 winrate vs v4-from-scratch@8=23.0% to
+  disentangle regime from round-count, and (b) note that warm-start makes `old_logp` == the gen policy
+  (more on-policy-correct than v4&#x27;s random-init anchor) — refuting FND-0027.
+
+**DISMISS (refuted / out-of-threat-model / prompt-defined):**
+- FND-0027 on-policy break: REFUTED (warm net at round start == gen policy == old_logp anchor).
+- FND-0028 opt-rollback desync: export happens AFTER the round with the (restored) final net, which IS
+  the next round&#x27;s gen policy → anchor stays consistent. No desync.
+- FND-0030 adv normalization: per-round-batch normalization is identical to v4; micro-batch computes
+  adv once on the full batch and indexes → unchanged.
+- FND-0004 AC6 vs dropped value head: parity is on tech+policy (the exported, generation-relevant
+  heads) — value head is train-only; the test already asserts out_names == {tech,policy}. Correct as-is.
+- FND-0024/0025/0026 security: local single-user research tool, no adversary on the run dir;
+  weights_only=True covers pickle-RCE/model-substitution on resume. Note only.
+- FND-0011/0012/0033 ops: small nets (tiny RSS), --gradle-timeout bounds hangs, sequential arms babysat.
+- FND-0013/0014/0015/0018 scope: success metric/ACs/out-of-scope defined in prompt; AC2 reports a
+  null/negative result PLAINLY (the experiment answers the question either way).
+- FND-0016/0031 replay: DEFERRED per prompt (gated on behavior-logp recording); 16 rounds stay
+  on-policy (each round trains only on its own freshly-generated data).
+**Adopt-lite:** quote run_v5.sh args (FND-0023); prune old ckpt/opt .pt beyond keep window (FND-0010);
+document K=256 choice (FND-0034); report divergence status before ceiling eval (FND-0032).
+**Verdict: APPROVE with revisions applied** (no unmitigated blocker; criticals either adopted as the
+`--continual` flag or dismissed with rationale).
+</pre></details>
+<section class="panel pr-nonce-p" aria-label="approval code"><h2>Approval code</h2><p>You reached the bottom. Paste this code back in the terminal to approve:</p><p><span class="pr-nonce" id="pr-nonce">raven-lumen-7195</span> <button class="btn" id="pr-copy" type="button" aria-label="copy approval code">copy</button></p><p class="kv">request changes &rarr; reply <code>revise: &lt;what&gt;</code> &middot; stop &rarr; reply <code>abort</code></p></section>
+</main>
+<script>document.addEventListener('DOMContentLoaded',function(){var b=document.getElementById('pr-expand');if(b){b.addEventListener('click',function(){var open=b.getAttribute('aria-expanded')!=='true';document.querySelectorAll('details').forEach(function(d){d.open=open;});b.setAttribute('aria-expanded',open);b.textContent=open?'collapse all':'expand all';});}var c=document.getElementById('pr-copy');if(c){c.addEventListener('click',function(){var n=document.getElementById('pr-nonce');if(n&&navigator.clipboard){navigator.clipboard.writeText(n.textContent.trim());}});}});</script>
+</body></html>

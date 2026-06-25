@@ -1,0 +1,12 @@
+[
+  {
+    "role_id": "product_manager",
+    "model": "deepseek/deepseek-v4-pro",
+    "seconds": 223.4
+  },
+  {
+    "role_id": "security_red_team",
+    "model": "deepseek/deepseek-v4-pro",
+    "seconds": 197.4
+  }
+]
