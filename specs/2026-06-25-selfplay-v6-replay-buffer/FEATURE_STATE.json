@@ -1,0 +1,7 @@
+{ "slug": "selfplay-v6-replay-buffer", "started": "2026-06-25", "mode": "BUILD", "size": "L",
+  "current_phase": 4, "current_step": 17, "last_completed_step": 16,
+  "spec_dir": "specs/2026-06-25-selfplay-v6-replay-buffer", "repo_root": "/Users/j/Unciv",
+  "source_commit_at_start": "04f2e27fa251415644e3909ceb8fd5dc48171aa9",
+  "test_mode": "integration", "experiment_run": "background-in-session",
+  "last_sync_commit": "04f2e27fa251415644e3909ceb8fd5dc48171aa9",
+  "last_sync_event": "skipped-origin-is-public-upstream" }

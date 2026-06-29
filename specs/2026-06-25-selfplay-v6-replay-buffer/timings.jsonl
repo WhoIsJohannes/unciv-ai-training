@@ -1,0 +1,21 @@
+{"step":0,"phase":1,"event":"start","ts":"2026-06-25T14:59:02Z"}
+{"step":0,"phase":1,"event":"end","ts":"2026-06-25T14:59:02Z"}
+{"step":1,"phase":1,"event":"end","ts":"2026-06-25T16:26:51Z"}
+{"step":2,"phase":1,"event":"end","ts":"2026-06-25T16:26:51Z"}
+{"step":3,"phase":1,"event":"end","ts":"2026-06-25T16:26:51Z"}
+{"step":5,"phase":2,"event":"start","ts":"2026-06-25T16:30:10Z"}
+{"step":7,"phase":2,"event":"start","ts":"2026-06-25T16:30:10Z"}
+{"step":4,"phase":2,"event":"start","ts":"2026-06-25T16:30:10Z"}
+{"step":4,"phase":2,"event":"end","ts":"2026-06-25T16:31:55Z"}
+{"event": "consolidation", "round": 1, "mode": "python", "raw_in": 34, "consolidated_out": 34, "ts": "2026-06-25T16:32:58Z"}
+{"step":5,"phase":2,"event":"end","ts":"2026-06-25T16:37:18Z"}
+{"step":7,"phase":2,"event":"end","ts":"2026-06-25T16:37:18Z"}
+{"step":8,"phase":2,"event":"end","ts":"2026-06-26T06:56:57Z"}
+{"step":11,"phase":2,"event":"start","ts":"2026-06-26T06:57:24Z"}
+{"event": "consolidation", "round": 1, "mode": "python", "raw_in": 33, "consolidated_out": 33, "ts": "2026-06-26T07:04:24Z"}
+{"step":11,"phase":2,"event":"end","ts":"2026-06-29T07:09:27Z"}
+{"step":12,"phase":3,"event":"end","ts":"2026-06-29T08:05:59Z"}
+{"step":13,"phase":3,"event":"end","ts":"2026-06-29T08:05:59Z"}
+{"step":14,"phase":3,"event":"end","ts":"2026-06-29T08:05:59Z"}
+{"step":15,"phase":3,"event":"end","ts":"2026-06-29T08:05:59Z"}
+{"step":16,"phase":3,"event":"end","ts":"2026-06-29T08:05:59Z"}
