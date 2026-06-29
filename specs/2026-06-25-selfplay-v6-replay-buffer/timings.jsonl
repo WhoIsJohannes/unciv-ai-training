@@ -19,3 +19,5 @@
 {"step":14,"phase":3,"event":"end","ts":"2026-06-29T08:05:59Z"}
 {"step":15,"phase":3,"event":"end","ts":"2026-06-29T08:05:59Z"}
 {"step":16,"phase":3,"event":"end","ts":"2026-06-29T08:05:59Z"}
+{"event": "consolidation", "round": 1, "mode": "python", "raw_in": 23, "consolidated_out": 23, "ts": "2026-06-29T08:15:14Z"}
+{"step":18,"phase":4,"event":"end","ts":"2026-06-29T08:30:09Z"}
