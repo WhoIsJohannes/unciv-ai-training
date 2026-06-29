@@ -28,6 +28,9 @@ GRADLEW="${GRADLEW:-../gradlew}"
 MAP_SIZE="${MAP_SIZE:-Medium}"; GEN_GAMES="${GEN_GAMES:-16}"; EVAL_GAMES="${EVAL_GAMES:-80}"
 TURN_CAP="${TURN_CAP:-250}"; CEIL_GAMES="${CEIL_GAMES:-200}"; SKIP_BENCH="${SKIP_BENCH:-0}"
 mkdir -p "$ROOT"
+# Resolve to ABSOLUTE: run_loop (cwd python/) and the gradle gen JVM (cwd repo root) resolve a RELATIVE
+# --out against different working dirs → the JVM writes shards/schema.json where Python can't find them.
+ROOT="$(cd "$ROOT" && pwd)"
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
 COMMON=(--variant structured --map-size "$MAP_SIZE" --rounds "$ROUNDS"
