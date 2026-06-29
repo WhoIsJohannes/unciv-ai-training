@@ -27,7 +27,7 @@ COMMON=(--variant structured --map-size Medium --rounds "$ROUNDS"
         --gen-games 16 --eval-games 80 --turn-cap 250 --threads "$TH"
         --epochs 8 --lr 1e-3 --gamma 0.99 --lam 0.95 --value-coef 0.5
         --entropy-coef 0.01 --clip-eps 0.2 --gen-seed 1000 --eval-seed 999000
-        --continual --resume)
+        --continual --resume --replay-window 1)   # v6: pin v5 single-round semantics (K=4 is now the default)
 
 # Track per-arm completion so we don't run a ceiling eval on a half-finished arm and don't report a
 # false "DONE" (ship-council FND-0010/0003/0015/0022/0031). --resume makes re-running the driver

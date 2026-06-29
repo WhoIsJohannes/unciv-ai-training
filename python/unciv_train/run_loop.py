@@ -123,15 +123,16 @@ def _replay_refill_rounds(start_round: int, replay_window: int) -> list[int]:
 
 
 def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, seed: int,
-                *, net=None, optimizer=None):
+                *, net=None, optimizer=None, replay_active: bool | None = None):
     """Dispatch to the right trainer by variant. Returns (net, stats, exporter_callable, optimizer).
     v5: `net`/`optimizer` are the warm continual pair (None ⇒ fresh round); the trainer returns the
-    optimizer so run_loop can carry it forward. micro_batch_steps is threaded from args."""
+    optimizer so run_loop can carry it forward. micro_batch_steps is threaded from args.
+    v6: `replay_active` (per-round; None ⇒ derive from --replay-window) gates the stored-logp source."""
     from . import contract
     mb = getattr(args, "micro_batch_steps", 0) or None
-    # v6: window-gated source switch — replay-window>1 ⇒ use the STORED behavior logp as old_logp for
-    # the (off-policy) replayed steps; window<=1 ⇒ behavior_logp=False ⇒ literal v5 recompute path.
-    bl = getattr(args, "replay_window", 1) > 1
+    # v6: window-gated source switch — replay active ⇒ use the STORED behavior logp as old_logp for
+    # the (off-policy) replayed steps; else behavior_logp=False ⇒ literal v5 recompute path.
+    bl = replay_active if replay_active is not None else (getattr(args, "replay_window", 1) > 1)
     if variant == "v1-reinforce":   # v1 is not continual — ignores warm net/opt
         net, stats = tr.train_reinforce(trajectories_or_steps, dims, epochs=args.epochs,
                                         lr=args.lr, seed=seed, entropy_coef=args.entropy_coef)
@@ -296,10 +297,13 @@ def main(argv=None) -> int:
                 continue
             rschema = rdir / "schema.json"
             is_rich_r = args.variant in ("rich-critic", "structured")
-            replay.append(ds.load_trajectories(
-                rshards, expected_version=contract.schema_version_from_schema(rschema),
-                expected_fingerprint=contract.fingerprint_from_schema(rschema), rich=is_rich_r,
-                expected_spatial_channels=(contract.spatial_channels_from_schema(rschema) if is_rich_r else None)))
+            try:   # ship-council 🔴: a corrupt/unreadable kept shard must NOT kill the multi-hour resume
+                replay.append(ds.load_trajectories(
+                    rshards, expected_version=contract.schema_version_from_schema(rschema),
+                    expected_fingerprint=contract.fingerprint_from_schema(rschema), rich=is_rich_r,
+                    expected_spatial_channels=(contract.spatial_channels_from_schema(rschema) if is_rich_r else None)))
+            except Exception as e:
+                print(f"[resume] replay refill: round_{rr} failed to load ({e!r}) — skipping (window under-filled)")
         print(f"[resume] replay refilled {len(replay)} round(s) for window K={args.replay_window}")
     for r in range(start_round, args.rounds):
         t0 = time.time()
@@ -337,10 +341,15 @@ def main(argv=None) -> int:
             train_data = data
         if args.continual and warm_net is None and r > 0:   # --resume restart: load warm net+opt from disk
             warm_net, warm_opt = _load_warm(args.variant, dims, schema, args, out, r)
+        # v6 (ship-council): round 0 (RandomPolicy bootstrap) ALWAYS trains on-policy (recompute) — its
+        # stored logp is the uniform RandomPolicy logp, and forcing recompute keeps round 0 IDENTICAL across
+        # the K=1 and K=4 arms (the v5 bootstrap), isolating the replay effect to rounds ≥1.
+        replay_active = (args.variant != "v1-reinforce" and args.replay_window > 1 and r > 0)
         net, stats, mode, opt = train_round(
             args.variant, train_data, dims, schema, args, seed=r,
             net=(warm_net if args.continual else None),
-            optimizer=(warm_opt if args.continual else None))
+            optimizer=(warm_opt if args.continual else None),
+            replay_active=replay_active)
         if args.continual:
             warm_net, warm_opt = net, opt                   # carry the persistent pair to next round
 
@@ -399,6 +408,12 @@ def main(argv=None) -> int:
               f"vloss={row['value_loss']:.3f} ent={row['entropy']:.2f} "
               f"onnx_dec={row['onnx_decisions']} diverged={row['diverged']} "
               f"({time.time()-t0:.0f}s)", flush=True)
+        # v6 (ship-council): surface growing off-policy variance loudly, not just on disk. mean_ratio≈1 is
+        # healthy near-on-policy; a high mean ratio (or heavy clipping) means the replay window is stale.
+        mr, cf = stats.get("mean_ratio", 1.0), stats.get("clip_frac", 0.0)
+        if replay_active and (mr > 1.5 or cf > 0.5):
+            sys.stderr.write(f"[replay-health WARN] r{r}: mean_ratio={mr:.3f} clip_frac={cf:.3f} — "
+                             f"off-policy variance high; consider lowering --replay-window or --clip-eps.\n")
 
         if args.keep_shards >= 0:
             old = out / f"round_{r - args.keep_shards}"

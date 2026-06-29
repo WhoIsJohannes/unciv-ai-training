@@ -24,7 +24,7 @@ for V in v1-reinforce blind-critic rich-critic; do
   log "TINY $V ($TINY_ROUNDS rounds)"
   $PY -m unciv_train.run_loop --variant "$V" --map-size Tiny --rounds "$TINY_ROUNDS" \
       --gen-games 24 --eval-games 100 --turn-cap 250 --threads "$TH" \
-      --out "$ROOT/$V-tiny" --resume || log "TINY $V FAILED (continuing)"
+      --replay-window 1 --out "$ROOT/$V-tiny" --resume || log "TINY $V FAILED (continuing)"
 done
 
 # --- Medium: blind vs rich (AC3 ceiling — where positional/board info should matter) ---
@@ -32,7 +32,7 @@ for V in blind-critic rich-critic; do
   log "MEDIUM $V ($MED_ROUNDS rounds)"
   $PY -m unciv_train.run_loop --variant "$V" --map-size Medium --rounds "$MED_ROUNDS" \
       --gen-games 16 --eval-games 80 --turn-cap 250 --threads "$TH" \
-      --out "$ROOT/$V-medium" --resume || log "MEDIUM $V FAILED (continuing)"
+      --replay-window 1 --out "$ROOT/$V-medium" --resume || log "MEDIUM $V FAILED (continuing)"
 done
 
 # --- Acceptance analysis (AC1/AC2/AC3 + plots; runs a final high-N Medium ceiling eval) ---

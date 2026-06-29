@@ -43,6 +43,9 @@ object MaskedChoice {
             for (i in legal.indices) { r -= exps[i]; if (r <= 0.0) { chosen = i; break } }
             chosen
         }
-        return legal[pos] to ln(exps[pos] / sum).toFloat()
+        // Numerically-stable log-softmax form: logp = (logit[chosen] - maxL) - ln(sum). Identical to
+        // ln(exps[pos]/sum) for normal values, but a LARGE FINITE negative number (never -Inf) when the
+        // chosen action's exp underflowed to 0 — and exactly matches Python's F.log_softmax (parity).
+        return legal[pos] to ((logits[legal[pos]] - maxL).toDouble() - ln(sum)).toFloat()
     }
 }
