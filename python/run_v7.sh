@@ -24,17 +24,21 @@ ROOT="${OUT_ROOT:-../training-runs/v7}"
 TH="${THREADS:-12}"
 ROUNDS="${ROUNDS:-16}"
 GRADLEW="${GRADLEW:-../gradlew}"
+# Knobs (defaults = the real experiment; override for a fast orchestration smoke):
+MAP_SIZE="${MAP_SIZE:-Medium}"; GEN_GAMES="${GEN_GAMES:-16}"; EVAL_GAMES="${EVAL_GAMES:-80}"
+TURN_CAP="${TURN_CAP:-250}"; CEIL_GAMES="${CEIL_GAMES:-200}"; SKIP_BENCH="${SKIP_BENCH:-0}"
 mkdir -p "$ROOT"
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
-COMMON=(--variant structured --map-size Medium --rounds "$ROUNDS"
-        --gen-games 16 --eval-games 80 --turn-cap 250 --threads "$TH"
+COMMON=(--variant structured --map-size "$MAP_SIZE" --rounds "$ROUNDS"
+        --gen-games "$GEN_GAMES" --eval-games "$EVAL_GAMES" --turn-cap "$TURN_CAP" --threads "$TH"
         --epochs 8 --lr 1e-3 --gamma 0.99 --lam 0.95 --value-coef 0.5
         --entropy-coef 0.01 --clip-eps 0.2 --gen-seed 1000 --eval-seed 999000
         --continual --resume --replay-window 4 --micro-batch-steps 256)
 
 # ---- PR5: throughput pre-gate (bench the per-city construction head BEFORE the multi-hour batch) ----
 bench_gate() {
+  [ "$SKIP_BENCH" = "1" ] && { log "PR5 bench pre-gate SKIPPED (SKIP_BENCH=1)"; return 0; }
   local warm="$ROOT/_bench_warmup"
   if [ ! -f "$warm/policy_round_0.onnx" ]; then
     log "PR5 warmup: producing a structured construction model (Tiny, 1 round) for the throughput bench"
@@ -81,10 +85,15 @@ for ARM in structured-small-off structured-small-on structured-medium-off struct
   case " $FAILED_ARMS " in *" $ARM "*) log "SKIP ceiling eval for $ARM (arm incomplete)"; continue ;; esac
   log "CEILING EVAL + z-tests: $ARM"
   CC=off; case "$ARM" in *-on) CC=on ;; esac   # ON arms MUST measure the ceiling WITH construction control
+  # Retry once — the ceiling eval spawns a gradle JVM and can transiently fail (daemon contention).
   "$PY" -m unciv_train.analyze_v5 --root "$ROOT/$ARM" --label "$ARM" \
-      --ceiling-games 200 --turn-cap 250 --threads "$TH" --eval-seed 4242424 \
+      --ceiling-games "$CEIL_GAMES" --turn-cap "$TURN_CAP" --threads "$TH" --eval-seed 4242424 \
       --control-construction "$CC" \
-    || log "ANALYZE_V5 $ARM FAILED"
+    || { log "ANALYZE_V5 $ARM failed — retrying once"; \
+         "$PY" -m unciv_train.analyze_v5 --root "$ROOT/$ARM" --label "$ARM" \
+            --ceiling-games "$CEIL_GAMES" --turn-cap "$TURN_CAP" --threads "$TH" --eval-seed 4242424 \
+            --control-construction "$CC" \
+         || log "ANALYZE_V5 $ARM FAILED (after retry — re-run analyze_v5 for this arm manually)"; }
   [ -f "$ROOT/$ARM/acceptance_v5.json" ] && cp "$ROOT/$ARM/acceptance_v5.json" "$ROOT/$ARM/acceptance_v7.json"
 done
 
