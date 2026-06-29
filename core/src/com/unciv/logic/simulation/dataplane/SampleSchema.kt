@@ -13,6 +13,10 @@ package com.unciv.logic.simulation.dataplane
  */
 object SampleSchema {
     /**
+     * VERSION 4 (was 3): adds a per-step [BLOCK_BEHAVIOR_LOGP] block for off-policy replay (v6) — the
+     * per-head behavior-policy log π_b recorded AT SAMPLING TIME. A v3 shard lacks the block ⇒ it is
+     * not layout-compatible ⇒ the Python reader refuses it ⇒ regenerate.
+     *
      * VERSION 3 (was 2): v4 structured-encoder layout. Adds a per-tile `spatial_coords` (f32 x,y)
      * block (the hex-GNN adjacency source — `spatial` stays u8 and cannot hold signed coords), map
      * dims in `global` (effective wrap radius + worldWrap + shape), a per-entity tile index in the
@@ -20,7 +24,7 @@ object SampleSchema {
      * is not layout-compatible. (VERSION 2 was: real terminal reward + applied civ-level action.)
      * The Python reader REFUSES a VERSION mismatch ⇒ regenerate; datasets are perishable by design.
      */
-    const val VERSION = 3
+    const val VERSION = 4
 
     /** 8 ASCII bytes at the head of every shard. */
     const val MAGIC = "UNCVSMP1"
@@ -118,6 +122,15 @@ object SampleSchema {
      */
     const val BLOCK_SPATIAL_COORDS = "spatial_coords"
     const val NUM_SPATIAL_COORDS = 2  // (x, y)
+
+    /**
+     * v6 (VERSION 4): per-head behavior-policy log-prob log π_b(a|s) recorded AT SAMPLING TIME (the
+     * masked-softmax over the legal logits, [MaskedChoice.chooseWithLogp]) — in [MASK_HEADS] order
+     * {tech, policy, …}, 0f where a head did not act. Same width as the `actions` block; the trainer
+     * slices [0:2]. SHARD-ONLY — consumed by the Python trainer as the off-policy `old_logp` for
+     * replayed steps; it is NOT an ONNX model I/O (the model emits logits; logp is derived from them).
+     */
+    const val BLOCK_BEHAVIOR_LOGP = "behavior_logp"
 
     /** Factored legal-action mask heads (boolean per candidate). Unit-intent + per-city
      *  construction are emitted per-entity in the UNIT/CITY tokens, not as global heads. */

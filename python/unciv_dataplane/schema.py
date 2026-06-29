@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any
 
 # Mirror of com.unciv.logic.simulation.dataplane.SampleSchema.VERSION — keep in lockstep.
+# v4 (v6 off-policy replay): adds the per-step `behavior_logp` block (per-head behavior-policy log π_b
+# recorded at sampling time). A v3 shard lacks the block ⇒ not layout-compatible ⇒ reader refuses.
 # v3 (v4 structured encoder): adds the per-tile spatial_coords (f32 x,y) block, map dims in global,
 # per-entity tile-index, and the construction-namespace fix. v2/v1 shards are not layout-compatible.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class SchemaError(Exception):

@@ -104,35 +104,37 @@ object DataPlaneHooks {
         if (!civ.isMajorCiv() || civ.isSpectator()) return
         val obs = state.featurizer.observe(civ)
         val turn = civ.gameInfo.turns
-        val actions = chooseAndApply(civ, policy, state.vocab, obs, turn)
-        state.recorder?.recordStep(civ, obs, actions, turn)
+        val (actions, behaviorLogp) = chooseAndApply(civ, policy, state.vocab, obs, turn)
+        state.recorder?.recordStep(civ, obs, actions, behaviorLogp, turn)
     }
 
-    /** Choose (and APPLY) the controlled civ-level actions. Returns the per-head action vector in
-     *  [SampleSchema.MASK_HEADS] order; −1 = "no decision this head this turn". v1 controls tech +
-     *  policy only; greatPerson/diplomaticVote stay heuristic (recorded as −1). */
-    private fun chooseAndApply(civ: Civilization, policy: PolicyProvider, vocab: Vocab, obs: Observation, turn: Int): FloatArray {
+    /** Choose (and APPLY) the controlled civ-level actions. Returns the per-head action vector AND the
+     *  per-head behavior-policy log-prob, both in [SampleSchema.MASK_HEADS] order; action −1 / logp 0f =
+     *  "no decision this head this turn". v1 controls tech + policy only; greatPerson/diplomaticVote stay
+     *  heuristic (recorded as −1 / 0f). The logp is recorded for v6 off-policy replay (NOT used here). */
+    private fun chooseAndApply(civ: Civilization, policy: PolicyProvider, vocab: Vocab, obs: Observation, turn: Int): Pair<FloatArray, FloatArray> {
         val actions = FloatArray(SampleSchema.MASK_HEADS.size) { -1f }
+        val behaviorLogp = FloatArray(SampleSchema.MASK_HEADS.size) { 0f }
 
         // TECH — decision only when no current research target (queue empty); pre-fill ⇒ heuristic respects it.
         if (civ.tech.techsToResearch.isEmpty()) {
             val mask = boolMask(obs, "mask_tech")
-            val idx = policy.chooseIndex("tech", civ, mask, turn)
-            actions[0] = idx.toFloat()
+            val (idx, logp) = policy.chooseIndexWithLogp("tech", civ, mask, turn)
+            actions[0] = idx.toFloat(); behaviorLogp[0] = logp
             if (idx >= 0) vocab.techId(idx)?.let { if (civ.tech.canBeResearched(it)) civ.tech.techsToResearch.add(it) }
         }
 
         // POLICY — decision only when a free policy slot is available; adopt the chosen policy.
         if (civ.policies.canAdoptPolicy()) {
             val mask = boolMask(obs, "mask_policy")
-            val idx = policy.chooseIndex("policy", civ, mask, turn)
-            actions[1] = idx.toFloat()
+            val (idx, logp) = policy.chooseIndexWithLogp("policy", civ, mask, turn)
+            actions[1] = idx.toFloat(); behaviorLogp[1] = logp
             if (idx >= 0) vocab.policyId(idx)?.let { name ->
                 val pol = civ.gameInfo.ruleset.policies[name]
                 if (pol != null && civ.policies.isAdoptable(pol)) civ.policies.adopt(pol)
             }
         }
-        return actions
+        return actions to behaviorLogp
     }
 
     private fun boolMask(obs: Observation, blockName: String): BooleanArray =
@@ -212,13 +214,16 @@ class ShardRecorder(
     private val civSlotById = LinkedHashMap<String, Int>()   // preserves recording order for terminal pass
     private var layout: List<Observation.Block> = emptyList() // captured at open for terminal zero-fill
 
-    /** Emit one non-terminal step for [x] with the already-chosen-and-applied [actions]. */
-    fun recordStep(x: Civilization, obs: Observation, actions: FloatArray, turn: Int) {
+    /** Emit one non-terminal step for [x] with the already-chosen-and-applied [actions] and the
+     *  per-head behavior log-prob [behaviorLogp] (v6 off-policy replay; same width as actions). */
+    fun recordStep(x: Civilization, obs: Observation, actions: FloatArray, behaviorLogp: FloatArray, turn: Int) {
         val isFirst = seenCivs.add(x.civID)
         val civSlot = gameInfo.civilizations.indexOf(x)
         civSlotById[x.civID] = civSlot
 
-        val blocks = obs.blocks + Observation.Block("actions", SampleSchema.DT_F32, BlockKind.FIXED, 0, actions)
+        val blocks = obs.blocks +
+            Observation.Block("actions", SampleSchema.DT_F32, BlockKind.FIXED, 0, actions) +
+            Observation.Block(SampleSchema.BLOCK_BEHAVIOR_LOGP, SampleSchema.DT_F32, BlockKind.FIXED, 0, behaviorLogp)
         if (!opened) {
             layout = blocks
             val header = DataPlaneHooks.buildHeaderJson(gameInfo, fingerprint, gameId, seed, config.caps, blocks, vocab)

@@ -22,5 +22,10 @@ class RoutingPolicy(
     override fun chooseIndex(head: String, civ: Civilization, legalMask: BooleanArray, turn: Int): Int =
         forCiv(civ).chooseIndex(head, civ, legalMask, turn)
 
+    /** v6 — delegate the behavior log-prob to the routed policy too (do NOT inherit the uniform
+     *  default, which would replace a routed net's true sampling logp with ln(1/nLegal)). */
+    override fun chooseIndexWithLogp(head: String, civ: Civilization, legalMask: BooleanArray, turn: Int): Pair<Int, Float> =
+        forCiv(civ).chooseIndexWithLogp(head, civ, legalMask, turn)
+
     override fun actUnit(unit: MapUnit) = forCiv(unit.civ).actUnit(unit)
 }

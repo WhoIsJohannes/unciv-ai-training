@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from unciv_train import dataset
+from unciv_dataplane.schema import SCHEMA_VERSION
 
 torch = pytest.importorskip("torch")
 
@@ -26,6 +27,7 @@ def _shard_with_steps(steps_spec, *, global_w=4, acting_w=3, tech_w=5, policy_w=
         {"name": "mask_tech", "dtype": "<u1", "kind": "fixed", "perItem": 0, "len": tech_w},
         {"name": "mask_policy", "dtype": "<u1", "kind": "fixed", "perItem": 0, "len": policy_w},
         {"name": "actions", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
+        {"name": "behavior_logp", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
         {"name": "spatial", "dtype": "<u1", "kind": "fixed", "perItem": 0, "len": n_tiles * 13},
         {"name": "own_units", "dtype": "<f4", "kind": "var", "perItem": 8, "len": 0},
         {"name": "opp_units", "dtype": "<f4", "kind": "var", "perItem": 8, "len": 0},
@@ -34,7 +36,7 @@ def _shard_with_steps(steps_spec, *, global_w=4, acting_w=3, tech_w=5, policy_w=
         {"name": "civ_tokens", "dtype": "<f4", "kind": "var", "perItem": 84, "len": 0},
     ]
     header = json.dumps({
-        "schemaVersion": 2, "rulesetFingerprint": fingerprint, "gameId": "ep-0", "seed": 1,
+        "schemaVersion": SCHEMA_VERSION, "rulesetFingerprint": fingerprint, "gameId": "ep-0", "seed": 1,
         "majorCivSlots": [{"slot": 0, "civId": "SimulationCiv1"}], "nTiles": n_tiles, "layout": layout,
     }).encode("utf-8")
 
@@ -45,6 +47,7 @@ def _shard_with_steps(steps_spec, *, global_w=4, acting_w=3, tech_w=5, policy_w=
         body += np.ones(tech_w, "<u1").tobytes()
         body += np.ones(policy_w, "<u1").tobytes()
         body += np.array([a_tech, a_policy, -1, -1], "<f4").tobytes()
+        body += np.array([-1.2, -0.3, 0, 0], "<f4").tobytes()     # behavior_logp per head (v6)
         body += np.zeros(n_tiles * 13, "<u1").tobytes()           # spatial (FIXED u8)
         for _ in range(5):                                         # 5 VARIABLE entity blocks, count 0
             body += struct.pack("<H", 0)
@@ -56,7 +59,7 @@ def _shard_with_steps(steps_spec, *, global_w=4, acting_w=3, tech_w=5, policy_w=
         records += (lambda b: struct.pack("<I", len(b)) + b)(step(t, 0, 0.0, at, ap)); t += 1
     term = step(t, 1, terminal_reward, -1.0, -1.0)
     records += struct.pack("<I", len(term)) + term
-    out = MAGIC + struct.pack("<H", 2) + struct.pack("<I", len(header)) + header + records
+    out = MAGIC + struct.pack("<H", SCHEMA_VERSION) + struct.pack("<I", len(header)) + header + records
     out += struct.pack("<II", len(steps_spec) + 1, zlib.crc32(records) & 0xFFFFFFFF)
     return out
 
@@ -65,7 +68,7 @@ def test_load_trajectories_keeps_noaction_and_terminal_only_reward(tmp_path):
     # one no-action step (both heads -1) FOLLOWED by an acting step → R1: BOTH kept, in order.
     p = tmp_path / "traj.bin"
     p.write_bytes(_shard_with_steps([(-1, -1), (2, 1)], terminal_reward=1.0))
-    trajs = dataset.load_trajectories([p], expected_version=2, expected_fingerprint="deadbeef")
+    trajs = dataset.load_trajectories([p], expected_version=SCHEMA_VERSION, expected_fingerprint="deadbeef")
     assert len(trajs) == 1
     tj = trajs[0]
     assert len(tj.rewards) == 2, "no-action step must NOT be dropped (GAE needs the full sequence)"
@@ -76,7 +79,7 @@ def test_load_trajectories_keeps_noaction_and_terminal_only_reward(tmp_path):
 def test_load_trajectories_rich_blocks_present(tmp_path):
     p = tmp_path / "traj.bin"
     p.write_bytes(_shard_with_steps([(2, 1)]))
-    trajs = dataset.load_trajectories([p], expected_version=2, expected_fingerprint="deadbeef",
+    trajs = dataset.load_trajectories([p], expected_version=SCHEMA_VERSION, expected_fingerprint="deadbeef",
                                       rich=True, expected_spatial_channels=13)
     assert trajs[0].rich is not None and "spatial" in trajs[0].rich[0]
 

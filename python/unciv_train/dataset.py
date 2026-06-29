@@ -56,6 +56,11 @@ class TrainTrajectory:
     mask_policy: np.ndarray  # [T, policy_w] float32
     rewards: np.ndarray      # [T] float32 — 0 except the terminal ±1 at the last step
     rich: list | None = None  # per-step dict{name -> np.ndarray} for the rich variant (else None)
+    # v6: per-step behavior-policy log π_b(a|s) recorded at sampling time, [T] f32, 0 where the head
+    # did not act. None ONLY for synthetic (non-shard) trajectories that never exercise off-policy
+    # replay; real shards (SCHEMA_VERSION≥4) always populate both. _stack_traj treats None as zeros.
+    b_logp_tech: np.ndarray | None = None
+    b_logp_policy: np.ndarray | None = None
 
 
 def _learner_slot(header: dict, learner_civ_id: str) -> int | None:
@@ -187,7 +192,12 @@ def load_trajectories(
         mask_policy = np.stack([s.blocks["mask_policy"] for s in steps]).astype(np.float32)
         rewards = np.zeros(t, dtype=np.float32)
         rewards[-1] = term_r                              # terminal-only ±1
+        # v6: behavior-policy log π_b per head (MASK_HEADS order {tech, policy}). No .get() fallback —
+        # SCHEMA_VERSION=4 guarantees the block (fail-loud, matching the perishable-dataset discipline).
+        b_logp_tech = np.array([float(s.blocks["behavior_logp"][0]) for s in steps], dtype=np.float32)
+        b_logp_policy = np.array([float(s.blocks["behavior_logp"][1]) for s in steps], dtype=np.float32)
         rich_blocks = ([_rich_step_blocks(s.blocks, expected_spatial_channels) for s in steps]
                        if rich else None)
-        out.append(TrainTrajectory(obs, a_tech, a_policy, mask_tech, mask_policy, rewards, rich_blocks))
+        out.append(TrainTrajectory(obs, a_tech, a_policy, mask_tech, mask_policy, rewards, rich_blocks,
+                                   b_logp_tech, b_logp_policy))
     return out

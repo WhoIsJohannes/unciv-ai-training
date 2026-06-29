@@ -134,12 +134,22 @@ def _optimize_actor_critic(
     entropy_coef: float,
     clip_eps: float | None,
     norm_adv: bool,
+    stored_old_logp: torch.Tensor | None = None,  # v6: per-step SUM of head behavior logps for REPLAYED
+                                                  # (off-policy) data. None ⇒ recompute = on-policy = v5 path.
 ) -> tuple[object, dict]:
     import copy
     opt = optimizer                  # v5: persistent optimizer (built once in the trainer, carried by run_loop)
     n = int(a_tech.shape[0])
     use_micro = (micro_batch_steps is not None and micro_batch_steps > 0
                  and forward_chunk_fn is not None and micro_batch_steps < n)  # <=0 ⇒ whole-batch no-op
+    # v6 GUARD: with stored behavior logp (off-policy replay), clip_eps MUST be truthy — the
+    # clip_eps-falsy policy-loss branch `-(adv*logp).mean()` never references old_logp, so it would
+    # silently ignore the stored behavior logp and apply replayed advantages as on-policy (biased).
+    if stored_old_logp is not None and not clip_eps:
+        raise ValueError(
+            "off-policy replay (stored_old_logp set) requires a truthy clip_eps — the clip_eps-falsy "
+            "policy loss ignores old_logp and would apply replayed advantages on-policy (biased "
+            "gradient). Pass clip_eps>0 (default 0.2) or disable replay (--replay-window 1).")
     stats = {"n": n, "n_traj": len(traj_lens), "ret_pos": n_pos}
     safe_state = copy.deepcopy(net.state_dict())  # restore on divergence (council 🔴: no NaN export)
     safe_opt = copy.deepcopy(opt.state_dict())    # v5: roll back optimizer moments too (else a diverged round poisons them)
@@ -147,6 +157,9 @@ def _optimize_actor_critic(
     # --- Compute advantages + value targets ONCE per round from a V-snapshot (standard PPO/A2C).
     # Recomputing each epoch makes the target chase V (degenerate value_loss); a fixed target ≈ the
     # bounded discounted-terminal return at λ≈1, so the critic regresses toward a stable signal.
+    # v6: val0 (current-net V) is ALWAYS recomputed here — GAE must use the CURRENT critic, never a
+    # stored value. Only the policy-logp SOURCE switches: stored behavior logp for replayed steps,
+    # else the recomputed current-net logp (the literal v5 on-policy path).
     with torch.no_grad():
         if use_micro:                                       # v5: chunk the snapshot; cat → math-identical
             v_parts, lp_parts = [], []
@@ -154,14 +167,16 @@ def _optimize_actor_critic(
                 hi = min(lo + micro_batch_steps, n)
                 tl0, pl0, v0 = forward_chunk_fn(lo, hi)
                 v_parts.append(v0.reshape(-1))
-                lp_parts.append(_masked_logp(tl0, a_tech[lo:hi], m_tech[lo:hi])
-                                + _masked_logp(pl0, a_policy[lo:hi], m_policy[lo:hi]))
+                if stored_old_logp is None:                 # only recompute when on-policy
+                    lp_parts.append(_masked_logp(tl0, a_tech[lo:hi], m_tech[lo:hi])
+                                    + _masked_logp(pl0, a_policy[lo:hi], m_policy[lo:hi]))
             val0 = torch.cat(v_parts)
-            old_logp = torch.cat(lp_parts).detach()
+            old_logp = stored_old_logp.detach() if stored_old_logp is not None else torch.cat(lp_parts).detach()
         else:
             tl0, pl0, val0 = forward_fn()
             val0 = val0.reshape(-1)
-            old_logp = (_masked_logp(tl0, a_tech, m_tech) + _masked_logp(pl0, a_policy, m_policy)).detach()
+            old_logp = (stored_old_logp.detach() if stored_old_logp is not None
+                        else (_masked_logp(tl0, a_tech, m_tech) + _masked_logp(pl0, a_policy, m_policy)).detach())
     v_np = val0.cpu().numpy()
     adv_np = np.zeros(n, dtype=np.float32)
     ret_np = np.zeros(n, dtype=np.float32)
@@ -184,6 +199,7 @@ def _optimize_actor_critic(
             # whole-batch else-branch below, applied per K-step chunk and size-weighted (chunk_n/N) so
             # the summed .mean()s == the whole-batch .mean()s; one backward-accumulate, one opt.step().
             loss_total = pl_sum = vl_sum = ent_sum = mv_sum = 0.0
+            ratio_sum = clip_count = 0.0                     # v6 read-only diagnostics (off-policy health)
             for lo in range(0, n, micro_batch_steps):
                 hi = min(lo + micro_batch_steps, n)
                 w = (hi - lo) / n
@@ -195,6 +211,9 @@ def _optimize_actor_critic(
                     ratio = torch.exp(logratio)
                     surr = torch.min(ratio * adv[lo:hi], torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv[lo:hi])
                     policy_loss = -surr.mean()
+                    with torch.no_grad():
+                        ratio_sum += float(ratio.sum())
+                        clip_count += float(((ratio - 1.0).abs() > clip_eps).float().sum())
                 else:
                     policy_loss = -(adv[lo:hi] * logp).mean()
                 value_loss = F.mse_loss(val, ret[lo:hi])
@@ -218,6 +237,8 @@ def _optimize_actor_critic(
             safe_opt = copy.deepcopy(opt.state_dict())
             stats.update(loss=loss_total, policy_loss=pl_sum, value_loss=vl_sum, entropy=ent_sum,
                          mean_adv=float(adv.mean().item()), mean_value=mv_sum / n, grad_norm=float(gnorm))
+            if clip_eps:
+                stats.update(mean_ratio=ratio_sum / n, clip_frac=clip_count / n)
         else:
             tl, pl, val = forward_fn()
             val = val.reshape(-1)
@@ -227,6 +248,9 @@ def _optimize_actor_critic(
                 ratio = torch.exp(logratio)
                 surr = torch.min(ratio * adv, torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv)
                 policy_loss = -surr.mean()
+                with torch.no_grad():                            # v6 read-only diagnostics (off-policy health)
+                    ep_mean_ratio = float(ratio.mean())
+                    ep_clip_frac = float(((ratio - 1.0).abs() > clip_eps).float().mean())
             else:                                               # plain A2C (single-epoch use)
                 policy_loss = -(adv * logp).mean()
             value_loss = F.mse_loss(val, ret)
@@ -249,7 +273,11 @@ def _optimize_actor_critic(
                          value_loss=float(value_loss.item()), entropy=float(ent.item()),
                          mean_adv=float(adv.mean().item()), mean_value=float(val.mean().item()),
                          grad_norm=float(gnorm))
+            if clip_eps:
+                stats.update(mean_ratio=ep_mean_ratio, clip_frac=ep_clip_frac)
     stats.setdefault("diverged", False)
+    stats.setdefault("mean_ratio", 1.0)   # v6: on-policy / plain-A2C path ⇒ ratio≡1, no clipping
+    stats.setdefault("clip_frac", 0.0)
     return net, stats
 
 
@@ -261,7 +289,15 @@ def _stack_traj(trajectories: list[TrainTrajectory]):
     rewards_np = np.concatenate([t.rewards for t in trajectories]).astype(np.float32)
     traj_lens = [int(len(t.rewards)) for t in trajectories]
     n_pos = int(sum(1 for t in trajectories if t.rewards[-1] > 0))
-    return a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos
+    # v6: per-step behavior logp per head, in the SAME flat-batch order as a_tech/a_policy. A synthetic
+    # trajectory with no recorded logp (b_logp_*=None) ⇒ zeros (it never exercises the off-policy path —
+    # the trainer only consumes `stored` when behavior_logp is enabled, i.e. real replayed shards).
+    def _blogp(attr, t):
+        v = getattr(t, attr)
+        return v if v is not None else np.zeros(len(t.rewards), dtype=np.float32)
+    b_logp_tech = torch.tensor(np.concatenate([_blogp("b_logp_tech", t) for t in trajectories]))
+    b_logp_policy = torch.tensor(np.concatenate([_blogp("b_logp_policy", t) for t in trajectories]))
+    return a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy
 
 
 def train_actor_critic_blind(
@@ -280,6 +316,7 @@ def train_actor_critic_blind(
     net=None,                        # v5: warm net (continual); None ⇒ fresh
     optimizer=None,                  # v5: warm optimizer; None ⇒ built once here
     micro_batch_steps: int | None = None,
+    behavior_logp: bool = False,     # v6: use stored behavior logp as old_logp (off-policy replay); False ⇒ v5 recompute
 ) -> tuple[PolicyNet, dict, object]:
     if net is None:
         torch.manual_seed(seed)
@@ -288,7 +325,9 @@ def train_actor_critic_blind(
         optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     if not trajectories:
         return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}, optimizer
-    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos = _stack_traj(trajectories)
+    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy = _stack_traj(trajectories)
+    # v6: stored behavior logp (sum of per-head logps) for off-policy replayed data; None ⇒ on-policy (v5).
+    stored = (b_logp_tech + b_logp_policy) if behavior_logp else None
     obs = torch.tensor(np.concatenate([t.obs for t in trajectories]))
 
     def forward_fn():
@@ -303,7 +342,7 @@ def train_actor_critic_blind(
         a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
         rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
         gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
-        clip_eps=clip_eps, norm_adv=norm_adv,
+        clip_eps=clip_eps, norm_adv=norm_adv, stored_old_logp=stored,
     )
     return net, stats, optimizer
 
@@ -325,6 +364,7 @@ def train_actor_critic_rich(
     net=None,                        # v5: warm net (continual); None ⇒ fresh
     optimizer=None,                  # v5: warm optimizer; None ⇒ built once here
     micro_batch_steps: int | None = None,
+    behavior_logp: bool = False,     # v6: use stored behavior logp as old_logp (off-policy replay); False ⇒ v5 recompute
 ) -> tuple[object, dict, object]:
     """Rich variant. Trajectories carry `rich` dicts of padded per-step token tensors + masks
     (assembled by features.build_rich_batch). The whole round is one padded batch.
@@ -339,7 +379,9 @@ def train_actor_critic_rich(
         optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     if not trajectories:
         return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}, optimizer
-    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos = _stack_traj(trajectories)
+    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy = _stack_traj(trajectories)
+    # v6: stored behavior logp (sum of per-head logps) for off-policy replayed data; None ⇒ on-policy (v5).
+    stored = (b_logp_tech + b_logp_policy) if behavior_logp else None
     inputs = build_rich_batch(trajectories, dims, token_specs)  # dict[name -> tensor], padded
 
     def forward_fn():
@@ -354,7 +396,7 @@ def train_actor_critic_rich(
         a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
         rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
         gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
-        clip_eps=clip_eps, norm_adv=norm_adv,
+        clip_eps=clip_eps, norm_adv=norm_adv, stored_old_logp=stored,
     )
     return net, stats, optimizer
 
@@ -378,6 +420,7 @@ def train_actor_critic_structured(
     net=None,                        # v5: warm net (continual); None ⇒ fresh (round 0 / from-scratch)
     optimizer=None,                  # v5: warm optimizer; None ⇒ built once here and carried by run_loop
     micro_batch_steps: int | None = None,  # v5: chunk the dense traversal (medium rung on Medium)
+    behavior_logp: bool = False,     # v6: use stored behavior logp as old_logp (off-policy replay); False ⇒ v5 recompute
 ) -> tuple[object, dict, object]:
     """v4 STRUCTURED variant: same encoder-AGNOSTIC core (_optimize_actor_critic) + same rich
     batch/stacking as train_actor_critic_rich — ONLY the nn.Module is swapped for
@@ -395,7 +438,9 @@ def train_actor_critic_structured(
         optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     if not trajectories:
         return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}, optimizer
-    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos = _stack_traj(trajectories)
+    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy = _stack_traj(trajectories)
+    # v6: stored behavior logp (sum of per-head logps) for off-policy replayed data; None ⇒ on-policy (v5).
+    stored = (b_logp_tech + b_logp_policy) if behavior_logp else None
     inputs = build_rich_batch(trajectories, dims, token_specs)
 
     def forward_fn():
@@ -410,6 +455,6 @@ def train_actor_critic_structured(
         a_tech=a_tech, a_policy=a_policy, m_tech=m_tech, m_policy=m_policy,
         rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
         gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
-        clip_eps=clip_eps, norm_adv=norm_adv,
+        clip_eps=clip_eps, norm_adv=norm_adv, stored_old_logp=stored,
     )
     return net, stats, optimizer

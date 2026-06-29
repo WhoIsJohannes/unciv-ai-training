@@ -99,12 +99,17 @@ class OnnxPolicy(
     /** True when the loaded model uses the rich multi-tensor contract (v2). */
     fun isRich(): Boolean = rich
 
-    override fun chooseIndex(head: String, civ: Civilization, legalMask: BooleanArray, turn: Int): Int {
-        if (head !in SampleSchema.OnnxContract.MODELED_HEADS) return -1
+    override fun chooseIndex(head: String, civ: Civilization, legalMask: BooleanArray, turn: Int): Int =
+        chooseIndexWithLogp(head, civ, legalMask, turn).first
+
+    /** v6 — net action + its masked-softmax behavior log-prob (recorded for off-policy replay).
+     *  Reuses the per-(game,civ,turn) memoized logits and the SAME single rng draw as [chooseIndex]. */
+    override fun chooseIndexWithLogp(head: String, civ: Civilization, legalMask: BooleanArray, turn: Int): Pair<Int, Float> {
+        if (head !in SampleSchema.OnnxContract.MODELED_HEADS) return -1 to 0f
         val logits = logitsFor(head, civ, turn)
-        val idx = com.unciv.logic.simulation.dataplane.MaskedChoice.choose(logits, legalMask, eval, rngFor(civ, turn))
+        val (idx, logp) = com.unciv.logic.simulation.dataplane.MaskedChoice.chooseWithLogp(logits, legalMask, eval, rngFor(civ, turn))
         if (idx >= 0) decisions.incrementAndGet()
-        return idx
+        return idx to logp
     }
 
     private fun logitsFor(head: String, civ: Civilization, turn: Int): FloatArray {

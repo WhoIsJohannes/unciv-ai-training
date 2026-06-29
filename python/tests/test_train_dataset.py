@@ -13,13 +13,14 @@ import pytest
 
 # The module under test (created in Phase 3). A hard import → collection error until built = the RED signal.
 from unciv_train import dataset
+from unciv_dataplane.schema import SCHEMA_VERSION
 
 MAGIC = b"UNCVSMP1"
 
 
 def _build_v2_shard(
     *,
-    version: int = 2,
+    version: int = SCHEMA_VERSION,
     fingerprint: str = "deadbeef",
     global_w: int = 4,
     acting_w: int = 3,
@@ -27,13 +28,15 @@ def _build_v2_shard(
     policy_w: int = 4,
     terminal_reward: float = 1.0,
 ) -> bytes:
-    """Minimal VERSION-2 shard: one non-terminal learner step (civ_slot=0) + one terminal record."""
+    """Minimal current-schema (v4) shard: one non-terminal learner step (civ_slot=0) + one terminal
+    record. v6: carries a `behavior_logp` FIXED f32 block right after `actions` (same width)."""
     layout = [
         {"name": "global", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": global_w},
         {"name": "acting_civ", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": acting_w},
         {"name": "mask_tech", "dtype": "<u1", "kind": "fixed", "perItem": 0, "len": tech_w},
         {"name": "mask_policy", "dtype": "<u1", "kind": "fixed", "perItem": 0, "len": policy_w},
         {"name": "actions", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
+        {"name": "behavior_logp", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
     ]
     import json
 
@@ -55,6 +58,7 @@ def _build_v2_shard(
         body += np.ones(tech_w, "<u1").tobytes()      # all legal (test)
         body += np.ones(policy_w, "<u1").tobytes()
         body += np.array([a_tech, a_policy, -1, -1], "<f4").tobytes()
+        body += np.array([-1.5, -0.7, 0, 0], "<f4").tobytes()   # behavior_logp per head
         return body
 
     records = b""
@@ -71,22 +75,22 @@ def _build_v2_shard(
 
 def test_refuses_schema_version_mismatch(tmp_path):
     p = tmp_path / "v1.bin"
-    p.write_bytes(_build_v2_shard(version=1))   # reader.load refuses VERSION 1 against SCHEMA_VERSION 2
+    p.write_bytes(_build_v2_shard(version=1))   # reader.load refuses VERSION 1 against the live SCHEMA_VERSION
     with pytest.raises(Exception):
-        dataset.load_training_steps([p], expected_version=2, expected_fingerprint="deadbeef")
+        dataset.load_training_steps([p], expected_version=SCHEMA_VERSION, expected_fingerprint="deadbeef")
 
 
 def test_refuses_fingerprint_mismatch(tmp_path):
     p = tmp_path / "wrongfp.bin"
     p.write_bytes(_build_v2_shard(fingerprint="00000000"))
     with pytest.raises(dataset.ProvenanceError):
-        dataset.load_training_steps([p], expected_version=2, expected_fingerprint="deadbeef")
+        dataset.load_training_steps([p], expected_version=SCHEMA_VERSION, expected_fingerprint="deadbeef")
 
 
 def test_extracts_obs_action_return(tmp_path):
     p = tmp_path / "ok.bin"
     p.write_bytes(_build_v2_shard(terminal_reward=1.0))
-    steps = dataset.load_training_steps([p], expected_version=2, expected_fingerprint="deadbeef")
+    steps = dataset.load_training_steps([p], expected_version=SCHEMA_VERSION, expected_fingerprint="deadbeef")
     assert len(steps) == 1                          # one non-terminal learner step
     s = steps[0]
     assert s.obs.shape[0] == 4 + 3                  # concat(global, acting_civ)

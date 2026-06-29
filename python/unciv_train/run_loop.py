@@ -109,6 +109,19 @@ def _load_warm(variant: str, dims, schema_path, args, out: Path, start: int):
     return net, opt
 
 
+def _replay_refill_rounds(start_round: int, replay_window: int) -> list[int]:
+    """v6 (plan council 🔴) — the round indices whose shards refill the replay deque on --resume.
+
+    Mirrors the in-process window EXACTLY: the recent NON-zero rounds `max(1, start-(K-1)) .. start-1`.
+    Round 0 (RandomPolicy, maximally off-policy) is EXCLUDED — a naive `[start-K .. start-1]` glob would
+    re-admit it when start ≤ K. K≤1 ⇒ no replay ⇒ [].
+    """
+    if replay_window <= 1:
+        return []
+    lo = max(1, start_round - (replay_window - 1))
+    return list(range(lo, start_round))
+
+
 def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, seed: int,
                 *, net=None, optimizer=None):
     """Dispatch to the right trainer by variant. Returns (net, stats, exporter_callable, optimizer).
@@ -116,6 +129,9 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
     optimizer so run_loop can carry it forward. micro_batch_steps is threaded from args."""
     from . import contract
     mb = getattr(args, "micro_batch_steps", 0) or None
+    # v6: window-gated source switch — replay-window>1 ⇒ use the STORED behavior logp as old_logp for
+    # the (off-policy) replayed steps; window<=1 ⇒ behavior_logp=False ⇒ literal v5 recompute path.
+    bl = getattr(args, "replay_window", 1) > 1
     if variant == "v1-reinforce":   # v1 is not continual — ignores warm net/opt
         net, stats = tr.train_reinforce(trajectories_or_steps, dims, epochs=args.epochs,
                                         lr=args.lr, seed=seed, entropy_coef=args.entropy_coef)
@@ -125,7 +141,7 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             trajectories_or_steps, dims, epochs=args.epochs, lr=args.lr, seed=seed,
             gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
-            net=net, optimizer=optimizer, micro_batch_steps=mb)
+            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl)
         return net, stats, "blind", optimizer
     if variant == "rich-critic":
         token_specs = contract.token_specs_from_schema(schema_path)
@@ -133,7 +149,7 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             trajectories_or_steps, dims, token_specs, epochs=args.epochs, lr=args.lr, seed=seed,
             gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
-            net=net, optimizer=optimizer, micro_batch_steps=mb)
+            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl)
         return net, stats, ("rich", token_specs), optimizer
     if variant == "structured":
         from .model import RUNGS
@@ -144,7 +160,7 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             trajectories_or_steps, dims, token_specs, vocab_counts, rung, epochs=args.epochs,
             lr=args.lr, seed=seed, gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
-            net=net, optimizer=optimizer, micro_batch_steps=mb)
+            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl)
         return net, stats, ("structured", token_specs), optimizer
     raise ValueError(f"unknown variant {variant!r}")
 
@@ -231,10 +247,20 @@ def main(argv=None) -> int:
     ap.add_argument("--micro-batch-steps", type=int, default=0,
                     help="v5: chunk the dense forward/backward into K-step sub-batches (0 ⇒ whole-batch "
                          "no-op). Set on the medium rung on Medium to avoid OOM. Changes ONLY traversal.")
+    ap.add_argument("--replay-window", type=int, default=4,
+                    help="v6: recent-round replay window K. Each update trains on the current round ∪ the "
+                         "last K-1 rounds' trajectories (K=4 ≈ 64 games vs the v5 ~16 — a sample-efficiency "
+                         "multiplier; the PPO clip + small window keep the importance-ratio variance bounded "
+                         "as the warm-started policy drifts only a few hundred grad-steps over K rounds). "
+                         "K=1 ⇒ NO replay (bit-identical to v5: window-gated old_logp recompute, no behavior "
+                         "logp). Round 0 (RandomPolicy) is always excluded from the window.")
     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
     args = ap.parse_args(argv)
     if args.variant == "rich-v2":   # alias for the v4 structured encoder
         args.variant = "structured"
+    # v6: keep enough recent round_*/ shard dirs alive that the last K-1 rounds survive the prune for
+    # the replay window (the in-process deque is lost on --resume and refilled from these dirs).
+    args.keep_shards = max(args.keep_shards, args.replay_window - 1)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -256,6 +282,25 @@ def main(argv=None) -> int:
             csv.writer(f).writerow(CURVE_COLS)
 
     warm_net = warm_opt = None       # v5: the persistent continual (net, optimizer) pair
+    # v6: recent-round replay window. The deque's maxlen gives the sliding window for free (appending the
+    # (K+1)-th round evicts the oldest). K=1 ⇒ maxlen 1 ⇒ degenerates to the single-round batch (== v5).
+    from collections import deque
+    replay: deque = deque(maxlen=max(1, args.replay_window))
+    if args.resume and args.variant != "v1-reinforce" and args.replay_window > 1:
+        # The in-process deque is empty on restart — refill it from disk over the SAME non-zero window.
+        for rr in _replay_refill_rounds(start_round, args.replay_window):
+            rdir = out / f"round_{rr}"
+            rshards = glob.glob(str(rdir / "*.bin"))
+            if not rshards:
+                print(f"[resume] replay refill: round_{rr} shards missing — skipping (window under-filled)")
+                continue
+            rschema = rdir / "schema.json"
+            is_rich_r = args.variant in ("rich-critic", "structured")
+            replay.append(ds.load_trajectories(
+                rshards, expected_version=contract.schema_version_from_schema(rschema),
+                expected_fingerprint=contract.fingerprint_from_schema(rschema), rich=is_rich_r,
+                expected_spatial_channels=(contract.spatial_channels_from_schema(rschema) if is_rich_r else None)))
+        print(f"[resume] replay refilled {len(replay)} round(s) for window K={args.replay_window}")
     for r in range(start_round, args.rounds):
         t0 = time.time()
         round_dir = out / f"round_{r}"
@@ -277,10 +322,23 @@ def main(argv=None) -> int:
                 shards, expected_version=ver, expected_fingerprint=fp, rich=is_rich,
                 expected_spatial_channels=(contract.spatial_channels_from_schema(schema)
                                            if is_rich else None))
+        # v6: assemble the replay batch. Round 0 (RandomPolicy) is EXCLUDED from the window — its policy
+        # is maximally off the current net (high-variance ratios) and contributes little; it trains on its
+        # own data directly. For r≥1 (and the trajectory variants), append this round and flatten the
+        # deque (current ∪ last K-1 rounds) into one list — each trajectory carries its own behavior_logp
+        # so stored_old_logp is correct per-step regardless of source round. v1-reinforce is single-round.
+        frac_replayed = 0.0
+        if args.variant != "v1-reinforce" and r > 0:
+            replay.append(data)
+            train_data = [t for round_trajs in replay for t in round_trajs]
+            if train_data:
+                frac_replayed = 1.0 - (len(data) / len(train_data))
+        else:
+            train_data = data
         if args.continual and warm_net is None and r > 0:   # --resume restart: load warm net+opt from disk
             warm_net, warm_opt = _load_warm(args.variant, dims, schema, args, out, r)
         net, stats, mode, opt = train_round(
-            args.variant, data, dims, schema, args, seed=r,
+            args.variant, train_data, dims, schema, args, seed=r,
             net=(warm_net if args.continual else None),
             optimizer=(warm_opt if args.continual else None))
         if args.continual:
@@ -329,7 +387,12 @@ def main(argv=None) -> int:
                                 "micro_batch_steps": int(args.micro_batch_steps),
                                 "turns_per_sec": ev.get("turns_per_sec"),
                                 "ms_per_decision": ev.get("ms_per_decision"),
-                                "mean_adv": stats.get("mean_adv", 0.0)}) + "\n")
+                                "mean_adv": stats.get("mean_adv", 0.0),
+                                # v6 off-policy-health diagnostics (read-only; let the multi-hour run be watched)
+                                "replay_window": int(args.replay_window),
+                                "frac_replayed": float(frac_replayed),
+                                "mean_ratio": stats.get("mean_ratio", 1.0),
+                                "clip_frac": stats.get("clip_frac", 0.0)}) + "\n")
         plot(rows, curve_png, args.variant, args.map_size)
         print(f"[{args.variant} r{r}] gen={n_games} steps={row['n_steps']} "
               f"winrate={row['winrate']*100:.1f}% pval={row['pval']:.3g} "
