@@ -1,0 +1,105 @@
+{
+  "reference_v5_v6": {
+    "small": 0.407,
+    "medium": 0.466
+  },
+  "blind_baseline": "58/200=28.9%",
+  "ship_criterion": "construction-ON beats OFF (p<0.05) within a rung \u2014 even below 50%",
+  "rungs": {
+    "small": {
+      "off": {
+        "dir": "structured-small-off",
+        "exists": true,
+        "final_round": 15,
+        "final_winrate_80g": 0.5,
+        "ceiling": {
+          "wins": 96,
+          "games": 204,
+          "winrate": 0.47058823529411764
+        }
+      },
+      "on": {
+        "dir": "structured-small-on",
+        "exists": true,
+        "final_round": 15,
+        "final_winrate_80g": 0.13095,
+        "ceiling": {
+          "wins": 28,
+          "games": 204,
+          "winrate": 0.13725490196078433
+        }
+      },
+      "effect_on_vs_off": {
+        "off": "96/204=0.471",
+        "on": "28/204=0.137",
+        "delta": -0.3333,
+        "z": -7.319290452051363,
+        "p_one_sided": 0.9999999999998753,
+        "construction_helps": false
+      },
+      "vs_50pct": {
+        "off": {
+          "winrate": 0.4706,
+          "z": -0.84,
+          "p_one_sided": 0.7996,
+          "crosses_50": false
+        },
+        "on": {
+          "winrate": 0.1373,
+          "z": -10.362,
+          "p_one_sided": 1.0,
+          "crosses_50": false
+        }
+      },
+      "verdict": "NULL / NEGATIVE (ON did not beat OFF at p<0.05)"
+    },
+    "medium": {
+      "off": {
+        "dir": "structured-medium-off",
+        "exists": true,
+        "final_round": 15,
+        "final_winrate_80g": 0.38095,
+        "ceiling": {
+          "wins": 82,
+          "games": 204,
+          "winrate": 0.4019607843137255
+        }
+      },
+      "on": {
+        "dir": "structured-medium-on",
+        "exists": true,
+        "final_round": 15,
+        "final_winrate_80g": 0.34524,
+        "ceiling": {
+          "wins": 75,
+          "games": 204,
+          "winrate": 0.36764705882352944
+        }
+      },
+      "effect_on_vs_off": {
+        "off": "82/204=0.402",
+        "on": "75/204=0.368",
+        "delta": -0.0343,
+        "z": -0.7122647220900395,
+        "p_one_sided": 0.7618495674367628,
+        "construction_helps": false
+      },
+      "vs_50pct": {
+        "off": {
+          "winrate": 0.402,
+          "z": -2.801,
+          "p_one_sided": 0.9974,
+          "crosses_50": false
+        },
+        "on": {
+          "winrate": 0.3676,
+          "z": -3.781,
+          "p_one_sided": 0.9999,
+          "crosses_50": false
+        }
+      },
+      "verdict": "NULL / NEGATIVE (ON did not beat OFF at p<0.05)"
+    }
+  },
+  "ship_recommendation": "SHIP INFRA ONLY \u2014 no directional win; default --control-construction OFF (reused by next per-entity heads)"
+}

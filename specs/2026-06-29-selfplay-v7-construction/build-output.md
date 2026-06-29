@@ -36,8 +36,13 @@ on v5 continual + v6 replay (both intact). All pre-run acceptance criteria green
 - **Build**: core+desktop Kotlin compile; `:tests:test` dataplane suite green; python suite green (1 pre-existing determinism flake).
 - **End-to-end ON pipeline** validated: gen-ON → dataset construction load → structured trainer construction summand → export with construction head → bench-onnx loads + drives it.
 
-## Pending
-- **AC#3 EFFECT** — the 4-arm Medium run (`run_v7.sh`): small/medium × OFF/ON, K=4, seed 4242424, then per-arm 200-game ceiling + `analyze_v7` ON-vs-OFF z-test + 50%-break-even framing. Launched as a resumable background batch (user-approved "drive to completion").
+## AC#3 EFFECT — COMPLETE (NEGATIVE)
+4-arm Medium run done (~10h). **Construction-ON does NOT beat OFF; neither crosses 50%:**
+- small: OFF 96/204=47.1% · ON 28/204=13.7% · Δ=−33.3pp · z=−7.32 (construction HURTS catastrophically)
+- medium: OFF 82/204=40.2% · ON 75/204=36.8% · Δ=−3.4pp · z=−0.71 p=0.76 (hurts, not significant)
+Likely cause: per-turn override → the under-trained net churns construction instead of committing-until-done
+(heuristic baseline is strong). See RESULTS.md for full analysis + v7.1 follow-ups (cadence/reward/capacity).
+Ship disposition: no directional win → infra default-OFF (pending user confirmation given the negative).
 
 ## Plan fidelity
 All 6 design decisions (A–F) implemented; all 6 plan-council refinements (PR1–PR6) folded. One build-time
