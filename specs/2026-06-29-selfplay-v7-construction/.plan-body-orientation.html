@@ -1,0 +1,9 @@
+<p><strong>The ask:</strong> give the self-play policy its first <em>per-entity</em> control lever — per-city
+production (what each city builds) — on top of the two civ-global heads (tech, policy), and measure whether
+controlling production moves the Medium win-rate toward/past the 50% break-even.</p>
+<p><strong>How this solves it:</strong> a per-city construction head reads the existing (un-pooled) own_cities
+token embeddings and emits per-city logits over the building∪unit vocabulary; the civ-turn hook pre-fills each
+deciding city's construction queue (mirroring the tech pattern), records two variable per-city blocks aligned to
+own_cities, and the trainer adds the per-city construction log-prob into the existing joint PPO ratio. A
+<code>--control-construction {on,off}</code> flag makes OFF a proven no-op (== v6). A 4-arm experiment
+(small/medium rung × OFF/ON, replay K=4) isolates construction as the only variable.</p>

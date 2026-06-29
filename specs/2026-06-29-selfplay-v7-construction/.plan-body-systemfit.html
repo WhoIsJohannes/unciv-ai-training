@@ -1,0 +1,13 @@
+<p><strong>New:</strong> a per-city <code>construction_head</code> in <code>model.py</code>; a shared
+<code>orderedOwnCities</code> helper; <code>run_v7.sh</code> + <code>analyze_v7.py</code>; one new
+<code>PolicyProvider</code> method; <code>Vocab.constructionId</code>; an <code>OUTPUT_CONSTRUCTION</code> ONNX output.</p>
+<p><strong>Touched:</strong> <code>DataPlaneHooks</code> (decision loop + recordStep), <code>ConstructionAutomation</code>
+(controlled-civ guard), <code>SampleSchema</code> + <code>schema.py</code> (version + block/output names),
+<code>OnnxPolicy</code> (per-city memo + fallback), <code>SelfPlayRunner</code>/<code>SampleConfig</code> (positional flag),
+<code>export_onnx</code>, <code>dataset.py</code> (ragged pad), <code>train.py</code> (logp summand), <code>run_loop.py</code> (flag).</p>
+<p><strong>Calls in:</strong> <code>NextTurnAutomation.onCivTurn</code> (fires before <code>automateCities</code>) → <code>DataPlaneHooks</code>.
+<strong>Calls out:</strong> the head reads existing own_cities embeddings; the decision loop calls
+<code>MaskedChoice.chooseWithLogp</code> + <code>CityConstructions.setCurrentConstruction</code>.</p>
+<p><strong>Untouched but relied on (FROZEN):</strong> terminal-only ±1 reward; tech/policy/value heads + dims;
+PPO clip/value/entropy/GAE math; v5 continual + v6 replay machinery. <strong>Stays heuristic:</strong> unit movement,
+promotion, great-person, diplomatic-vote (asserted).</p>

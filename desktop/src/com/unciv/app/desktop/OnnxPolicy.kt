@@ -47,6 +47,10 @@ class OnnxPolicy(
     private val rich: Boolean
     /** True when the loaded model is contract v3 (structured: rich + hex-GNN neighbor inputs). */
     private val structured: Boolean
+    /** v7: true when the model exposes the per-city `construction_logits` output. */
+    private val hasConstructionOutput: Boolean
+    /** v7: the construction-mask / per-city-head width (buildings+units), for the PR3 dim cross-check. */
+    private val constrW: Int = vocab.buildingCount + vocab.unitCount
 
     init {
         val f = java.io.File(modelPath)
@@ -80,12 +84,24 @@ class OnnxPolicy(
             val missing = want.filter { it !in have }
             check(missing.isEmpty()) { "OnnxPolicy: model missing expected inputs $missing (model has $have)" }
         }
+        // v7: discover the per-city construction output. PR3/PR2 — if construction control is requested
+        // but the model lacks the head, FAIL LOUD at load (an "ON" arm silently falling back to the
+        // heuristic would contaminate the ON-vs-OFF comparison).
+        hasConstructionOutput = SampleSchema.OnnxContract.OUTPUT_CONSTRUCTION in session.outputNames
+        check(!config.controlConstruction || hasConstructionOutput) {
+            "OnnxPolicy: controlConstruction=ON but model lacks output '${SampleSchema.OnnxContract.OUTPUT_CONSTRUCTION}' " +
+                "(export the net with the v7 per-city construction head)"
+        }
     }
 
     /** One forward pass per (game, civ, turn), reused across the two head calls of that turn.
      *  ThreadLocal ⇒ no cross-thread / cross-game bleed when [com.unciv.logic.simulation.Simulation]
      *  runs games concurrently. */
-    private class Memo(val key: String, val techLogits: FloatArray, val policyLogits: FloatArray)
+    private class Memo(
+        val key: String, val techLogits: FloatArray, val policyLogits: FloatArray,
+        /** v7: per-city construction logits [ncities][constrW], or null if the model has no construction head. */
+        val constructionLogits: Array<FloatArray>?,
+    )
     private val memo = ThreadLocal<Memo?>()
 
     /** Net decisions actually made (index ≥ 0). EVAL asserts this is > 0 to confirm the learner civ
@@ -93,8 +109,13 @@ class OnnxPolicy(
     private val decisions = java.util.concurrent.atomic.AtomicLong(0)
     fun decisionCount(): Long = decisions.get()
 
+    /** v7 (PR2): per-city construction fallbacks (empty support / out-of-range row). A healthy ON arm
+     *  reports ≈0; a large count means the net rarely controlled construction (comparison contaminated). */
+    private val constructionFallbacks = java.util.concurrent.atomic.AtomicLong(0)
+    fun constructionFallbackCount(): Long = constructionFallbacks.get()
+
     /** Public single-input inference for the blind PARITY test (no masking/sampling). */
-    fun infer(input: FloatArray): Pair<FloatArray, FloatArray> = forward(input)
+    fun infer(input: FloatArray): Pair<FloatArray, FloatArray> = forward("parity", input).let { it.techLogits to it.policyLogits }
 
     /** True when the loaded model uses the rich multi-tensor contract (v2). */
     fun isRich(): Boolean = rich
@@ -112,32 +133,51 @@ class OnnxPolicy(
         return idx to logp
     }
 
-    private fun logitsFor(head: String, civ: Civilization, turn: Int): FloatArray {
+    /** v7 — per-city construction from the SAME memoized forward (ONE inference per civ-turn). Index the
+     *  net's per-city construction logits at [cityRow] (the city's position in [Featurizer.orderedOwnCities],
+     *  which is the own_cities token order), then masked-softmax-sample exactly like the civ heads. Missing
+     *  output / out-of-range row → abstain (−1) and count a fallback (PR2). */
+    override fun chooseConstructionWithLogp(
+        civ: Civilization, city: com.unciv.logic.city.City, cityRow: Int, legalMask: BooleanArray, turn: Int,
+    ): Pair<Int, Float> {
+        val cons = forwardCached(civ, turn).constructionLogits
+        if (cons == null || cityRow < 0 || cityRow >= cons.size) { constructionFallbacks.incrementAndGet(); return -1 to 0f }
+        val (idx, logp) = com.unciv.logic.simulation.dataplane.MaskedChoice.chooseWithLogp(cons[cityRow], legalMask, eval, rngFor(civ, turn))
+        if (idx >= 0) decisions.incrementAndGet() else constructionFallbacks.incrementAndGet()
+        return idx to logp
+    }
+
+    /** The ONE memoized forward per (game, civ, turn), reused by tech/policy/construction calls. */
+    private fun forwardCached(civ: Civilization, turn: Int): Memo {
         val key = "${civ.gameInfo.gameId}|${civ.civID}|$turn"
         val cached = memo.get()
-        val m = if (cached != null && cached.key == key) cached else run {
-            val obs = Featurizer(civ.gameInfo, vocab, config).observe(civ)
-            val (tech, policy) = if (rich) forwardRich(obs, if (structured) civ.gameInfo.tileMap else null)
-                                 else forward(obs.block("global") + obs.block("acting_civ"))
-            Memo(key, tech, policy).also { memo.set(it) }
-        }
+        if (cached != null && cached.key == key) return cached
+        val obs = Featurizer(civ.gameInfo, vocab, config).observe(civ)
+        val m = if (rich) forwardRich(key, obs, if (structured) civ.gameInfo.tileMap else null)
+                else forward(key, obs.block("global") + obs.block("acting_civ"))
+        memo.set(m)
+        return m
+    }
+
+    private fun logitsFor(head: String, civ: Civilization, turn: Int): FloatArray {
+        val m = forwardCached(civ, turn)
         return if (head == "tech") m.techLogits else m.policyLogits
     }
 
-    private fun forward(input: FloatArray): Pair<FloatArray, FloatArray> {
+    private fun forward(key: String, input: FloatArray): Memo {
         OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(1, input.size.toLong())).use { t ->
             session.run(mapOf(SampleSchema.OnnxContract.INPUT_NAME to t)).use { res ->
                 val tech = row(res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor)
                 val policy = row(res.get(SampleSchema.OnnxContract.OUTPUT_POLICY).get() as OnnxTensor)
-                return tech to policy
+                return Memo(key, tech, policy, null)   // blind models never expose construction
             }
         }
     }
 
-    /** Rich (contract v2) forward: build the SAME multi-tensor input the trainer pads (per-tile
-     *  spatial token set + per-type entity token sets, each with a presence mask), feed onnxruntime,
-     *  read the policy logits. EVERY created [OnnxTensor] is closed (no native leak — council R7). */
-    private fun forwardRich(obs: Observation, tileMap: TileMap?): Pair<FloatArray, FloatArray> {
+    /** Rich (contract v2/v3) forward: build the SAME multi-tensor input the trainer pads, feed
+     *  onnxruntime, read tech/policy (+ v7 per-city construction when present). EVERY created
+     *  [OnnxTensor] is closed (no native leak — council R7). */
+    private fun forwardRich(key: String, obs: Observation, tileMap: TileMap?): Memo {
         val inputs = buildRichTensors(env, obs)
         if (tileMap != null) {  // v3 structured: add the hex-GNN neighbor inputs from the LIVE map
             val (idx, mask) = buildNeighborTensorsLive(env, tileMap)
@@ -149,7 +189,11 @@ class OnnxPolicy(
                 session.run(inputs).use { res ->
                     val tech = row(res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor)
                     val policy = row(res.get(SampleSchema.OnnxContract.OUTPUT_POLICY).get() as OnnxTensor)
-                    tech to policy
+                    val construction = if (hasConstructionOutput)
+                        rows2d(res.get(SampleSchema.OnnxContract.OUTPUT_CONSTRUCTION).get() as OnnxTensor) else null
+                    if (construction != null && construction.isNotEmpty() && construction[0].size != constrW)
+                        error("OnnxPolicy: construction_logits width=${construction[0].size} != live constrW=$constrW (regenerate vs the live ruleset)")  // PR3
+                    Memo(key, tech, policy, construction)
                 }
             }
         } finally {
@@ -159,6 +203,10 @@ class OnnxPolicy(
 
     @Suppress("UNCHECKED_CAST")
     private fun row(t: OnnxTensor): FloatArray = (t.value as Array<FloatArray>)[0]
+
+    /** v7: a [1, N, W] tensor → its [N][W] rows (the per-city construction logits). */
+    @Suppress("UNCHECKED_CAST")
+    private fun rows2d(t: OnnxTensor): Array<FloatArray> = (t.value as Array<Array<FloatArray>>)[0]
 
     companion object {
         /** Build the contract-v2 multi-tensor input from a live [Observation]. Shared by inference
@@ -259,6 +307,9 @@ class OnnxPolicy(
     override fun actUnit(unit: MapUnit) = UnitAutomation.automateUnitMoves(unit)
 
     override fun close() {
+        val fb = constructionFallbacks.get()
+        if (config.controlConstruction && fb > 0)
+            com.unciv.utils.Log.error("WARN: OnnxPolicy construction fallbacks=%d (ON arm should be ~0; net rarely controlled construction)", fb)
         try { session.close() } catch (_: Exception) {}
     }
 }

@@ -30,6 +30,21 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
     private val cityTokenWidth = 17  // v3: +centerTile.zeroBasedIndex (entity↔GNN-node co-location)
     private val unitTokenWidth = 9   // v3: +currentTile.zeroBasedIndex
 
+    companion object {
+        /**
+         * v7: the canonical `own_cities` order — `civ.cities.sortedBy{it.id}`, truncated at
+         * [maxOwnCities]. The SINGLE source of this ordering, reused by the featurizer (`own_cities`
+         * tokens + `mask_construction`), the control decision loop ([DataPlaneHooks.chooseAndApply]),
+         * and the recorder, so the per-city construction decision at row `i` aligns row-for-row with
+         * `mask_construction[i]` / `own_cities[i]`. Any caller that re-derives this order independently
+         * risks a silent off-by-one across the Kotlin↔Python boundary.
+         */
+        fun orderedOwnCities(civ: Civilization, maxOwnCities: Int): List<City> {
+            val sorted = civ.cities.sortedBy { it.id }
+            return if (sorted.size > maxOwnCities) sorted.take(maxOwnCities) else sorted
+        }
+    }
+
     fun observe(x: Civilization): Observation {
         var overflow = false
         val omni = config.omniscientOpponents
@@ -57,9 +72,9 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
             if (lvl != null) diplo[i * n + j] = (lvl + 1).toFloat()
         }
 
-        // ---- own cities (EXACT) ----
-        val ownCityList = x.cities.sortedBy { it.id }
-            .let { if (it.size > caps.maxOwnCities) { overflow = true; it.take(caps.maxOwnCities) } else it }
+        // ---- own cities (EXACT) — orderedOwnCities is THE canonical order (shared w/ control + recorder) ----
+        val ownCityList = orderedOwnCities(x, caps.maxOwnCities)
+        if (x.cities.size > caps.maxOwnCities) overflow = true
         val ownCities = FloatArray(ownCityList.size * cityTokenWidth)
         ownCityList.forEachIndexed { i, c -> writeCityToken(ownCities, i * cityTokenWidth, c, x, true, ownerSlot) }
 

@@ -1,0 +1,305 @@
+{
+  "version": 1,
+  "schema_version": "1",
+  "mode": "BUILD",
+  "size": "L",
+  "base": "master",
+  "pr_target": "master",
+  "counts": {
+    "edited": 18,
+    "created": 2,
+    "deleted": 0
+  },
+  "blast_radius": "engine civ-turn hook + recorder + schema + net + trainer + run driver; first per-entity head",
+  "test_status": "RED (schema 4\u22605 + v4-refuse fail now)",
+  "council": "intake 31 (30 folded); plan 31 (5 crit/21 maj \u2014 6 refinements folded PR1-6, rest covered/oos); no design-invalidating findings",
+  "change_archetypes": [
+    "schema",
+    "interface",
+    "delta",
+    "decisions"
+  ],
+  "review_focus": [
+    {
+      "item": "own_cities ordering reused identically in featurizer + decision loop + recorder (capped at maxOwnCities)",
+      "why": "row misalignment silently corrupts per-city training signal",
+      "confidence": "high",
+      "anchor": "pr-substance"
+    },
+    {
+      "item": "constructionId inverts the 0-indexed MASK space, not 1-indexed constructionCode",
+      "why": "off-by-one mislabels building vs unit; legality test must catch it",
+      "confidence": "high",
+      "anchor": "pr-substance"
+    },
+    {
+      "item": "stored old_logp includes \u03a3_cities construction at generation time (incl. K=4 replay)",
+      "why": "PPO off-policy ratio correctness across heads",
+      "confidence": "high",
+      "anchor": "pr-substance"
+    },
+    {
+      "item": "OFF is a proven zero-summand no-op (== v6)",
+      "why": "clean ON-vs-OFF attribution",
+      "confidence": "med",
+      "anchor": "pr-substance"
+    },
+    {
+      "item": "single memoized ONNX forward emits all per-city rows (no O(cities) inference)",
+      "why": "throughput AC#6",
+      "confidence": "med",
+      "anchor": "pr-systemfit"
+    }
+  ],
+  "system_fit": {
+    "new": [
+      "model.py construction_head",
+      "Featurizer.orderedOwnCities",
+      "run_v7.sh",
+      "analyze_v7.py",
+      "PolicyProvider.chooseConstructionWithLogp",
+      "Vocab.constructionId"
+    ],
+    "touched": [
+      "DataPlaneHooks.kt",
+      "ConstructionAutomation.kt",
+      "SampleSchema.kt",
+      "schema.py",
+      "OnnxPolicy.kt",
+      "SelfPlayRunner.kt",
+      "export_onnx.py",
+      "dataset.py",
+      "train.py",
+      "run_loop.py"
+    ],
+    "untouched_relied_on": [
+      "terminal-only \u00b11 reward",
+      "tech/policy/value heads",
+      "PPO clip/value/GAE math",
+      "v5 continual + v6 replay"
+    ],
+    "consumers": [
+      "train.py dataset loader",
+      "OnnxPolicy inference",
+      "analyze_v7 z-tests"
+    ],
+    "edges": [
+      {
+        "from": "NextTurnAutomation.onCivTurn",
+        "to": "DataPlaneHooks.chooseAndApply",
+        "label": "before automateCities"
+      },
+      {
+        "from": "chooseAndApply",
+        "to": "PolicyProvider.chooseConstructionWithLogp",
+        "label": "per deciding city"
+      },
+      {
+        "from": "chooseConstructionWithLogp",
+        "to": "MaskedChoice.chooseWithLogp",
+        "label": "single RNG draw"
+      },
+      {
+        "from": "chooseAndApply",
+        "to": "CityConstructions.setCurrentConstruction",
+        "label": "pre-fill queue[0]"
+      },
+      {
+        "from": "recordStep",
+        "to": "shard (2 VARIABLE blocks)",
+        "label": "construction_action/logp"
+      },
+      {
+        "from": "dataset.py",
+        "to": "train.py",
+        "label": "padded per-city logp summand"
+      }
+    ]
+  },
+  "top_decisions": [
+    {
+      "decision": "Centralize own_cities order in one orderedOwnCities helper (capped)",
+      "rejected": "repeat the sortedBy{id} literal at each site",
+      "confidence": "high"
+    },
+    {
+      "decision": "Ship on directional proof (ON>OFF p<0.05), 50% is a milestone not a gate",
+      "rejected": "block ship unless it crosses 50%",
+      "confidence": "high"
+    },
+    {
+      "decision": "OFF = zero-summand no-op (head inert, == v6)",
+      "rejected": "separate OFF code path / no head in graph",
+      "confidence": "high"
+    },
+    {
+      "decision": "constructionId inverts the 0-indexed mask space",
+      "rejected": "reuse constructionCode 1-indexed inverse",
+      "confidence": "high"
+    },
+    {
+      "decision": "Independent per-city sampling (non-autoregressive)",
+      "rejected": "AlphaStar-style autoregressive city conditioning",
+      "confidence": "high"
+    }
+  ],
+  "risks": [
+    {
+      "n": 1,
+      "text": "own_cities row misalignment across 5 components",
+      "ls": "M\u00d7H",
+      "mitigation": "single orderedOwnCities helper + determinism/parity test asserting alignment"
+    },
+    {
+      "n": 2,
+      "text": "\u03a3_cities log-ratio variance grows with city count \u2192 more clipping on ON arms",
+      "ls": "M\u00d7M",
+      "mitigation": "logratio.clamp(-20,20)+PPO clip; watch ratio/clip-fraction telemetry"
+    },
+    {
+      "n": 3,
+      "text": "constructionId off-by-one (1-indexed vs 0-indexed)",
+      "ls": "M\u00d7H",
+      "mitigation": "mask-space inverse + round-trip assert + legality test (recorded==applied, in-mask)"
+    },
+    {
+      "n": 4,
+      "text": "ON-arm ONNX fallback silently substitutes heuristic \u2192 contaminates ON-vs-OFF",
+      "ls": "L\u00d7H",
+      "mitigation": "PR2: count fallbacks; analyze_v7 asserts \u22480 on ON arms or flags invalid"
+    }
+  ],
+  "human_actions": [
+    "Launch the multi-hour 4-arm run_v7 batch after parity/no-op/legality green (driven to completion this session per the experiment decision)"
+  ],
+  "rollback": "revert branch; v4\u2192v5 schema bump means v7 shards/replay are perishable and separate \u2014 no in-place migration to undo",
+  "out_of_scope": [
+    "promotion/great-person/diplomatic-vote heads",
+    "unit-movement/target head",
+    "encoder rewrite",
+    "autoregressive city conditioning",
+    "reward shaping",
+    "ONNX file signing / replay poisoning defenses (single-trust local training)"
+  ],
+  "open_questions": [],
+  "change_inventory": [
+    {
+      "path": "core/.../DataPlaneHooks.kt",
+      "change": "edit",
+      "why": "per-city decision loop + recordStep 2 VARIABLE blocks",
+      "group": "control",
+      "heart": true
+    },
+    {
+      "path": "core/.../Featurizer.kt",
+      "change": "edit",
+      "why": "extract orderedOwnCities shared helper",
+      "group": "control"
+    },
+    {
+      "path": "core/.../ConstructionAutomation.kt",
+      "change": "edit",
+      "why": "controlled-civ + pre-filled guard",
+      "group": "control"
+    },
+    {
+      "path": "core/.../PolicyProvider.kt",
+      "change": "edit",
+      "why": "chooseConstructionWithLogp default",
+      "group": "seam"
+    },
+    {
+      "path": "desktop/.../OnnxPolicy.kt",
+      "change": "edit",
+      "why": "per-city memo + fallback",
+      "group": "seam"
+    },
+    {
+      "path": "core/.../SampleSchema.kt",
+      "change": "edit",
+      "why": "VERSION 4\u21925; OUTPUT_CONSTRUCTION + block names",
+      "group": "schema"
+    },
+    {
+      "path": "core/.../Vocab.kt",
+      "change": "edit",
+      "why": "constructionId (0-indexed inverse)",
+      "group": "schema"
+    },
+    {
+      "path": "core/.../SelfPlayRunner.kt",
+      "change": "edit",
+      "why": "positional controlConstruction arg \u2192 SampleConfig",
+      "group": "flag"
+    },
+    {
+      "path": "python/unciv_dataplane/schema.py",
+      "change": "edit",
+      "why": "SCHEMA_VERSION 4\u21925",
+      "group": "schema"
+    },
+    {
+      "path": "python/unciv_train/model.py",
+      "change": "edit",
+      "why": "per-city construction_head",
+      "group": "net",
+      "heart": true
+    },
+    {
+      "path": "python/unciv_train/export_onnx.py",
+      "change": "edit",
+      "why": "construction output + dynamic city axis",
+      "group": "net"
+    },
+    {
+      "path": "python/unciv_train/dataset.py",
+      "change": "edit",
+      "why": "load+pad construction blocks",
+      "group": "train"
+    },
+    {
+      "path": "python/unciv_train/train.py",
+      "change": "edit",
+      "why": "construction logp summand (live + stored old_logp)",
+      "group": "train",
+      "heart": true
+    },
+    {
+      "path": "python/unciv_train/run_loop.py",
+      "change": "edit",
+      "why": "--control-construction flag bridge",
+      "group": "flag"
+    },
+    {
+      "path": "python/run_v7.sh",
+      "change": "new",
+      "why": "4-arm OFF/ON resumable driver",
+      "group": "experiment"
+    },
+    {
+      "path": "python/unciv_train/analyze_v7.py",
+      "change": "new",
+      "why": "per-rung ON-vs-OFF z-tests + 50% framing",
+      "group": "experiment"
+    },
+    {
+      "path": "tests/.../FairnessAndDeterminismTests.kt",
+      "change": "edit",
+      "why": "construction mask parity + determinism + constructionId round-trip",
+      "group": "tests"
+    },
+    {
+      "path": "tests/.../OnnxPolicyLegalityTest.kt",
+      "change": "edit",
+      "why": "per-city legality (recorded==applied, in-mask)",
+      "group": "tests"
+    }
+  ],
+  "verification": [
+    "./gradlew :tests:test \u2014 Kotlin parity/legality/determinism green",
+    "python -m pytest python/ \u2014 schema round-trip + no-op zero-summand + dataset pad",
+    "bench-onnx \u2014 per-city head \u226570% heuristic throughput",
+    "run_v7.sh \u2014 4-arm Medium, analyze_v7 z-tests ON-vs-OFF + vs 50%"
+  ],
+  "compact": false
+}

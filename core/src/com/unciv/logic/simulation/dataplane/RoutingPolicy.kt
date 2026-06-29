@@ -1,5 +1,6 @@
 package com.unciv.logic.simulation.dataplane
 
+import com.unciv.logic.city.City
 import com.unciv.logic.civilization.Civilization
 import com.unciv.logic.map.mapunit.MapUnit
 
@@ -26,6 +27,11 @@ class RoutingPolicy(
      *  default, which would replace a routed net's true sampling logp with ln(1/nLegal)). */
     override fun chooseIndexWithLogp(head: String, civ: Civilization, legalMask: BooleanArray, turn: Int): Pair<Int, Float> =
         forCiv(civ).chooseIndexWithLogp(head, civ, legalMask, turn)
+
+    /** v7 — route per-city construction to the civ's policy (learner net vs opponent uniform), so the
+     *  recorded construction log-prob is the routed policy's TRUE sampling logp, not the abstain default. */
+    override fun chooseConstructionWithLogp(civ: Civilization, city: City, cityRow: Int, legalMask: BooleanArray, turn: Int): Pair<Int, Float> =
+        forCiv(civ).chooseConstructionWithLogp(civ, city, cityRow, legalMask, turn)
 
     override fun actUnit(unit: MapUnit) = forCiv(unit.civ).actUnit(unit)
 }

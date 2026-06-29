@@ -45,10 +45,10 @@ def gradle_selfplay(args: list[str], timeout: float) -> str:
 
 
 def generate(model: str, out_dir: Path, n: int, max_turns: int, threads: int, seed: int,
-             timeout: float, map_size: str = "Tiny") -> int:
+             timeout: float, map_size: str = "Tiny", control_construction: bool = False) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     out = gradle_selfplay(["gen", model, str(out_dir), str(n), str(max_turns), str(threads),
-                           str(seed), map_size], timeout)
+                           str(seed), map_size, str(control_construction).lower()], timeout)
     m = GEN_RE.search(out)
     if not m:
         sys.stderr.write(out[-4000:])
@@ -57,9 +57,9 @@ def generate(model: str, out_dir: Path, n: int, max_turns: int, threads: int, se
 
 
 def evaluate(model: Path, m_games: int, max_turns: int, threads: int, seed: int,
-             timeout: float, map_size: str = "Tiny") -> dict:
+             timeout: float, map_size: str = "Tiny", control_construction: bool = False) -> dict:
     out = gradle_selfplay(["eval", str(model), str(m_games), str(max_turns), str(threads),
-                           str(seed), map_size], timeout)
+                           str(seed), map_size, str(control_construction).lower()], timeout)
     m = EVAL_RE.search(out)
     if not m:
         sys.stderr.write(out[-4000:])
@@ -161,7 +161,8 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             trajectories_or_steps, dims, token_specs, vocab_counts, rung, epochs=args.epochs,
             lr=args.lr, seed=seed, gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
-            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl)
+            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl,
+            construction=(getattr(args, "control_construction", "off") == "on"))   # v7: train the per-city head only when ON
         return net, stats, ("structured", token_specs), optimizer
     raise ValueError(f"unknown variant {variant!r}")
 
@@ -255,6 +256,11 @@ def main(argv=None) -> int:
                          "as the warm-started policy drifts only a few hundred grad-steps over K rounds). "
                          "K=1 ⇒ NO replay (bit-identical to v5: window-gated old_logp recompute, no behavior "
                          "logp). Round 0 (RandomPolicy) is always excluded from the window.")
+    ap.add_argument("--control-construction", choices=["on", "off"], default="off",
+                    help="v7: when 'on', the policy DRIVES each deciding city's production (per-city "
+                         "construction head) in gen+eval AND the trainer sums the construction logp into "
+                         "the joint PPO ratio. 'off' ⇒ construction stays heuristic (the v6 / no-op path). "
+                         "Only the STRUCTURED variant carries the head.")
     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
     args = ap.parse_args(argv)
     if args.variant == "rich-v2":   # alias for the v4 structured encoder
@@ -310,7 +316,8 @@ def main(argv=None) -> int:
         round_dir = out / f"round_{r}"
         gen_model = str(model_path) if model_path is not None else "random"
         n_games = generate(gen_model, round_dir, args.gen_games, args.turn_cap, args.threads,
-                           args.gen_seed + r * 1000, args.gradle_timeout, args.map_size)
+                           args.gen_seed + r * 1000, args.gradle_timeout, args.map_size,
+                           control_construction=(args.control_construction == "on"))
 
         schema = round_dir / "schema.json"
         dims = contract.dims_from_schema(schema)
@@ -377,7 +384,8 @@ def main(argv=None) -> int:
                                ruleset_fingerprint=fp, sample_inputs=sample)
 
         ev = evaluate(model_path, args.eval_games, args.turn_cap, args.threads, args.eval_seed,
-                      args.gradle_timeout, args.map_size)
+                      args.gradle_timeout, args.map_size,
+                      control_construction=(args.control_construction == "on"))
         row = {"round": r, "games": ev["games"], "winrate": ev["winrate"], "pval": ev["pval"],
                "n_steps": stats.get("n", 0), "loss": stats.get("loss", 0.0),
                "value_loss": stats.get("value_loss", 0.0), "entropy": stats.get("entropy", 0.0),

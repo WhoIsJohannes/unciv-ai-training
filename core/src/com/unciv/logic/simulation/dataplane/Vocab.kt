@@ -61,6 +61,21 @@ class Vocab(ruleset: Ruleset) {
         return if (u >= 0) buildingCount + u + 1 else 0
     }
 
+    /**
+     * v7 self-play CONTROL inverse: map a chosen construction action index back to the building/unit id
+     * to APPLY it. Inverts the 0-INDEXED construction-MASK space (the layout of
+     * [LegalActionMasks.constructionMask] and the per-city net logits, width buildingCount+unitCount):
+     * idx in [0, buildingCount) → building#idx; idx in [buildingCount, buildingCount+unitCount) → unit#(idx−buildingCount).
+     * NOTE: this is NOT the inverse of [constructionCode] (which is 1-indexed with 0="none") — using that
+     * here would be off-by-one and silently mislabel buildings vs units. Out of range → null.
+     */
+    fun constructionId(idx: Int): String? = when {
+        idx < 0 -> null
+        idx < buildingCount -> id(BUILDINGS, idx)
+        idx < buildingCount + unitCount -> id(UNITS, idx - buildingCount)
+        else -> null
+    }
+
     val techCount get() = size(TECHS)
     val buildingCount get() = size(BUILDINGS)
     val unitCount get() = size(UNITS)

@@ -3,6 +3,7 @@ package com.unciv.logic.simulation.dataplane
 import com.unciv.UncivGame
 import com.unciv.logic.GameInfo
 import com.unciv.logic.automation.civilization.NextTurnAutomation
+import com.unciv.logic.city.City
 import com.unciv.logic.civilization.Civilization
 import com.unciv.models.ruleset.unique.GameContext
 import com.unciv.utils.Log
@@ -59,7 +60,12 @@ object DataPlaneHooks {
         { civ, turn -> GameContext(civInfo = civ).stateBasedRandom("dataplane-policy-$turn") }
 
     // ---- per-game state: a Featurizer (always, for control masks + emit obs) + an optional recorder ----
-    private class GameState(val featurizer: Featurizer, val vocab: Vocab, val recorder: ShardRecorder?)
+    private class GameState(val featurizer: Featurizer, val vocab: Vocab, val recorder: ShardRecorder?) {
+        /** v7: cityId → the turn at which the policy pre-filled that city's production. Read by
+         *  [constructionControlled] so `ConstructionAutomation.chooseNextConstruction` skips the
+         *  heuristic for exactly the cities the policy drove this turn. */
+        val prefilledConstruction = ConcurrentHashMap<String, Int>()
+    }
     private val games = ConcurrentHashMap<GameInfo, GameState>()
     @Volatile private var installedPolicy: PolicyProvider? = null
 
@@ -99,20 +105,39 @@ object DataPlaneHooks {
     fun controls(civ: Civilization): Boolean =
         installedPolicy != null && civ.isMajorCiv() && !civ.isSpectator() && games.containsKey(civ.gameInfo)
 
+    /** v7 — true iff the policy pre-filled [city]'s production THIS turn (the no-op-safe controlled-civ
+     *  guard `ConstructionAutomation.chooseNextConstruction` uses to skip the heuristic for exactly the
+     *  cities the policy drove). False when construction control is off / the city abstained. */
+    fun constructionControlled(city: City): Boolean =
+        games[city.civ.gameInfo]?.prefilledConstruction?.get(city.id) == city.civ.gameInfo.turns
+
     private fun handleCivTurn(civ: Civilization, state: GameState) {
         val policy = installedPolicy ?: return
         if (!civ.isMajorCiv() || civ.isSpectator()) return
+        val config = state.featurizer.config
         val obs = state.featurizer.observe(civ)
         val turn = civ.gameInfo.turns
-        val (actions, behaviorLogp) = chooseAndApply(civ, policy, state.vocab, obs, turn)
-        state.recorder?.recordStep(civ, obs, actions, behaviorLogp, turn)
+        val d = chooseAndApply(civ, policy, state.vocab, config, state.prefilledConstruction, obs, turn)
+        state.recorder?.recordStep(civ, obs, d.actions, d.behaviorLogp, d.constructionActions, d.constructionLogp, turn)
     }
 
-    /** Choose (and APPLY) the controlled civ-level actions. Returns the per-head action vector AND the
-     *  per-head behavior-policy log-prob, both in [SampleSchema.MASK_HEADS] order; action −1 / logp 0f =
-     *  "no decision this head this turn". v1 controls tech + policy only; greatPerson/diplomaticVote stay
-     *  heuristic (recorded as −1 / 0f). The logp is recorded for v6 off-policy replay (NOT used here). */
-    private fun chooseAndApply(civ: Civilization, policy: PolicyProvider, vocab: Vocab, obs: Observation, turn: Int): Pair<FloatArray, FloatArray> {
+    /** The per-civ-turn decision: fixed civ-head actions + per-head behavior logp ([SampleSchema.MASK_HEADS]
+     *  order), PLUS the v7 per-city construction action / logp aligned to [Featurizer.orderedOwnCities]. */
+    private class CivTurnDecision(
+        val actions: FloatArray, val behaviorLogp: FloatArray,
+        val constructionActions: FloatArray, val constructionLogp: FloatArray,
+    )
+
+    /** Choose (and APPLY) the controlled actions. v1 controls tech + policy (greatPerson/diplomaticVote stay
+     *  heuristic, recorded −1/0f). v7 ADDS per-city construction when [SampleConfig.controlConstruction]: for
+     *  each city that would otherwise choose this turn (idle on a PerpetualConstruction), the policy picks a
+     *  legal construction and we pre-fill `constructionQueue[0]` (the heuristic then skips it). Recorded
+     *  construction action == applied, per city; cities not decided record −1/0f. Logp is recorded for v6
+     *  off-policy replay (summed across heads + cities into the per-step old_logp). */
+    private fun chooseAndApply(
+        civ: Civilization, policy: PolicyProvider, vocab: Vocab, config: SampleConfig,
+        prefilled: ConcurrentHashMap<String, Int>, obs: Observation, turn: Int,
+    ): CivTurnDecision {
         val actions = FloatArray(SampleSchema.MASK_HEADS.size) { -1f }
         val behaviorLogp = FloatArray(SampleSchema.MASK_HEADS.size) { 0f }
 
@@ -134,7 +159,36 @@ object DataPlaneHooks {
                 if (pol != null && civ.policies.isAdoptable(pol)) civ.policies.adopt(pol)
             }
         }
-        return actions to behaviorLogp
+
+        // CONSTRUCTION (v7) — per own city in the SAME orderedOwnCities order as obs `mask_construction`.
+        val cities = Featurizer.orderedOwnCities(civ, config.caps.maxOwnCities)
+        val cActions = FloatArray(cities.size) { -1f }
+        val cLogp = FloatArray(cities.size) { 0f }
+        if (config.controlConstruction) {
+            val constrW = vocab.buildingCount + vocab.unitCount
+            val maskFlat = obs.block("mask_construction")
+            if (maskFlat.size == cities.size * constrW) {  // alignment guard (must always hold)
+                cities.forEachIndexed { i, city ->
+                    // The policy DRIVES each city's production every turn (pre-fills queue[0]). It does NOT
+                    // wait for the city to be idle-on-perpetual: at the onCivTurn hook the heuristic has
+                    // kept every city mid-build, so a perpetual-only gate fires ~never (the lever would be
+                    // inert). Switching is non-destructive — Unciv stores accumulated production per
+                    // construction (`inProgressConstructions`), so the policy can re-pick freely and the
+                    // reward shapes coherent choices. Puppet cities (no player construction control) skip.
+                    if (city.isPuppet) return@forEachIndexed
+                    val row = BooleanArray(constrW) { k -> maskFlat[i * constrW + k] != 0f }
+                    if (row.none { it }) return@forEachIndexed   // no legal construction → heuristic (−1)
+                    val (idx, logp) = policy.chooseConstructionWithLogp(civ, city, i, row, turn)
+                    if (idx < 0) return@forEachIndexed
+                    val name = vocab.constructionId(idx) ?: return@forEachIndexed   // PR4 null-guard
+                    if (!city.cityConstructions.getConstruction(name).isBuildable(city.cityConstructions)) return@forEachIndexed
+                    city.cityConstructions.setCurrentConstruction(name)   // pre-fill queue[0]
+                    prefilled[city.id] = turn                              // controlled-civ guard marker
+                    cActions[i] = idx.toFloat(); cLogp[i] = logp
+                }
+            }
+        }
+        return CivTurnDecision(actions, behaviorLogp, cActions, cLogp)
     }
 
     private fun boolMask(obs: Observation, blockName: String): BooleanArray =
@@ -215,15 +269,22 @@ class ShardRecorder(
     private var layout: List<Observation.Block> = emptyList() // captured at open for terminal zero-fill
 
     /** Emit one non-terminal step for [x] with the already-chosen-and-applied [actions] and the
-     *  per-head behavior log-prob [behaviorLogp] (v6 off-policy replay; same width as actions). */
-    fun recordStep(x: Civilization, obs: Observation, actions: FloatArray, behaviorLogp: FloatArray, turn: Int) {
+     *  per-head behavior log-prob [behaviorLogp] (v6 off-policy replay; same width as actions), PLUS the
+     *  v7 per-city construction action / behavior logp ([constructionActions]/[constructionLogp],
+     *  VARIABLE, one row per own city in `own_cities` order; −1/0f where the city did not decide). */
+    fun recordStep(
+        x: Civilization, obs: Observation, actions: FloatArray, behaviorLogp: FloatArray,
+        constructionActions: FloatArray, constructionLogp: FloatArray, turn: Int,
+    ) {
         val isFirst = seenCivs.add(x.civID)
         val civSlot = gameInfo.civilizations.indexOf(x)
         civSlotById[x.civID] = civSlot
 
         val blocks = obs.blocks +
             Observation.Block("actions", SampleSchema.DT_F32, BlockKind.FIXED, 0, actions) +
-            Observation.Block(SampleSchema.BLOCK_BEHAVIOR_LOGP, SampleSchema.DT_F32, BlockKind.FIXED, 0, behaviorLogp)
+            Observation.Block(SampleSchema.BLOCK_BEHAVIOR_LOGP, SampleSchema.DT_F32, BlockKind.FIXED, 0, behaviorLogp) +
+            Observation.Block(SampleSchema.BLOCK_CONSTRUCTION_ACTION, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionActions) +
+            Observation.Block(SampleSchema.BLOCK_CONSTRUCTION_LOGP, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionLogp)
         if (!opened) {
             layout = blocks
             val header = DataPlaneHooks.buildHeaderJson(gameInfo, fingerprint, gameId, seed, config.caps, blocks, vocab)

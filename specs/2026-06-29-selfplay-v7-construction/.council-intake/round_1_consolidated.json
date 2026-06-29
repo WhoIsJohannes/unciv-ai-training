@@ -1,0 +1,776 @@
+[
+  {
+    "id": "FND-0001",
+    "cluster_key": "86848f86ff7d",
+    "title": "Avoid unnecessary `PolicyProvider` abstraction for construction seam",
+    "severity": "major",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "Design decisions (from the prompt \u2014 marked \"decisive\")",
+    "description": "The brief introduces a new `PolicyProvider.chooseConstructionWithLogp(...)` seam when the existing pattern (`DataPlaneHooks.chooseIndexWithLogp(...)`) already handles head-typed actions without an extra provider layer. Adding a wrapper class/interface that does nothing but delegate to the ONNX policy is unjustified abstraction tax\u2014it increases cognitive overhead, introduces a naming pattern that future devs may cargo-cult, and provides no testability benefit that isn't already achievable via the hooks.",
+    "rationale": "The existing codebase handles tech/policy actions directly from `DataPlaneHooks` with a simple type-string dispatch. A separate provider for construction, with exactly one implementation and no clear test-double need beyond what the ONNX policy already supports, violates YAGNI and adds a layer that every future per-entity head would have to replicate or refactor.",
+    "suggested_addition": "Remove the `PolicyProvider` concept entirely. Add construction handling directly to `DataPlaneHooks.chooseAndApply` following the existing tech/policy pattern\u2014e.g. a private `chooseConstructionWithLogp(\u2026)` method on `DataPlaneHooks` that calls `onnxPolicy.logitsFor(\u2026)`, applies the legal mask, and returns the selected index and logp. Remove the `PolicyProvider` target from the design-decision list.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Seam: `PolicyProvider.chooseConstructionWithLogp(civ, city, cityRow, legalMask, turn)`."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0002",
+    "cluster_key": "e4cbbc20efd8",
+    "title": "Per-city construction logp summing collides with stored per-step old_logp scalar",
+    "severity": "critical",
+    "primary_lens": "structure",
+    "target_file": "decisions.md",
+    "target_section": "Design decisions (E) Train",
+    "description": "Decision E adds \u03a3_cities masked construction logp into the per-step logp, while the existing PPO ratio (train.py:210) is computed from a per-step SUM of head behavior logps stored as old_logp. With a variable city count, the construction contribution to old_logp is itself variable-dimension, but the importance ratio math assumes a fixed-shape scalar per step. The brief never states whether old_logp is re-summed at replay time over the SAME city set that produced it.",
+    "rationale": "If the city count changes between sample-time and replay-time (cities founded/captured/razed across the replay window), the stored old_logp and the recomputed logp sum over mismatched city sets, silently corrupting the importance ratio \u2014 the core PPO correctness invariant. This is a data-model-vs-algorithm conflict that will not surface as a crash, only as broken training.",
+    "suggested_addition": "Add an explicit invariant: 'old_logp at replay time must be re-summed over exactly the city set recorded at sample-time, keyed by the recorded own_cities order. If a city in the recorded set no longer exists at replay, its stored per-city logp is used as-is (frozen), never recomputed.' State whether construction logp is folded into the single stored old_logp scalar or stored as a separate per-city block that is summed at train time \u2014 and which path the replay buffer reads.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "per-step logp += \u03a3_cities masked_logp(construction); shares the per-step GAE advantage; replay old_logp includes construction",
+      "Stored old_logp = per-step SUM of head behavior logps."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0003",
+    "cluster_key": "648f15319fcc",
+    "title": "own_cities ordering is an undocumented cross-system contract spanning 5 components",
+    "severity": "critical",
+    "primary_lens": "structure",
+    "target_file": "discovery-output.md",
+    "target_section": "Prereq self-check",
+    "description": "The per-city head correctness depends on `x.cities.sortedBy { it.id }` (Featurizer.kt:61) being reproduced identically across the Kotlin featurizer, the control loop (ConstructionAutomation), the ONNX per-city output indexing (OnnxPolicy.kt), the recorder's VARIABLE blocks, and the Python dataset loader. This ordering is currently an implicit, repeated literal rather than a single named contract.",
+    "rationale": "A per-entity head with variable count is only correct if every producer and consumer agrees on row\u2194city alignment. Five independent re-implementations of one sort key is a classic source of silent misalignment that no single test catches unless parity is asserted end-to-end across all five.",
+    "suggested_addition": "Elevate own_cities ordering to a named contract in the design: define a single canonical helper (e.g. `ownCityOrder(civ)`) reused by featurizer, control loop, and recorder, and document that ONNX city-axis index i and dataset construction block row i both refer to `ownCityOrder(civ)[i]`. Require the parity test to assert alignment across featurizer\u2194control\u2194dataset, not just per-component legality.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "own_cities order = `x.cities.sortedBy { it.id }` (Featurizer.kt:61) \u2014 per-city loop must reuse exactly.",
+      "per-city decision loop MUST reuse this exact order."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0004",
+    "cluster_key": "5936d7eb5b6c",
+    "title": "Schema version target is inconsistent (4 vs 5) between brief and decisions",
+    "severity": "major",
+    "primary_lens": "structure",
+    "target_file": "discovery-output.md",
+    "target_section": "Prereq self-check",
+    "description": "The discovery self-check describes both schema files at VERSION=4/SCHEMA_VERSION=4 and asserts new VARIABLE blocks 'round-trip free', while decisions.md (D) explicitly states 'SCHEMA 4\u21925'. The brief does not reconcile whether a lockstep version bump is actually required or whether descriptor-generic round-tripping makes the bump cosmetic.",
+    "rationale": "If new modeled blocks round-trip without a version bump, then old readers will silently accept v7 data as v6 \u2014 losing the ability to detect a construction-bearing shard fed to a construction-blind trainer. A version bump exists precisely to prevent that mismatch; treating it as optional undermines the schema-lockstep guarantee the repo relies on.",
+    "suggested_addition": "State definitively: bump both `SampleSchema.VERSION` and `schema.py SCHEMA_VERSION` to 5 in lockstep, and add an assertion that the reader rejects (or explicitly tolerates with a logged warning) version-skew. Clarify that 'round-trips free' refers only to the binary decode path, not to semantic version compatibility.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "new VARIABLE blocks round-trip free",
+      "Record: two VARIABLE blocks (`construction_action`, `construction_logp`) aligned to own_cities; SCHEMA 4\u21925."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0005",
+    "cluster_key": "748a1ecd50fb",
+    "title": "MODELED_HEADS not extended \u2014 construction head has no declared seam in the head registry",
+    "severity": "major",
+    "primary_lens": "structure",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "A \u2014 v6/v5 machinery",
+    "description": "`MODELED_HEADS = listOf(\"tech\",\"policy\")` (SampleSchema.kt:68) and the dataset loader hard-indexes `behavior_logp[0]`(tech)/`[1]`(policy) (dataset.py:189-198). The brief adds a third learned head but does not state how MODELED_HEADS and the fixed-position logp indexing are extended to a variable-count head whose logp lives in a VARIABLE block, not at a fixed scalar index.",
+    "rationale": "The existing head abstraction assumes fixed-count heads addressed by integer position; construction is the first variable-count head. If the head registry isn't explicitly extended to model 'this head's logp is a per-entity block, not behavior_logp[k]', the abstraction leaks and the next per-entity head repeats the ad-hoc wiring.",
+    "suggested_addition": "Add to the design: extend `MODELED_HEADS` to include 'construction' and document that variable-count heads contribute logp via a named VARIABLE block rather than a fixed behavior_logp index. Define the per-head logp contract so future per-entity heads (per-unit, per-tile) follow it.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "`MODELED_HEADS = listOf(\"tech\",\"policy\")` at :68",
+      "actions + `behavior_logp[0]`(tech)/`[1]`(policy) per step"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0006",
+    "cluster_key": "6d6da1185ed3",
+    "title": "No-op equivalence claim (OFF == v6) lacks a defined verification mechanism",
+    "severity": "major",
+    "primary_lens": "structure",
+    "target_file": "decisions.md",
+    "target_section": "Design decisions (F) No-op",
+    "description": "Decision F asserts `--control-construction off` 'reproduces v6 (and v5 at K=1)', and the AC requires no-op green before the Medium run. But the brief does not specify what no-op equivalence is tested against: identical recorded bytes, identical net outputs on the unchanged heads, or merely 'construction blocks absent'.",
+    "rationale": "An L-sized change that touches the recorder, net export, and ONNX output ordering can perturb the existing tech/policy logp serialization (e.g. block ordering, version byte) even when construction is OFF. Without a byte-level or output-level no-op definition, 'no-op green' is unfalsifiable and a regression in the frozen heads ships silently.",
+    "suggested_addition": "Define no-op equivalence precisely: with `--control-construction off`, recorded shard bytes for tech/policy blocks must be byte-identical to a v6 baseline shard on the same seed, AND no construction VARIABLE block is emitted. Add this as an explicit assertion in the parity/no-op test stage, anchored to a captured v6 reference shard.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "No-op: `--control-construction {on,off}`, default ON; OFF reproduces v6 (and v5 at K=1).",
+      "AC ordering: parity + no-op + legality green BEFORE the Medium run."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0007",
+    "cluster_key": "d4025cf1d09b",
+    "title": "No rollback story for schema v5 and mixed replay data",
+    "severity": "critical",
+    "primary_lens": "production-readiness",
+    "target_file": "discovery-output.md",
+    "target_section": "Prereq self-check / Design decisions",
+    "description": "The brief commits to a lockstep schema bump and new VARIABLE blocks, but does not state how v4 shards, v5 shards, old checkpoints, and partially written runs coexist. If the new dataset reader or trainer assumes construction blocks are always present, a failed rollout can strand existing replay data or make rollback unsafe.",
+    "rationale": "At 3am, the fastest recovery path must be disabling the feature or reverting code without corrupting the replay corpus. Schema changes are operationally dangerous unless backward/forward compatibility and partial-write handling are explicit.",
+    "suggested_addition": "Add a compatibility requirement: the v5 reader/trainer must accept v4 samples by treating missing construction_action/construction_logp as OFF/no-op, and v4 code must never be pointed at v5 output directories. Each run directory must include a manifest with schema_version, control_construction flag, model head set, and source commit. Rollback procedure: stop writer, switch --control-construction off or revert to prior checkpoint, resume only from v4-compatible run dirs; never rewrite existing shards in place.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Two schema files lockstep: `SampleSchema.kt:27` (VERSION=4) + `python/unciv_dataplane/schema.py:20` (SCHEMA_VERSION=4); reader is descriptor-generic \u2192 new VARIABLE blocks round-trip free.",
+      "Record: two VARIABLE blocks (`construction_action`, `construction_logp`) aligned to own_cities; SCHEMA 4\u21925."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0008",
+    "cluster_key": "2e4af16c4de1",
+    "title": "Long v7 batch lacks runbook-grade progress and recovery signals",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "discovery-output.md",
+    "target_section": "Experiment design",
+    "description": "The brief says the four-arm CPU batch is resumable and should be driven to completion, but does not define heartbeat logs, per-round checkpoints, failure classification, or the exact resume command/state file. A multi-hour sequential experiment will fail eventually; without operator-facing state, recovery depends on reading code and guessing which artifacts are safe.",
+    "rationale": "For production-like training pipelines, resumable is not enough; on-call needs to know whether a job is alive, stuck, out of disk, producing invalid data, or safe to restart. Otherwise failures become manual archaeology.",
+    "suggested_addition": "Add an experiment operations section: every arm/round writes a JSONL event log with arm, round, phase, seed, schema_version, checkpoint path, shard count, games completed, elapsed time, samples/sec, and last successful checkpoint. Define the canonical resume command and idempotency guarantee. Include a minimal runbook: how to identify the failed arm, how to resume from the last good round, when to delete partial artifacts, and where final 200-game eval results are written.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Experiment execution \u2192 Build \u2192 validate \u2192 run to completion: get parity/no-op/legality green, then launch the resumable run_v7 batch and drive it to completion",
+      "4 arms, sequential (CPU): `small-OFF`, `small-ON`, `medium-OFF`, `medium-ON`"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0009",
+    "cluster_key": "72767daa337a",
+    "title": "No safe fallback when construction ONNX output is missing or bad",
+    "severity": "critical",
+    "primary_lens": "production-readiness",
+    "target_file": "discovery-output.md",
+    "target_section": "Prereq self-check / Design decisions",
+    "description": "The brief adds a new ONNX output and makes construction control default ON, but does not define runtime behavior if the model artifact lacks `construction_logits`, returns NaNs, has the wrong city dimension, or produces no legal action after masking. That creates a single model-interface failure that can break civ turns instead of degrading to the existing heuristic.",
+    "rationale": "A new model head on a user-facing/game-engine path needs fail-closed behavior. The operationally acceptable failure mode is 'disable construction control and continue turns,' not crash the automation loop or poison recorded behavior_logp.",
+    "suggested_addition": "Add a runtime fallback contract: if `--control-construction=on` but ONNX output validation fails, logits contain non-finite values, dimensions do not match `own_cities \u00d7 constrW`, or a legal mask is empty, log a structured warning with gameId/civId/turn/cityId/reason, skip learned construction for that city/civ, and fall back to `ConstructionAutomation.chooseNextConstruction()`. Emit counters for construction_control_fallback_total by reason and fail CI if fallback occurs in legality/parity tests.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "No turn-start queue clobber \u2192 pre-fill is safe.",
+      "No-op: `--control-construction {on,off}`, default ON; OFF reproduces v6"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0010",
+    "cluster_key": "2d33c0d02003",
+    "title": "Variable city head has no capacity or resource budget",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "discovery-output.md",
+    "target_section": "Experiment design / Prereq self-check",
+    "description": "The new head scales with number of owned cities times construction vocabulary width, but the brief gives no upper bounds, memory budget, shard-size estimate, or throughput guardrail beyond the domain-preset hint. Medium-map experiments may pass while larger games or replay windows silently blow up CPU, RAM, ONNX latency, or disk.",
+    "rationale": "Variable-count outputs are classic production footguns: they pass correctness tests and then page you under realistic cardinality. The design needs explicit caps and measurements before the implementation path is locked.",
+    "suggested_addition": "Add capacity criteria: record max/avg own_cities, constrW, logits tensor size, shard bytes/sample, train samples/sec, and ONNX inference latency with construction OFF vs ON. Set acceptance thresholds, e.g. construction ON must retain at least 70% of v6 throughput, peak trainer memory must stay under a named limit, and city counts above a documented cap must either be supported by dynamic axes tests or fail with a clear diagnostic before training starts.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Net: per-city construction head on UN-pooled own_cities token embeddings \u2192 logits [B,Ncities,constrW].",
+      "Domain preset: data-pipeline (schema round-trip, dataset/replay training pipeline, throughput criterion)."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0011",
+    "cluster_key": "5880d7fb1048",
+    "title": "Observability is test-focused, not incident-focused",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "discovery-output.md",
+    "target_section": "Experiment design",
+    "description": "The acceptance ordering requires parity/no-op/legality tests before the Medium run, but the brief does not commit to structured runtime logs or metrics for the new control seam. If win rate regresses or legality fails mid-run, there is no specified signal tying the failure to city ordering, masks, chosen construction IDs, or summed logp.",
+    "rationale": "Tests catch known cases; production observability explains unknown failures. For a cross Kotlin/Python data pipeline, logs need enough context to diagnose without stepping through both runtimes.",
+    "suggested_addition": "Add structured observability for construction control: per sampled/debug turn log gameId, civId, turn, cityId, cityRow, chosen_construction_idx/name, legal_count, behavior_logp, fallback_reason, and schema_version. Add aggregate counters/histograms for illegal_mask_total, construction_choice_total, nonfinite_logp_total, city_order_mismatch_total, and samples_with_construction_blocks_total. The run summary should include these metrics for each arm before reporting win rates.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "AC ordering: parity + no-op + legality green BEFORE the Medium run.",
+      "Train: per-step logp += \u03a3_cities masked_logp(construction); shares the per-step GAE advantage; replay old_logp includes construction."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0012",
+    "cluster_key": "3396c8970ee1",
+    "title": "Ambiguous Ship Decision on Negative Experiment Results",
+    "severity": "critical",
+    "primary_lens": "outcome-truth",
+    "target_file": "Discovery Output",
+    "target_section": "Experiment design (locked)",
+    "description": "The brief requires reporting if construction-ON beats construction-OFF (p<0.05), but fails to define the merge/ship criteria if the experiment fails this check. It is unclear if a negative result means we discard the feature, or merge the infrastructure with the default set to OFF for future iteration.",
+    "rationale": "Metrics must drive decisions, not just produce reports. If we don't define the 'no-go' or 'merge-but-disable' criteria upfront, the team will be paralyzed or tempted to p-hack if the multi-hour training run yields a 49% win rate.",
+    "suggested_addition": "Add explicit ship criteria: 'If ON does not beat OFF (p<0.05), the PR will still be merged to establish the per-city infrastructure, but the `--control-construction` default will be set to OFF. If ON beats OFF, default becomes ON.'",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Acceptance #3 framing: construction-ON beats construction-OFF (p<0.05) within each rung, AND report win-rate vs the 50% break-even",
+      "report 200-game OFF-vs-ON win-rates with z/p vs the 50% break-even when done"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0013",
+    "cluster_key": "79cb60c3a33f",
+    "title": "Unbounded Compute Time Assumption for Launch Blocker",
+    "severity": "major",
+    "primary_lens": "outcome-truth",
+    "target_file": "decisions.md",
+    "target_section": "D-disc-2: The Medium experiment is a long, resumable background batch",
+    "description": "The acceptance criteria block shipping on a sequential, 4-arm CPU training run described vaguely as 'multi-hour compute'. There is no timebox, fallback plan, or early-stopping criteria if the training takes days instead of hours.",
+    "rationale": "Unbounded compute dependencies on the critical path kill feature momentum. We need a strict time budget or a fast-fail mechanism so the engineer isn't blocked waiting 48 hours for a test to finish before they can ship.",
+    "suggested_addition": "Define a timebox for the experiment (e.g., 'Max 12 hours total compute'). Add an early-stopping clause: 'If the small-ON arm shows catastrophic failure (<10% win rate) after 4 rounds, abort the Medium run and fail the experiment early.'",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "4 arms run sequentially (CPU oversubscription if parallel)",
+      "This is multi-hour compute.",
+      "parity + no-op + legality green BEFORE the Medium run."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0014",
+    "cluster_key": "2e723a6aaa1a",
+    "title": "Missing Explicit 'Non-Goals' / Scope Exclusions",
+    "severity": "major",
+    "primary_lens": "outcome-truth",
+    "target_file": "Discovery Output",
+    "target_section": "Context category & docs",
+    "description": "The brief relies on 'the prompt's FROZEN/NON-GOALS' as authoritative constraints, but fails to actually list them in the discovery output or decisions document. The 'What this is NOT' section is effectively empty in the shared state.",
+    "rationale": "A brief without explicit, documented exclusions is an invitation for scope creep. If the specific non-goals (e.g., worker automation, gold purchasing, global tech overrides) aren't written in the plan, engineers will accidentally build them or over-complicate the design to accommodate them.",
+    "suggested_addition": "Extract the exact FROZEN/NON-GOALS from the prompt and list them explicitly as bullet points in a 'Non-Goals (Out of Scope)' section in the Discovery Output.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Authoritative constraints = the prompt's FROZEN/NON-GOALS + ACCEPTANCE CRITERIA + the v5/v6 code patterns."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0015",
+    "cluster_key": "cac6e77a58f5",
+    "title": "Unverified Assumption on Dynamic Entity Counts (0-city state)",
+    "severity": "major",
+    "primary_lens": "outcome-truth",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "C \u2014 per-city construction mask",
+    "description": "The brief introduces a 'variable-count' per-city lever based on `ownCityList.size`, but doesn't explicitly address the 0-city edge case (e.g., a civ loses its last city but hasn't triggered game-over yet, or a 1-turn delay in state updates).",
+    "rationale": "The riskiest part of moving from global to per-entity control is handling empty sets. If the pipeline assumes count > 0 and crashes on a zero-dimension array, the entire multi-hour training loop will die unpredictably mid-run.",
+    "suggested_addition": "Add a constraint/test requirement: 'Must explicitly handle and test the 0-city edge case (ownCityList.size == 0) to ensure the pipeline does not crash and correctly outputs empty variable blocks.'",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "The learned policy gains its first high-leverage, variable-count, per-city lever",
+      "construction = FloatArray(ownCityList.size * constrW)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0016",
+    "cluster_key": "619c1d3ec123",
+    "title": "Parity/no-op/legality gates are named but not defined",
+    "severity": "critical",
+    "primary_lens": "testable-dod",
+    "target_file": "discovery-output.md",
+    "target_section": "Experiment design / Acceptance #3 framing",
+    "description": "The brief requires parity, no-op, and legality to be green before the Medium run, but it does not define the exact pass/fail assertions, fixtures, tolerances, or required test names. From this document alone, QA cannot derive Given/When/Then criteria for the P0 construction-control capability.",
+    "rationale": "These are correctness gates for a schema-changing RL control head; if they remain shorthand, different implementers can satisfy them with different coverage. A green build could still have city/action misalignment, incorrect logp summing, or OFF-mode drift from v6.",
+    "suggested_addition": "Add an explicit acceptance-gate section:\n- Parity: for a fixed saved game with N owned cities, construction masks emitted by Kotlin featurization must match `LegalActionMasks.constructionMask(city,vocab)` for every city in `x.cities.sortedBy { it.id }`.\n- No-op/OFF: with `--control-construction off`, emitted schema/action/logp outputs and gameplay choices must match v6 tech+policy behavior, with no construction variable blocks recorded.\n- Legality: every selected construction action must be within the per-city legal mask and map back through `Vocab.constructionId(idx)` to the same building/unit name applied to `constructionQueue[0]`.\n- Logp: recorded per-step behavior logp must equal tech logp + policy logp + sum of per-city construction logps when ON, within a stated float tolerance.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "AC ordering: parity + no-op + legality green BEFORE the Medium run.",
+      "Acceptance #3 framing: construction-ON beats construction-OFF (p<0.05) within each rung..."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0017",
+    "cluster_key": "12d6d96da9f7",
+    "title": "Experiment success criterion is statistically underspecified",
+    "severity": "major",
+    "primary_lens": "testable-dod",
+    "target_file": "discovery-output.md",
+    "target_section": "Experiment design (locked)",
+    "description": "The brief states that construction-ON must beat construction-OFF with p<0.05, but it does not specify the statistical test, one-sided vs two-sided hypothesis, treatment of draws/timeouts/crashes, or whether failed games are rerun or counted. It also asks to report against 50% break-even without defining how ties affect the denominator.",
+    "rationale": "QA cannot verify the experiment result reproducibly unless the scoring rule is fixed before execution. Ambiguity here can turn an inconclusive run into a claimed pass by changing draw handling or test direction after seeing results.",
+    "suggested_addition": "Define the experiment assertion explicitly: use a preselected two-proportion or binomial test, state one-sided/two-sided alpha=0.05, define win/loss/draw handling, require exactly 200 completed evaluable games per rung comparison, and specify that crashes/timeouts count as failures unless a documented infrastructure retry policy applies. Include the exact command/seed set used for the 200-game ceiling eval.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "report 200-game OFF-vs-ON win-rates with z/p vs the 50% break-even when done",
+      "construction-ON beats construction-OFF (p<0.05) within each rung"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0018",
+    "cluster_key": "ad016568f2e8",
+    "title": "Throughput criterion has no measurable test protocol",
+    "severity": "major",
+    "primary_lens": "testable-dod",
+    "target_file": "discovery-output.md",
+    "target_section": "Context category & docs",
+    "description": "The brief references a throughput criterion of at least 70%, but it does not define the metric, baseline, hardware assumptions, warmup period, or acceptable variance. QA cannot write a performance test from 'throughput \u226570%' without knowing whether this means games/hour, samples/sec, training steps/sec, or wall-clock completion time.",
+    "rationale": "The new variable-count construction head can materially affect Kotlin inference, ONNX export, dataset size, and PPO training speed. Without a fixed benchmark, performance regressions will be argued subjectively after implementation.",
+    "suggested_addition": "Add a performance acceptance criterion: `With construction ON, end-to-end selfplay throughput must be >=70% of construction OFF on the same machine/config, measured as completed generated games per wall-clock hour over rounds X-Y after warmup, using structured/Medium, replay-window 4, micro-batch-steps 256. Report OFF baseline, ON result, ratio, hardware, commit, and log path.` If training throughput is also required, define a separate samples/sec or optimizer-steps/sec metric.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Domain preset: data-pipeline (schema round-trip, dataset/replay training pipeline, throughput criterion).",
+      "cost_efficiency (throughput \u226570%)"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0019",
+    "cluster_key": "4612a99a350d",
+    "title": "Variable city-count edge cases are not specified",
+    "severity": "critical",
+    "primary_lens": "testable-dod",
+    "target_file": "discovery-output.md",
+    "target_section": "Prereq self-check / Design decisions",
+    "description": "The brief specifies city ordering and the per-city construction seam, but it does not define expected behavior for zero owned cities, city capture/destruction between observation and application, empty legal masks, queue already populated, or invalid construction-id reverse mappings. These are core edge cases for the first variable-count per-entity head.",
+    "rationale": "Variable entity control is where off-by-one and stale-index bugs hide. If edge behavior is not fixed before planning, QA cannot distinguish an implementation defect from an undefined game-state case.",
+    "suggested_addition": "Add edge-case requirements:\n- If a civ has zero owned cities, emit zero-length construction action/logp blocks and do not fail training or ONNX inference.\n- If a city's legal mask has no valid construction actions, skip applying construction for that city and record a sentinel/no-action value, or fail fast; choose one.\n- If a city is captured/destroyed before apply, skip it and log a deterministic warning, or re-resolve by city id; choose one.\n- If `constructionQueue[0]` is already non-perpetual, construction control must not overwrite it unless the design explicitly says otherwise.\n- `Vocab.constructionId(idx)` must fail deterministically for out-of-range indices.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "own_cities order = `x.cities.sortedBy { it.id }` ... per-city loop must reuse exactly.",
+      "Control: pre-fill each city's `constructionQueue[0]` at the civ-turn hook, after tech/policy."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0020",
+    "cluster_key": "a6783bceecc0",
+    "title": "No committed test fixtures for Kotlin/Python/ONNX round-trip",
+    "severity": "major",
+    "primary_lens": "testable-dod",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "Tests to extend",
+    "description": "The scan lists tests to extend, but the brief does not commit to concrete fixtures or mockable integration boundaries for the cross-system path: Kotlin featurizer/schema, Python dataset/training, ONNX export, and desktop policy inference. QA would have to invent saved games, shards, and deterministic logits after implementation starts.",
+    "rationale": "This feature is schema-lockstep and integration-heavy; lack of shared golden data makes regressions hard to localize. Deterministic fixtures are required to verify that variable construction blocks survive round-trip and stay aligned to city rows across languages.",
+    "suggested_addition": "Add required test assets: a fixed saved game with at least 0, 1, and multiple owned cities; a golden schema-v5 shard containing construction_action and construction_logp variable blocks; a mock/fake policy provider with deterministic logits for each city; and an exported minimal ONNX fixture or stubbed ONNX runtime path. State that tests must run without launching the long Medium experiment.",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "cross-cutting: Kotlin engine + Python training, schema lockstep bump, new net head, new per-entity control seam",
+      "Tests to extend"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0021",
+    "cluster_key": "51d417af636a",
+    "title": "No integrity verification for ONNX model files",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "Security considerations (missing)",
+    "description": "The design loads ONNX model files from local storage during training/eval, but there is no hash verification or signing. An attacker who can replace the model file (e.g., via dependency compromise or local attack) could swap in a malicious ONNX model that exploits vulnerabilities in the ONNX runtime, leading to arbitrary code execution in both Python and Kotlin host processes.",
+    "rationale": "Even in a local self-play loop, the ONNX runtime is a complex native library; known CVEs exist. Without integrity checks, a compromised development environment could escalate to full host compromise.",
+    "suggested_addition": "Add a section on model security: store a cryptographic hash (SHA-256) of the trusted ONNX model alongside the model file, verify it before loading in both Python (export_onnx.py/load path) and Kotlin (OnnxPolicy.kt). Consider using ORT's session options to limit operators to those actually used.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "export_onnx.py",
+      "OnnxPolicy.kt"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0022",
+    "cluster_key": "e024a99f5d6e",
+    "title": "Replay file parsing trusts attacker-controlled size fields",
+    "severity": "minor",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "Data format (schema.py/reader.py)",
+    "description": "The replay reader (`reader.py:_decode_blocks`) loads new VARIABLE blocks with a 16-bit count (`<H`) then reads count * perItem items. There is no validation that the total block size aligns with the stated count, nor an upper bound on count. A maliciously crafted replay file (e.g., from a modded game client) could cause memory exhaustion or a crash in the training process, disrupting the self-play loop.",
+    "rationale": "If the training pipeline ever processes replay data from untrusted sources (e.g., community-contributed replays), a denial-of-service or allocation-bomb attack could halt experiments. Even in self-play, a buggy game state could emit a corrupted block that breaks training.",
+    "suggested_addition": "Add input validation: (1) verify that `count * perItem` does not exceed remaining bytes in the block; (2) enforce a reasonable maximum count per block (e.g., 10000) to prevent runaway allocation; (3) consider a block-level checksum to detect corruption early.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "schema.py:20,SCHEMA_VERSION=4",
+      "reader.py:105-140 _decode_blocks()",
+      "two new VARIABLE f32 blocks round-trip free"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0023",
+    "cluster_key": "e0a373b42c93",
+    "title": "Training data poisoning via unvalidated replay data",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "Experiment design / replay usage",
+    "description": "The training loop consumes replay data generated by the self-play game engine. If an attacker can influence the game state (e.g., via a malicious mod or corrupted save file), they could inject crafted behavior logp values or per-city production actions that bias the RL policy toward an attacker-chosen suboptimal behavior. There is no data provenance check, anomaly detection, or integrity verification on replay files.",
+    "rationale": "In an RL pipeline that iterates on its own data, a one-time data poisoning attack can cascade across training rounds and permanently compromise the learned policy. This is analogous to federated learning poisoning, but even in a single-machine loop, a supply chain attack that replaces the replay files mid-loop could steer the model.",
+    "suggested_addition": "Document a threat model for replay integrity. Implement basic anomaly detection: clip logps to a reasonable range, verify that action indices are within vocabulary bounds, and optionally sign replay shards with a session key to detect tampering if the pipeline is ever extended to distributed training.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "per-step logp += \u03a3_cities masked_logp(construction); shares the per-step GAE advantage",
+      "replay old_logp includes construction"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0024",
+    "cluster_key": "1139fd806ea2",
+    "title": "Prevent O(N) ONNX Inference Scaling per Turn",
+    "severity": "critical",
+    "primary_lens": "inference-cost",
+    "target_file": "decisions.md",
+    "target_section": "Design decisions (from the prompt)",
+    "description": "The design introduces a per-city control seam (`chooseConstructionWithLogp(civ, city...)`) while the ONNX model outputs all city logits at once (`[B, Ncities, constrW]`). The brief does not explicitly mandate that the per-city loop must reuse a single ONNX invocation.",
+    "rationale": "If the per-city loop triggers a full ONNX forward pass for each city, inference compute costs will multiply by the number of cities (easily 5-10x), destroying the >70% throughput efficiency goal and massively inflating CPU compute time for the 200-game eval.",
+    "suggested_addition": "Add a strict constraint to Decision B: `PolicyProvider.chooseConstructionWithLogp` MUST read from the already-memoized `logitsFor(gameId, civID, turn)` output. The ONNX forward pass must remain O(1) per civ-turn, extracting the specific `cityRow` from the cached `[B, Ncities, constrW]` tensor rather than re-evaluating the network.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Seam: PolicyProvider.chooseConstructionWithLogp(civ, city, cityRow, legalMask, turn).",
+      "Net: per-city construction head on UN-pooled own_cities token embeddings \u2192 logits [B,Ncities,constrW]."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0025",
+    "cluster_key": "cee0a308353d",
+    "title": "Replay Buffer Memory/Storage Scaling with City Count",
+    "severity": "major",
+    "primary_lens": "inference-cost",
+    "target_file": "decisions.md",
+    "target_section": "Design decisions (from the prompt)",
+    "description": "Adding `construction_action` and `construction_logp` as VARIABLE blocks aligned to `own_cities` means the replay buffer size now scales multiplicatively with the number of cities per turn.",
+    "rationale": "Unbounded or dynamically scaling per-step data can lead to out-of-memory (OOM) crashes or massive disk I/O spikes during the `--replay-window 4` training, requiring expensive instance up-sizing (vertical scaling) to accommodate the new memory baseline.",
+    "suggested_addition": "Add to Decision D: Calculate the expected memory footprint increase for the replay buffer (`avg_cities * 2 * 4 bytes * steps`). Verify that the existing memory limits can absorb this O(cities) scaling without requiring an instance RAM upgrade, or implement a hard cap/padding on `Ncities` recorded per step.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Record: two VARIABLE blocks (construction_action, construction_logp) aligned to own_cities; SCHEMA 4\u21925.",
+      "Train: per-step logp += \u03a3_cities masked_logp(construction)... replay old_logp includes construction."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0026",
+    "cluster_key": "10760b2cabe3",
+    "title": "ONNX Dynamic City Axis Re-optimization Overhead",
+    "severity": "major",
+    "primary_lens": "inference-cost",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "E \u2014 net + python",
+    "description": "The ONNX export relies on a \"dynamic city axis\". In many ONNX runtimes, frequently changing dynamic axis dimensions (as cities are founded or captured) defeats graph caching and forces expensive runtime memory re-allocations.",
+    "rationale": "Compute cost per unit (inference latency) will degrade unpredictably if the execution provider has to re-optimize the graph every time `Ncities` changes, leading to wasted CPU cycles and lower throughput.",
+    "suggested_addition": "Evaluate padding `Ncities` to a fixed maximum (e.g., 16 or 32) during ONNX export and inference. This allows the ONNX runtime to reuse optimized execution graphs and pre-allocated memory, masking out the unused city slots to maintain predictable inference costs.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Dynamic batch axis (:83 blind, :135-143 rich). \u2190 add construction_logits output + dynamic city axis."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0027",
+    "cluster_key": "2b7e35031e12",
+    "title": "Per-city logp aggregation conflates variable-count cities \u2014 GAE advantage scaling is undefined",
+    "severity": "critical",
+    "primary_lens": "ml-correctness",
+    "target_file": "decisions.md",
+    "target_section": "Design decisions (from the prompt) \u2014 E) Train",
+    "description": "Decision E sums masked construction logp across all cities into the per-step logp that shares the single per-step GAE advantage. The number of cities varies per step and grows over a game, so the construction term's contribution to the policy-gradient ratio scales with city count while the shared scalar advantage does not.",
+    "rationale": "A civ with 8 cities contributes ~8x the construction logp magnitude of a 2-city civ for the same advantage signal, systematically biasing the importance ratio and gradient toward high-city-count states \u2014 this is a silent ML-correctness bug that 'tests green' but trains the wrong objective.",
+    "suggested_addition": "Specify in the plan whether construction logp is summed or mean-pooled across cities, and justify against the PPO ratio math: a per-step SUM over a variable city count interacts with the single shared GAE advantage and clamped logratio (train.py:210). State explicitly how the per-city construction action is treated as one joint action vs N independent actions for the advantage assignment.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Train: per-step logp += \u03a3_cities masked_logp(construction); shares the per-step GAE advantage; replay old_logp includes construction.",
+      "Stored old_logp = per-step SUM of head behavior logps."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0028",
+    "cluster_key": "99762e07ba17",
+    "title": "Replay old_logp recomputation over construction breaks PPO off-policy correctness when city count changes",
+    "severity": "critical",
+    "primary_lens": "ml-correctness",
+    "target_file": "decisions.md",
+    "target_section": "Design decisions \u2014 E) Train + replay-window 4",
+    "description": "With --replay-window 4, stored old_logp must include the construction sum captured at behavior time, but the net re-evaluates logp on the same recorded own_cities. The brief does not state that the city set (and its sorted-by-id order) is frozen in the recorded sample so old_logp and new logp align city-for-city across the 4-round replay.",
+    "rationale": "PPO's importance ratio is only valid if old_logp and the recomputed logp refer to the same action decomposition; if replayed samples re-derive cities from a different snapshot or re-sort differently, the ratio silently corrupts and the whole construction-ON arm trains on invalid gradients.",
+    "suggested_addition": "Add an explicit invariant: the recorded construction VARIABLE blocks are indexed by the exact own_cities order (Featurizer.kt:61 sortedBy{it.id}) captured at behavior time, and replay recomputes per-city logp against that stored ordering \u2014 never against a live re-featurization. Add a replay round-trip test asserting old_logp == recomputed logp for an unchanged sample (ratio==1).",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "replay old_logp includes construction",
+      "own_cities order (Featurizer.kt:61): val ownCityList = x.cities.sortedBy { it.id } \u2190 per-city decision loop MUST reuse this exact order."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0029",
+    "cluster_key": "4e07d1ba3bc1",
+    "title": "No-op claim 'OFF reproduces v6' is unverified once schema bumps 4\u21925 and a new head is wired",
+    "severity": "major",
+    "primary_lens": "ml-correctness",
+    "target_file": "decisions.md",
+    "target_section": "F) No-op + Acceptance #3",
+    "description": "The acceptance framing requires construction-ON to beat construction-OFF within each rung, treating OFF as a clean v6 reproduction. But OFF still adds the construction head to the net graph, bumps the schema, and changes the recorded sample layout. The brief does not require a bit-exact or win-rate-exact equivalence check that OFF == v6 before attributing the ON-vs-OFF delta to construction.",
+    "rationale": "If the OFF arm silently diverges from v6 (e.g. head params perturb shared trunk init, or schema-5 records extra zero blocks that shift RNG/optimizer state), the ON-vs-OFF comparison no longer isolates construction \u2014 the headline business result (does the lever help?) becomes uninterpretable.",
+    "suggested_addition": "Add an acceptance check that construction-OFF is behaviorally identical to v6: either OFF skips constructing the head entirely (no param init, no schema-5 blocks emitted) OR demonstrate determinism parity (same seed \u2192 same trajectory) between OFF and a v6 run. State which guarantee the design provides.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "No-op: --control-construction {on,off}, default ON; OFF reproduces v6 (and v5 at K=1).",
+      "construction-ON beats construction-OFF (p<0.05) within each rung"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0030",
+    "cluster_key": "1e256b5d9bd6",
+    "title": "PerpetualConstruction guard means controlled cities may never be re-decided \u2014 domain meaning of the lever is narrowed",
+    "severity": "major",
+    "primary_lens": "ml-correctness",
+    "target_file": "codebase-scan-light.md",
+    "target_section": "D \u2014 heuristic to override",
+    "description": "ConstructionAutomation.chooseNextConstruction has an early guard 'if (getCurrentConstruction() !is PerpetualConstruction) return', and pre-fill writes queue[0]. This means the policy only gets to choose when a city is otherwise idle (building gold/science perpetually); a city mid-building keeps its existing item. The brief does not state whether this is the intended decision frequency for the 'first per-city lever'.",
+    "rationale": "The business claim is a 'high-leverage per-city production lever,' but if the policy only acts on idle cities the effective control surface is far narrower than implied \u2014 the learned signal and the win-rate delta will reflect that, and the team should decide deliberately rather than inherit the guard accidentally.",
+    "suggested_addition": "Document the decision cadence explicitly: does the policy choose construction (a) only when current is PerpetualConstruction (idle), (b) every turn (overriding in-progress builds), or (c) only when the queue is empty? State the chosen semantics and why, since it determines what 'production control' actually means and how often the construction logp even fires.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "early guard if (getCurrentConstruction() !is PerpetualConstruction) return; ... \u2190 add controlled-civ + pre-filled guard here.",
+      "First PER-ENTITY control head \u2014 per-city PRODUCTION (construction). ... high-leverage, variable-count, per-city lever"
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  },
+  {
+    "id": "FND-0031",
+    "cluster_key": "75c417b50b3b",
+    "title": "Zero-city / queue-already-filled steps need defined behavior for construction logp",
+    "severity": "major",
+    "primary_lens": "ml-correctness",
+    "target_file": "decisions.md",
+    "target_section": "E) Train / D) Record",
+    "description": "A civ can have cities where construction is not decided this turn (queue pre-filled by a prior turn, or city has zero legal constructions), and early-game a civ may briefly have effectively no decidable cities. The brief does not define what construction_action/logp records in those cases, nor how the train-side sum handles steps with zero contributing cities.",
+    "rationale": "If a no-decision city records a spurious logp (or is omitted inconsistently between record-time and replay-time), the per-step sum and the old_logp/new_logp alignment break \u2014 same off-policy corruption as the variable-count concern but triggered by the empty/skip case, which is the most common edge in practice.",
+    "suggested_addition": "Define the recorded value for cities not decided this step (e.g. logp contribution = 0, action = sentinel, mask all-false) and confirm the train-side sum treats them as identity (zero logp, zero gradient). Add a test for a step with zero decidable cities.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "supporting_lenses": [],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "two VARIABLE blocks (construction_action, construction_logp) aligned to own_cities",
+      "No turn-start queue clobber \u2192 pre-fill is safe."
+    ],
+    "first_seen_round": 1,
+    "status": "open"
+  }
+]

@@ -24,6 +24,8 @@ CONTRACT_VERSION_STRUCTURED = 3
 INPUT_NAME = "obs"                 # contract v1 single input
 OUTPUT_TECH = "tech_logits"
 OUTPUT_POLICY = "policy_logits"
+# v7: per-city construction head output [batch, n_own_cities, constr_w] — only on the STRUCTURED export.
+OUTPUT_CONSTRUCTION = "construction_logits"
 MODELED_HEADS = ["tech", "policy"]
 
 # Contract v2 named multi-tensor inputs. Token sets each pair with a "<name>_mask" presence mask.
@@ -56,6 +58,7 @@ META_CONTRACT_VERSION = "contract_version"
 META_INPUT_WIDTH = "input_width"
 META_TECH_WIDTH = "tech_width"
 META_POLICY_WIDTH = "policy_width"
+META_CONSTRUCTION_WIDTH = "construction_width"   # v7: per-city head width (buildings+units) for the JVM dim cross-check
 META_INPUT_NAMES = "input_names"   # comma-joined ordered tensor names (contract v2)
 
 # Learner identity (the pinned nation Constants.simulationCiv1). The trainer filters shards to this

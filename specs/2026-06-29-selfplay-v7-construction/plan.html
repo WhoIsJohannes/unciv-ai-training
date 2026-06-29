@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-jE+yTHdCUhW8LHfIJj4Z9HG+RahbFqx3bDYZVH7N1hU='; img-src data:">
+<title>Plan review — selfplay-v7-construction (v7: per-city PRODUCTION control head)</title>
+<style>
+:root{--bg:#f5f6f8;--panel:#fff;--panel2:#f1f3f6;--ink:#1a1f27;--muted:#5b626e;--line:#e2e6ec;
+--accent:#1c5fd6;--mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+--h:#cf222e;--m:#8a5a00;--l:#1f7a37;--new:#1f883d;--edit:#9a6700;--del:#cf222e;--human:#1c5fd6;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:980px;margin:0 auto;padding:20px 20px 80px}
+.wrap.compact{padding:14px 16px 60px}
+.compact .panel{padding:10px 12px;margin:0 0 9px}
+.mono{font-family:var(--mono)}
+code{font-family:var(--mono);font-size:12.5px;background:var(--panel2);padding:1px 4px;border-radius:3px}
+.skip{position:absolute;left:-999px;top:0;background:var(--accent);color:#fff;padding:8px 12px;border-radius:0 0 6px 0;z-index:10}
+.skip:focus{left:0}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:14px 16px;margin:0 0 14px}
+h1{font:600 19px var(--mono);margin:0 0 2px}
+h2{font:700 12px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 8px}
+.lead{color:var(--muted);font-size:13px;margin:0 0 12px}
+.kv{color:var(--muted);font-size:12.5px}
+.strip{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:0 0 14px;padding:8px 10px;background:var(--panel);border:1px solid var(--line);border-radius:7px}
+.pill{font:600 11px var(--mono);padding:2px 9px;border-radius:4px;border:1px solid var(--line);color:var(--muted)}
+.pill.ok{color:var(--l);border-color:#bfe2c8}.pill.warn{color:var(--m);border-color:#ead9a6}
+table{width:100%;border-collapse:collapse;font-size:13px}
+caption{text-align:left;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;padding:0 0 6px}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+details{border:1px solid var(--line);border-radius:7px;margin:0 0 9px;padding:0 14px;background:var(--panel)}
+summary{cursor:pointer;padding:10px 0;font-weight:600;color:var(--muted)}summary::marker{color:var(--accent)}
+details[open] summary{color:var(--ink)}details[open]{padding-bottom:12px}
+pre{white-space:pre-wrap;word-break:break-word;font-size:12px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:10px;overflow-x:auto}
+.figure{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:10px;overflow-x:auto;margin:8px 0 0}
+figcaption.diag-cap{color:var(--muted);font-size:11.5px;margin-top:6px;text-align:center}
+.diag-note{color:var(--del);font-weight:600;font-size:13px;margin:6px 2px}
+.toolbar{display:flex;justify-content:flex-end;margin:10px 0 8px}
+button.btn{font:600 11px var(--mono);background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:6px 11px;cursor:pointer;color:var(--accent)}
+.pr-nonce-p{border:1.5px solid var(--accent)}
+.pr-nonce{font:700 22px var(--mono);color:var(--accent);user-select:all;background:var(--panel2);border:1px dashed var(--accent);border-radius:5px;padding:9px 15px;display:inline-block}
+.mc{display:inline-block;font:700 10px var(--mono);padding:1px 6px;border-radius:3px}
+.mc.H{color:var(--h)}.mc.M{color:var(--m)}.mc.L{color:var(--l)}
+.b-new{color:var(--new)}.b-edit{color:var(--edit)}
+.substance{border:1.5px solid var(--accent)}
+.substance>h2{color:var(--accent)}
+.scrutinize{border-left:3px solid var(--m);background:#fffaf0}
+.pr-banner{border:1.5px solid var(--del);background:#fdeff0}
+.pr-banner h2{color:var(--del)}
+.banner .fix{color:var(--ink);font-size:12.5px;margin:2px 0 0}
+.ha{border-left:3px solid var(--human)}
+.heart{display:inline-block;font:700 9px var(--mono);color:var(--del);border:1px solid var(--del);border-radius:3px;padding:0 4px;margin-left:6px}
+.grp{font:700 11px var(--mono);color:var(--ink);margin:10px 0 2px}
+.focuslbl{font-weight:700;color:var(--m)}
+.audit .h{color:var(--muted);font-size:11.5px}
+</style></head><body><main class="wrap">
+<a class="skip" href="#pr-substance">skip to what you're reviewing</a><h1>selfplay-v7-construction (v7: per-city PRODUCTION control head)</h1><p class="lead">This is an AI's plan for a code change. Read <strong>what it will build</strong> (top), check <strong>what it flags</strong>, then scroll to the bottom and paste the approval code to start the build.</p><div class="strip" aria-label="plan status"><span class="pill">BUILD</span><span class="pill">size L</span><span class="pill">base master</span><span class="pill">18 edited · 2 created</span><span class="pill ok">council APPROVE-with-folded-refinements</span><span class="pill warn">test RED (tests planned)</span></div>
+<section id="pr-orient" class="panel"><h2>What's changing &amp; why</h2><p><strong>The ask:</strong> give the self-play policy its first <em>per-entity</em> control lever — per-city
+production (what each city builds) — on top of the two civ-global heads (tech, policy), and measure whether
+controlling production moves the Medium win-rate toward/past the 50% break-even.</p>
+<p><strong>How this solves it:</strong> a per-city construction head reads the existing (un-pooled) own_cities
+token embeddings and emits per-city logits over the building∪unit vocabulary; the civ-turn hook pre-fills each
+deciding city&#x27;s construction queue (mirroring the tech pattern), records two variable per-city blocks aligned to
+own_cities, and the trainer adds the per-city construction log-prob into the existing joint PPO ratio. A
+<code>--control-construction {on,off}</code> flag makes OFF a proven no-op (== v6). A 4-arm experiment
+(small/medium rung × OFF/ON, replay K=4) isolates construction as the only variable.</p>
+</section>
+<section id="pr-substance" class="panel substance"><h2>★ What you&#x27;re reviewing — the data contract + the interfaces + the behavior change + the decisions</h2><h3>Schema delta — two new VARIABLE recorded blocks + version bump (lockstep)</h3>
+<table>
+  <caption>Recorded-step additions (one row per own city, in <code>orderedOwnCities</code> order). Reader is descriptor-generic → round-trips with no reader change.</caption>
+  <thead><tr><th scope="col">field</th><th scope="col">type</th><th scope="col">required / default</th><th scope="col">notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>construction_action</code></td><td>VARIABLE f32, perItem=1, count=ncities</td><td>new in v5</td><td>chosen <strong>0-indexed mask</strong> idx per own city; −1 = no decision</td></tr>
+    <tr><td><code>construction_logp</code></td><td>VARIABLE f32, perItem=1, count=ncities</td><td>new in v5</td><td>behavior log-prob per own city; 0 where no decision</td></tr>
+    <tr><td><code>SampleSchema.VERSION</code> / <code>SCHEMA_VERSION</code></td><td>int</td><td>4 → 5 (Kotlin + Python lockstep)</td><td>layout changed → old v4 shards refuse (<code>expect_compatible</code>); v7 replay starts fresh</td></tr>
+    <tr><td><code>OUTPUT_CONSTRUCTION</code> (&quot;construction_logits&quot;)</td><td>ONNX output [B, n_cities(dyn), constrW]</td><td>new</td><td>value head still dropped from the policy-only export; dynamic city axis</td></tr>
+    <tr><td><code>actions</code> / <code>behavior_logp</code></td><td>FIXED f32, width 4 (MASK_HEADS)</td><td>unchanged</td><td>construction is a separate per-entity block, NOT a MASK_HEADS slot</td></tr>
+  </tbody>
+</table>
+<h3>Interface delta — new/changed signatures</h3>
+<pre><code>// Kotlin (engine)
+PolicyProvider.chooseConstructionWithLogp(civ, city, cityRow: Int, legalMask: BooleanArray, turn: Int): Pair&lt;Int,Float&gt;
+    // default impl = uniform-legal (RandomPolicy inherits); OnnxPolicy = one memoized forward → index row cityRow → MaskedChoice.chooseWithLogp
+Vocab.constructionId(idx: Int): String?           // inverse of the 0-INDEXED mask space (idx&lt;buildingCount→building; else→unit). NOT constructionCode (1-indexed).
+Featurizer.orderedOwnCities(civ): List&lt;City&gt;      // canonical: x.cities.sortedBy{it.id}, capped at caps.maxOwnCities — single source reused by featurizer + decision loop + recorder
+SampleConfig.controlConstruction: Boolean         // positional arg[8] across the Python→JVM bridge
+
+# Python (training)
+RichPolicyValueNet.forward(inputs) -&gt; (tech, policy, construction, value)   // construction = [B, Ncities, constrW]
+run_loop.py: --control-construction {on,off}  (default ON for v7 arms)</code></pre>
+<h3>Training delta — joint logp gains one summand</h3>
+<pre><code>per-step logp = _masked_logp(tech) + _masked_logp(policy) + Σ_cities _masked_logp(construction_city)   # −1 → 0
+stored old_logp (behavior, incl. replay K=4) = the SAME sum  →  ratio exp(logp − old_logp) stays a per-step SCALAR
+advantage = terminal ±1 → GAE (current-value critic), multiplies the whole summed logp  (shared; no per-decision reward; no shaping)
+clip / value / entropy / GAE math otherwise verbatim from v6</code></pre>
+</section>
+<section id="pr-scrutinize" class="panel scrutinize"><h2>⚠ What to scrutinize</h2><ul><li><a href="#pr-substance">own_cities ordering reused identically in featurizer + decision loop + recorder (capped at maxOwnCities)</a> — row misalignment silently corrupts per-city training signal <span class="kv">(confidence: high)</span></li><li><a href="#pr-substance">constructionId inverts the 0-indexed MASK space, not 1-indexed constructionCode</a> — off-by-one mislabels building vs unit; legality test must catch it <span class="kv">(confidence: high)</span></li><li><a href="#pr-substance">stored old_logp includes Σ_cities construction at generation time (incl. K=4 replay)</a> — PPO off-policy ratio correctness across heads <span class="kv">(confidence: high)</span></li><li><a href="#pr-substance">OFF is a proven zero-summand no-op (== v6)</a> — clean ON-vs-OFF attribution <span class="kv">(confidence: med)</span></li><li><a href="#pr-systemfit">single memoized ONNX forward emits all per-city rows (no O(cities) inference)</a> — throughput AC#6 <span class="kv">(confidence: med)</span></li></ul></section>
+<section id="pr-risks" class="panel"><h2>Risks</h2><table><caption>risks</caption><tr><th scope="col">#</th><th scope="col">risk</th><th scope="col">L×S</th><th scope="col">mitigation</th></tr><tr><td>1</td><td>own_cities row misalignment across 5 components</td><td>M×H</td><td>single orderedOwnCities helper + determinism/parity test asserting alignment</td></tr><tr><td>2</td><td>Σ_cities log-ratio variance grows with city count → more clipping on ON arms</td><td>M×M</td><td>logratio.clamp(-20,20)+PPO clip; watch ratio/clip-fraction telemetry</td></tr><tr><td>3</td><td>constructionId off-by-one (1-indexed vs 0-indexed)</td><td>M×H</td><td>mask-space inverse + round-trip assert + legality test (recorded==applied, in-mask)</td></tr><tr><td>4</td><td>ON-arm ONNX fallback silently substitutes heuristic → contaminates ON-vs-OFF</td><td>L×H</td><td>PR2: count fallbacks; analyze_v7 asserts ≈0 on ON arms or flags invalid</td></tr></table></section>
+<section id="pr-top-decisions" class="panel"><h2>Top decisions</h2><table><caption>decision · rejected alternative · confidence</caption><tr><th scope="col">decision</th><th scope="col">rejected alternative</th><th scope="col">confidence</th></tr><tr><td>Centralize own_cities order in one orderedOwnCities helper (capped)</td><td>repeat the sortedBy{id} literal at each site</td><td>high</td></tr><tr><td>Ship on directional proof (ON&gt;OFF p&lt;0.05), 50% is a milestone not a gate</td><td>block ship unless it crosses 50%</td><td>high</td></tr><tr><td>OFF = zero-summand no-op (head inert, == v6)</td><td>separate OFF code path / no head in graph</td><td>high</td></tr><tr><td>constructionId inverts the 0-indexed mask space</td><td>reuse constructionCode 1-indexed inverse</td><td>high</td></tr><tr><td>Independent per-city sampling (non-autoregressive)</td><td>AlphaStar-style autoregressive city conditioning</td><td>high</td></tr></table></section>
+<section id="pr-systemfit" class="panel"><h2>★ How it fits the system</h2><p><strong>New:</strong> a per-city <code>construction_head</code> in <code>model.py</code>; a shared
+<code>orderedOwnCities</code> helper; <code>run_v7.sh</code> + <code>analyze_v7.py</code>; one new
+<code>PolicyProvider</code> method; <code>Vocab.constructionId</code>; an <code>OUTPUT_CONSTRUCTION</code> ONNX output.</p>
+<p><strong>Touched:</strong> <code>DataPlaneHooks</code> (decision loop + recordStep), <code>ConstructionAutomation</code>
+(controlled-civ guard), <code>SampleSchema</code> + <code>schema.py</code> (version + block/output names),
+<code>OnnxPolicy</code> (per-city memo + fallback), <code>SelfPlayRunner</code>/<code>SampleConfig</code> (positional flag),
+<code>export_onnx</code>, <code>dataset.py</code> (ragged pad), <code>train.py</code> (logp summand), <code>run_loop.py</code> (flag).</p>
+<p><strong>Calls in:</strong> <code>NextTurnAutomation.onCivTurn</code> (fires before <code>automateCities</code>) → <code>DataPlaneHooks</code>.
+<strong>Calls out:</strong> the head reads existing own_cities embeddings; the decision loop calls
+<code>MaskedChoice.chooseWithLogp</code> + <code>CityConstructions.setCurrentConstruction</code>.</p>
+<p><strong>Untouched but relied on (FROZEN):</strong> terminal-only ±1 reward; tech/policy/value heads + dims;
+PPO clip/value/entropy/GAE math; v5 continual + v6 replay machinery. <strong>Stays heuristic:</strong> unit movement,
+promotion, great-person, diplomatic-vote (asserted).</p>
+<table><caption>components touched and how they relate</caption><tr><th scope="col">component</th><th scope="col">kind</th><th scope="col">relationship</th></tr><tr><td class="mono">model.py construction_head</td><td>new</td><td>new</td></tr><tr><td class="mono">Featurizer.orderedOwnCities</td><td>new</td><td>new</td></tr><tr><td class="mono">run_v7.sh</td><td>new</td><td>new</td></tr><tr><td class="mono">analyze_v7.py</td><td>new</td><td>new</td></tr><tr><td class="mono">PolicyProvider.chooseConstructionWithLogp</td><td>new</td><td>new</td></tr><tr><td class="mono">Vocab.constructionId</td><td>new</td><td>new</td></tr><tr><td class="mono">DataPlaneHooks.kt</td><td>touched</td><td>touched</td></tr><tr><td class="mono">ConstructionAutomation.kt</td><td>touched</td><td>touched</td></tr><tr><td class="mono">SampleSchema.kt</td><td>touched</td><td>touched</td></tr><tr><td class="mono">schema.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">OnnxPolicy.kt</td><td>touched</td><td>touched</td></tr><tr><td class="mono">SelfPlayRunner.kt</td><td>touched</td><td>touched</td></tr><tr><td class="mono">export_onnx.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">dataset.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">train.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">run_loop.py</td><td>touched</td><td>touched</td></tr><tr><td class="mono">terminal-only ±1 reward</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">tech/policy/value heads</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">PPO clip/value/GAE math</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">v5 continual + v6 replay</td><td>untouched</td><td>untouched (relied on)</td></tr><tr><td class="mono">train.py dataset loader</td><td>consumers</td><td>consumer / reader</td></tr><tr><td class="mono">OnnxPolicy inference</td><td>consumers</td><td>consumer / reader</td></tr><tr><td class="mono">analyze_v7 z-tests</td><td>consumers</td><td>consumer / reader</td></tr></table><figure class="figure"><svg viewBox="0 0 706 620" width="100%" role="img" aria-label="dependency and data-flow diagram" aria-describedby="pr-diag-desc"><title>dependency and data-flow diagram</title><desc id="pr-diag-desc">Nodes: model.py construction_head (new), Featurizer.orderedOwnCities (new), run_v7.sh (new), analyze_v7.py (new), PolicyProvider.chooseConstructionWithLogp (new), Vocab.constructionId (new), DataPlaneHooks.kt (edit), ConstructionAutomation.kt (edit), SampleSchema.kt (edit), schema.py (edit), OnnxPolicy.kt (edit), SelfPlayRunner.kt (edit), export_onnx.py (edit), dataset.py (edit), train.py (edit), run_loop.py (edit), terminal-only ±1 reward (ctx), tech/policy/value heads (ctx), PPO clip/value/GAE math (ctx), v5 continual + v6 replay (ctx), train.py dataset loader (ctx), OnnxPolicy inference (ctx), analyze_v7 z-tests (ctx). Edges: NextTurnAutomation.onCivTurn→DataPlaneHooks.chooseAndApply: before automateCities; chooseAndApply→PolicyProvider.chooseConstructionWithLogp: per deciding city; chooseConstructionWithLogp→MaskedChoice.chooseWithLogp: single RNG draw; chooseAndApply→CityConstructions.setCurrentConstruction: pre-fill queue[0]; recordStep→shard (2 VARIABLE blocks): construction_action/logp; dataset.py→train.py: padded per-city logp summand.</desc><defs><marker id="pr-arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#69707d"/></marker></defs><line x1="426" y1="341" x2="476" y2="341" stroke="#69707d" fill="none" marker-end="url(#pr-arr)"/><rect class="edge-label-bg" x="448" y="327" width="126" height="13" rx="2" fill="#ffffff" fill-opacity="0.92"/><text class="edge-label-text" x="451" y="337" font-size="10" font-family="monospace" fill="#69707d">padded per-city logp</text><rect class="node" x="16" y="16" width="180" height="48" rx="5" fill="#eaf6ee" stroke="#1f883d"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="37">model.py</tspan><tspan x="28" dy="15">construction_head</tspan></text><rect class="node" x="246" y="16" width="180" height="48" rx="5" fill="#eaf6ee" stroke="#1f883d"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="37">Featurizer.orderedOwnC</tspan><tspan x="258" dy="15">ities</tspan></text><rect class="node" x="476" y="16" width="180" height="46" rx="5" fill="#eaf6ee" stroke="#1f883d"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="43">run_v7.sh</tspan></text><rect class="node" x="16" y="92" width="180" height="46" rx="5" fill="#eaf6ee" stroke="#1f883d"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="119">analyze_v7.py</tspan></text><rect class="node" x="246" y="92" width="180" height="48" rx="5" fill="#eaf6ee" stroke="#1f883d"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="113">PolicyProvider.chooseC</tspan><tspan x="258" dy="15">onstructionWithLogp</tspan></text><rect class="node" x="476" y="92" width="180" height="46" rx="5" fill="#eaf6ee" stroke="#1f883d"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="119">Vocab.constructionId</tspan></text><rect class="node" x="16" y="168" width="180" height="46" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="195">DataPlaneHooks.kt</tspan></text><rect class="node" x="246" y="168" width="180" height="48" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="189">ConstructionAutomation</tspan><tspan x="258" dy="15">.kt</tspan></text><rect class="node" x="476" y="168" width="180" height="46" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="195">SampleSchema.kt</tspan></text><rect class="node" x="16" y="244" width="180" height="46" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="271">schema.py</tspan></text><rect class="node" x="246" y="244" width="180" height="46" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="271">OnnxPolicy.kt</tspan></text><rect class="node" x="476" y="244" width="180" height="46" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="271">SelfPlayRunner.kt</tspan></text><rect class="node" x="16" y="318" width="180" height="46" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="345">export_onnx.py</tspan></text><rect class="node" x="246" y="318" width="180" height="46" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="345">dataset.py</tspan></text><rect class="node" x="476" y="318" width="180" height="46" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="345">train.py</tspan></text><rect class="node" x="16" y="392" width="180" height="46" rx="5" fill="#fdf6e3" stroke="#9a6700"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="419">run_loop.py</tspan></text><rect class="node" x="246" y="392" width="180" height="48" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="413">terminal-only ±1</tspan><tspan x="258" dy="15">reward</tspan></text><rect class="node" x="476" y="392" width="180" height="48" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="413">tech/policy/value</tspan><tspan x="488" dy="15">heads</tspan></text><rect class="node" x="16" y="468" width="180" height="48" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="489">PPO clip/value/GAE</tspan><tspan x="28" dy="15">math</tspan></text><rect class="node" x="246" y="468" width="180" height="48" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="489">v5 continual + v6</tspan><tspan x="258" dy="15">replay</tspan></text><rect class="node" x="476" y="468" width="180" height="48" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="488" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="488" y="489">train.py dataset</tspan><tspan x="488" dy="15">loader</tspan></text><rect class="node" x="16" y="544" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="28" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="28" y="571">OnnxPolicy inference</tspan></text><rect class="node" x="246" y="544" width="180" height="46" rx="5" fill="#ffffff" stroke="#9aa3b0"/><text class="nodelabel" x="258" font-size="12" font-family="monospace" fill="#1a1f27"><tspan x="258" y="571">analyze_v7 z-tests</tspan></text><g class="legend"><rect x="16" y="601" width="11" height="11" rx="2" fill="#eaf6ee" stroke="#1f883d"/><text x="32" y="610" font-size="10" font-family="monospace" fill="#69707d">new</text><rect x="68" y="601" width="11" height="11" rx="2" fill="#fdf6e3" stroke="#9a6700"/><text x="84" y="610" font-size="10" font-family="monospace" fill="#69707d">edit</text><rect x="126" y="601" width="11" height="11" rx="2" fill="#ffffff" stroke="#9aa3b0"/><text x="142" y="610" font-size="10" font-family="monospace" fill="#69707d">context</text></g></svg><figcaption class="diag-cap">system-fit — what the change connects to</figcaption></figure></section>
+<section id="pr-walkthrough" class="panel"><h2>Worked walkthrough</h2><p><em>Illustrative mock values — not measured; sanity-check against the design above.</em> Civ &quot;Rome&quot; (controlled, construction ON), turn 80, 3 cities; buildingCount=40, unitCount=18 → constrW=58.</p>
+<ol>
+  <li><strong>observe(Rome)</strong> → <code>orderedOwnCities=[c12,c31,c54]</code>; <code>mask_construction</code> rows: c12 legal {Granary=idx5, Worker=idx40}, c31 mid-building a Wonder, c54 idle (Perpetual-Gold) legal {Library=idx8, Warrior=idx41}.</li>
+  <li><strong>chooseAndApply</strong> tech→idx14 (logp −2.3), policy→idx3 (logp −1.6).</li>
+  <li><strong>construction loop</strong>: c12 deciding (row0); c31 NOT idle → −1; c54 idle (row2).</li>
+  <li><strong>OnnxPolicy</strong> ONE memoized forward → <code>construction_logits[3][58]</code>; row0 masked-softmax (single RNG draw) → idx5 Granary (logp −1.1); row2 → idx8 Library (logp −0.9).</li>
+  <li><strong>pre-fill + guard</strong>: c12.queue[0]=&quot;Granary&quot;, c54.queue[0]=&quot;Library&quot;; <code>ConstructionAutomation</code> skips c12,c54 (controls &amp;&amp; pre-filled); c31 untouched.</li>
+  <li><strong>recordStep</strong>: <code>construction_action=[5,−1,8]</code>, <code>construction_logp=[−1.1,0,−0.9]</code>; stored old_logp = −2.3−1.6−1.1−0.9 = −5.9.</li>
+  <li><strong>train (later)</strong>: pad to Nmax; live logp recomputes over recorded [5,−1,8]; ratio=exp(logp−(−5.9)) × step GAE advantage (terminal ±1).</li>
+</ol>
+<p>OFF arm / missing <code>OUTPUT_CONSTRUCTION</code>: hop 3 returns −1 for all cities → heuristic builds → summand 0 → identical to v6.</p>
+</section>
+<details id="pr-change-map"><summary>Change map — 18 item(s), grouped by concern</summary><div class="grp">control</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">core/.../DataPlaneHooks.kt<span class="heart">heart of the change</span></td><td>edit</td><td>per-city decision loop + recordStep 2 VARIABLE blocks</td></tr><tr><td class="mono">core/.../Featurizer.kt</td><td>edit</td><td>extract orderedOwnCities shared helper</td></tr><tr><td class="mono">core/.../ConstructionAutomation.kt</td><td>edit</td><td>controlled-civ + pre-filled guard</td></tr></table><div class="grp">seam</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">core/.../PolicyProvider.kt</td><td>edit</td><td>chooseConstructionWithLogp default</td></tr><tr><td class="mono">desktop/.../OnnxPolicy.kt</td><td>edit</td><td>per-city memo + fallback</td></tr></table><div class="grp">schema</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">core/.../SampleSchema.kt</td><td>edit</td><td>VERSION 4→5; OUTPUT_CONSTRUCTION + block names</td></tr><tr><td class="mono">core/.../Vocab.kt</td><td>edit</td><td>constructionId (0-indexed inverse)</td></tr><tr><td class="mono">python/unciv_dataplane/schema.py</td><td>edit</td><td>SCHEMA_VERSION 4→5</td></tr></table><div class="grp">flag</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">core/.../SelfPlayRunner.kt</td><td>edit</td><td>positional controlConstruction arg → SampleConfig</td></tr><tr><td class="mono">python/unciv_train/run_loop.py</td><td>edit</td><td>--control-construction flag bridge</td></tr></table><div class="grp">net</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">python/unciv_train/model.py<span class="heart">heart of the change</span></td><td>edit</td><td>per-city construction_head</td></tr><tr><td class="mono">python/unciv_train/export_onnx.py</td><td>edit</td><td>construction output + dynamic city axis</td></tr></table><div class="grp">train</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">python/unciv_train/dataset.py</td><td>edit</td><td>load+pad construction blocks</td></tr><tr><td class="mono">python/unciv_train/train.py<span class="heart">heart of the change</span></td><td>edit</td><td>construction logp summand (live + stored old_logp)</td></tr></table><div class="grp">experiment</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">python/run_v7.sh</td><td>new</td><td>4-arm OFF/ON resumable driver</td></tr><tr><td class="mono">python/unciv_train/analyze_v7.py</td><td>new</td><td>per-rung ON-vs-OFF z-tests + 50% framing</td></tr></table><div class="grp">tests</div><table><tr><th scope="col">path / area</th><th scope="col">change</th><th scope="col">why</th></tr><tr><td class="mono">tests/.../FairnessAndDeterminismTests.kt</td><td>edit</td><td>construction mask parity + determinism + constructionId round-trip</td></tr><tr><td class="mono">tests/.../OnnxPolicyLegalityTest.kt</td><td>edit</td><td>per-city legality (recorded==applied, in-mask)</td></tr></table></details>
+<section id="pr-operational" class="panel ha"><h2>Human actions required</h2><ul><li>Launch the multi-hour 4-arm run_v7 batch after parity/no-op/legality green (driven to completion this session per the experiment decision)</li></ul></section><details><summary>Verification · rollback · out-of-scope</summary><h2>Verification</h2><ul><li>./gradlew :tests:test — Kotlin parity/legality/determinism green</li><li>python -m pytest python/ — schema round-trip + no-op zero-summand + dataset pad</li><li>bench-onnx — per-city head ≥70% heuristic throughput</li><li>run_v7.sh — 4-arm Medium, analyze_v7 z-tests ON-vs-OFF + vs 50%</li></ul><h2>Rollback</h2><p>revert branch; v4→v5 schema bump means v7 shards/replay are perishable and separate — no in-place migration to undo</p><h2>Explicitly not changing</h2><ul><li>promotion/great-person/diplomatic-vote heads</li><li>unit-movement/target head</li><li>encoder rewrite</li><li>autoregressive city conditioning</li><li>reward shaping</li><li>ONNX file signing / replay poisoning defenses (single-trust local training)</li></ul></details>
+<section id="pr-audit" class="panel audit"><h2>Audit &amp; sources</h2><p class="kv">The substance above is an LLM-authored summary — the source of truth is plan.md / decisions.md. The content hash lets a developer confirm the verbatim copy below matches what was approved.</p><table><tr><th scope="col">source</th><th scope="col">path</th><th scope="col">content hash</th></tr><tr><td><a href="plan.md">plan.md</a></td><td class="mono">specs/2026-06-29-selfplay-v7-construction/plan.md</td><td class="mono h">36f3ebd54e5e4dc0</td></tr><tr><td><a href="decisions.md">decisions.md</a></td><td class="mono">specs/2026-06-29-selfplay-v7-construction/decisions.md</td><td class="mono h">a56d28381de93bef</td></tr><tr><td><a href=".plan-meta.json">.plan-meta.json</a></td><td class="mono">specs/2026-06-29-selfplay-v7-construction/.plan-meta.json</td><td class="mono h">94a5662921c5bc01</td></tr></table></section>
+<div class="toolbar"><button class="btn" id="pr-expand" type="button" aria-expanded="false">expand all</button></div>
+<details><summary>Verbatim source — plan.md + decisions.md</summary><h2>plan.md</h2><pre># Plan — selfplay-v7-construction (v7: per-city PRODUCTION control head)
+
+**Mode**: BUILD · **Size**: L · **Base**: master (fork) · **Branch**: selfplay-v7-construction
+
+## WHAT &amp; WHY (how it solves the ask)
+The learned policy controls only **tech + policy** (two civ-global, one-per-turn decisions),
+so in the symmetric 1v1 Random-opponent eval it sits below 50% (v5 small-rung 40.7%). v7 gives
+the net its first **PER-ENTITY** lever — **per-city construction** (what each city builds) — a
+variable-count decision conditioned on *which* city. We answer: does controlling production move
+the learner toward/past 50% on Medium? **Ship criterion (D-C5):** ship the infra + honest RESULTS
+as long as we PROVE directional improvement (**construction-ON beats construction-OFF, p&lt;0.05**, in
+≥1 rung), even below 50%; crossing 50% is a reported milestone, not a gate.
+
+## HOW — design (decisive, from the prompt; refined by scan + council)
+
+### Ordering contract (council C2 + scan surprise #1) — load-bearing
+`x.cities.sortedBy { it.id }`, **capped at `caps.maxOwnCities`**, is the canonical own_cities order.
+[AI_CODE] Extract it into ONE shared function `Featurizer.orderedOwnCities(civ): List&lt;City&gt;` and
+reuse it in: the featurizer mask/tokens, the chooseAndApply decision loop, and the recorder. Row `i`
+of `mask_construction` / `construction_action` / `construction_logp` / the ONNX per-city output ALL
+correspond to `orderedOwnCities(civ)[i]`. A determinism+parity test asserts the alignment.
+
+### (A) CONTROL — pre-fill at the civ-turn hook  [AI_CODE]
+In `DataPlaneHooks.chooseAndApply`, AFTER tech/policy, when `config.controlConstruction`:
+- Iterate `orderedOwnCities(civ)`. For each city, decide a construction **iff the city would choose
+  this turn** = its current construction is a `PerpetualConstruction` (idle) OR queue empty AND it has
+  ≥1 legal construction. Otherwise record −1 (no decision).
+- For a deciding city: read its `mask_construction` row from `obs`, call
+  `policy.chooseConstructionWithLogp(civ, city, cityRow=i, legalMask, turn)` → `(idx, logp)`; if
+  `idx≥0` and `vocab.constructionId(idx)` is non-null and `city.cityConstructions.canConstruct(name)`,
+  pre-fill via `city.cityConstructions.setCurrentConstruction(name)` (sets queue[0]). Record `idx`,`logp`.
+- Edge cases (council C7/M30): 0 cities → empty blocks; empty legal mask → −1; capture/destruction
+  between obs and apply is impossible (same synchronous `handleCivTurn`); invalid reverse-map → guarded
+  by `canConstruct` → fall back to −1 (heuristic builds).
+- `ConstructionAutomation.chooseNextConstruction` early-returns when
+  `DataPlaneHooks.controls(city.civ) &amp;&amp; &lt;policy pre-filled this city this turn&gt;` (mirror adoptPolicy:302).
+  Cities the policy did NOT decide → heuristic untouched. Decision cadence == the heuristic&#x27;s (decide
+  only when idle) — intentional (council M29); a mid-build city keeps its item.
+
+### (B) SEAM — `PolicyProvider.chooseConstructionWithLogp`  [AI_CODE]
+Add `fun chooseConstructionWithLogp(civ, city, cityRow: Int, legalMask: BooleanArray, turn: Int):
+Pair&lt;Int,Float&gt;` with a **default uniform-legal impl** (mirrors `chooseIndexWithLogp`; RandomPolicy
+inherits it). Kept minimal — one method, no new class (council M11): the per-entity signature genuinely
+needs the city/cityRow that the civ-level seam lacks, so the new method is justified, not abstraction tax.
+`OnnxPolicy` implements it: ONE memoized forward per `(game|civ|turn)` ALSO produces per-city
+construction logits `[ncities][constrW]`; index row `cityRow`; sample via `MaskedChoice.chooseWithLogp`
+(single RNG draw — byte-identical replay). chooseIndex/chooseIndexWithLogp (tech/policy) unchanged.
+**Graceful fallback** (council C4): if `OUTPUT_CONSTRUCTION` is absent / NaN / wrong city-dim / no
+legal action after masking → return `(-1, 0f)` → heuristic builds (this is also the OFF path).
+
+### (C) NET — per-city construction head  [AI_CODE]
+`RichPolicyValueNet`: capture the own_cities **pre-pool** token embeddings `[B,Ncities,token_dim]`
+(currently discarded by `masked_pool` in `_TokenEncoder`). Add
+`construction_head = MLP(per_city_emb ⊕ broadcast trunk h) → [B,Ncities,constrW]`, `constrW` read from
+the schema (buildings+units, never hardcoded). `forward` returns `(tech, policy, construction, value)`.
+Tech/policy/value heads + dims unchanged (no encoder rewrite). `export_onnx._RichPolicyOnly` returns
+`(tech, policy, construction)` (value still dropped); `output_names += OUTPUT_CONSTRUCTION`;
+`dynamic_axes[&quot;construction_logits&quot;]={0:&quot;batch&quot;,1:&quot;n_cities&quot;}`.
+
+### (D) RECORD — two VARIABLE blocks  [AI_CODE]
+`recordStep` appends `Block(&quot;construction_action&quot;, DT_F32, VARIABLE, perItem=1, cAct)` and
+`Block(&quot;construction_logp&quot;, DT_F32, VARIABLE, perItem=1, cLogp)`, one row per `orderedOwnCities`
+(−1 / 0 where no decision). Observation does NOT re-emit per city (one obs/step). Bump
+`SampleSchema.VERSION 4→5` (Kotlin :27) + `schema.py SCHEMA_VERSION 4→5` (:20) in lockstep — old v4
+shards refuse (`expect_compatible`), perishable by design (council C3 → v7 replay starts FRESH, no v6
+carryover). Reader is descriptor-generic (`reader.py:_decode_blocks`) → both new f32 VARIABLE blocks
+round-trip with NO reader change. Construction is a per-entity block, NOT a `MASK_HEADS` slot (council
+M13); `actions`/`behavior_logp` stay width-4 FIXED, unchanged.
+
+### (E) TRAIN — construction logp summand  [AI_CODE]
+`dataset.py`: load `construction_action`/`construction_logp` (ragged [T,Ncities_i]) + `mask_construction`;
+**pad to max Ncities** (action=−1, logp=0, mask=0 — inert rows contribute 0) BEFORE tensorizing so the
+micro-batch `forward_chunk_fn(lo,hi)` step-index slicing stays aligned (scan surprise #7).
+`train.py`: live per-step logp `= _masked_logp(tech)+_masked_logp(policy)+Σ_cities _masked_logp(construction_city)`
+(−1 → 0, exactly the existing gating). The **stored `behavior_logp`/old_logp** = the SAME sum captured at
+generation → importance ratio `exp(logp−old_logp)` stays a per-step scalar covering all heads jointly
+(council C1/C10; the recorded city set+order is frozen in the sample so old/new logp align city-for-city
+across the K=4 replay window). The per-step GAE advantage (terminal ±1, current-value critic) multiplies
+the WHOLE summed logp — construction inherits the step&#x27;s advantage (shared, research-confirmed standard;
+no per-decision reward, no shaping). Entropy MAY add the per-city construction term. Clip/value/GAE math
+otherwise verbatim. Risk (council C9 + research insight #2): the Σ_cities log-ratio grows with city count;
+the existing `logratio.clamp(-20,20)` + PPO clip bound it — watch ratio/clip-fraction telemetry on ON arms.
+
+### Plan-council refinements (folded — PR1–PR6)
+- **PR1**: AC#5 gate = the DETERMINISTIC zero-summand bit-identical-weights test (max|Δw|&lt;1e-6); the OFF-vs-v6 training-curve match is confirmatory only, not a gate.
+- **PR2**: COUNT construction-fallback events (idx&lt;0 / illegal / NaN / missing output); the ON arms must report ≈0 fallbacks (asserted in analyze_v7), else the ON-vs-OFF comparison is contaminated → flagged invalid. A guard-failure records −1 (policy abstains; heuristic builds; train contributes 0 — no gradient mixing).
+- **PR3**: fail-loud assert at ONNX load / first inference that `construction_logits` width == `vocab.buildingCount+vocab.unitCount` (mirror `test_contract_failloud`) — no silent vocab mismatch.
+- **PR4**: explicit null-guard — `val name = vocab.constructionId(idx) ?: &lt;record −1, skip&gt;` BEFORE any `canConstruct` call.
+- **PR5**: bench-onnx is a PRE-run GATE — measure ON-arm throughput BEFORE launching the multi-hour batch; a &lt;70% head is fixed before launch, not discovered mid-run.
+- **PR6**: v7 runs in a FRESH OUT_ROOT, replay starts EMPTY, NO cross-schema ckpt resume from v6 dirs; rollback = revert branch (v5 shards/replay perishable &amp; separate).
+
+### (F) NO-OP SAFETY — `--control-construction {on,off}`, default ON  [AI_CODE]
+Positional Python→JVM bridge (scan surprise #3): `run_loop.py --control-construction` →
+`gradle_selfplay([&quot;gen&quot;,…, str(control).lower()])` → `SelfPlayRunner.gen/eval` parses positional
+`args[8]` → `SampleConfig.controlConstruction`. OFF ⇒ no construction control (heuristic builds), the
+decision loop records **zero** construction decisions → `Σ_cities _masked_logp(construction) ≡ 0` →
+loss/gradient **identical to v6** (the head gets zero gradient, inert). **No-op proof (council C4/M14/M28)**:
+OFF construction summand == 0 (asserted) AND the OFF curve reproduces v6 within fp tolerance (and v5 at K=1).
+
+### Vocab inverse (scan surprise #2 / trap)  [AI_CODE]
+Add `Vocab.constructionId(idx: Int): String?` inverting the **0-indexed mask space** (matches
+`constructionMask`/net logits): `idx&lt;buildingCount → buildingName(idx)`; `else → unitName(idx−buildingCount)`;
+out-of-range → null. NOT the 1-indexed `constructionCode` inverse (off-by-one trap). Round-trip asserted
+in the parity test.
+
+## Experiment  [AI_CODE]
+`run_v7.sh` (mirrors run_v6.sh, resumable `--resume`, heartbeat logs, per-round ckpt): **4 arms**
+sequential, all `--replay-window 4 --continual --micro-batch-steps 256`, structured/Medium, 16 rounds,
+gen 16 / eval 80, turn-cap 250:
+`small-OFF`, `small-ON`, `medium-OFF`, `medium-ON` (construction is the ONLY axis within each rung pair).
+Then per-arm 200-game ceiling eval @ eval-seed 4242424 + z-tests vs the fixed blind baseline.
+`analyze_v7.py` (mirrors analyze_v6): per-rung ON-vs-OFF two-proportion **one-sided z-test** (H1: ON&gt;OFF),
+draws/timeouts/crashes = non-win, 200 fixed denominator; AND each arm&#x27;s win-rate vs the **50% break-even**
+(z/p), stated plainly. Run order: parity + no-op + legality green → THEN the Medium run (per AC).
+
+## FROZEN / NON-GOALS (council M19 — explicit)
+FROZEN: terminal-only ±1 reward (NO shaping); tech/policy heads + dims; PPO clip/value/entropy/GAE math
+(only the logp now sums the construction term); v5 continual + v6 replay machinery. NON-GOALS: NO
+promotion / great-person / diplomatic-vote heads (next features, reuse this per-entity infra); NO
+unit-movement / target head (spatial, deliberately heuristic); NO encoder rewrite (head reads existing
+own_cities embeddings); NO autoregressive city-conditioning (independent per-city is the correct first
+cut). Asserted-heuristic: unit movement, promotion, great-person, diplomatic-vote.
+OUT OF SCOPE (council C24/C25/m31 — single-trust local training, no adversary): ONNX file signing,
+replay data-poisoning defenses, reader hardening beyond the existing buffer-safe `&lt;H` decode.
+
+## Reuse (all internal; no new libraries)
+`MaskedChoice.chooseWithLogp` (sampler), Observation VARIABLE-block format, `reader.py` descriptor-generic
+decode, `_masked_logp` + v6 micro-batch/replay/old_logp machinery, `TestGame` fixtures, `run_v6.sh` /
+`analyze_v6.py` as templates. No duplication introduced.
+
+## Tests (definitions — council C6; RED-first in Step 11)
+- **LEGALITY (AC#1)**: every applied construction ∈ that city&#x27;s mask; recorded `construction_action[i]` ==
+  the construction actually queued for `orderedOwnCities(civ)[i]`; zero illegal across the eval.
+- **PARITY (AC#2)**: JVM per-city construction logits == Python reference for a fixed obs, atol 1e-4
+  (extend the existing logit-parity harness to the per-city output) + `constructionId` round-trip.
+- **SCHEMA (AC#4)**: VERSION 4→5 lockstep; old v4 shard refuses; the two new VARIABLE blocks round-trip
+  with no reader change (Python round-trip test).
+- **NO-OP (AC#5)**: OFF → construction summand ≡ 0; OFF reproduces v6 within fp tolerance (and v5 at K=1).
+- **DETERMINISM**: single RNG draw/decision; identical order; byte-identical shards on replay incl. blocks.
+- **THROUGHPUT (AC#6)**: bench-onnx — per-city head inference cost; ≥70% of heuristic baseline.
+
+## Component shape (clean-structure anticipation — advisory)
+~2 new files (`run_v7.sh`, `analyze_v7.py`) + surgical edits to ~18 existing files; the construction head is
+a ~30-line block in `model.py`; the shared `orderedOwnCities` helper consolidates a currently-duplicated
+literal. No module is expected to mix responsibilities or pass ~300 lines from this change.
+
+## Walkthrough
+See `## Walkthrough` below — one civ-turn traced end to end.
+
+## Walkthrough (one representative civ-turn, illustrative mock values — not measured)
+Civ &quot;Rome&quot; (controlled, construction ON), turn 80, owns 3 cities; vocab: buildingCount=40, unitCount=18 → constrW=58.
+
+| Hop | Component | Contract | Mock data |
+|---|---|---|---|
+| 1 | `handleCivTurn(Rome)` → `featurizer.observe` | Observation w/ VARIABLE `mask_construction` | `orderedOwnCities=[c12,c31,c54]` (sorted by id, ≤cap); mask rows: c12 legal {Granary(idx5), Worker(idx40)}, c31 mid-building Wonder (will be skipped), c54 idle on Perpetual-Gold legal {Library(idx8),Warrior(idx41)} |
+| 2 | `chooseAndApply` tech/policy | actions[0..1] | tech→idx14 logp −2.3; policy→idx3 logp −1.6 |
+| 3 | construction loop over `orderedOwnCities` | per-city `(idx,logp)` | c12 deciding → `chooseConstructionWithLogp(row0)`; c31 NOT idle → −1; c54 idle → `chooseConstructionWithLogp(row2)` |
+| 4 | `OnnxPolicy` (ONE memoized forward) | `construction_logits[3][58]` | row0 masked-softmax (single RNG draw) → idx5 (Granary) logp −1.1; row2 → idx8 (Library) logp −0.9 |
+| 5 | pre-fill + heuristic guard | `setCurrentConstruction` | c12.queue[0]=&quot;Granary&quot;; c54.queue[0]=&quot;Library&quot;; `ConstructionAutomation` skips c12,c54 (controls &amp;&amp; pre-filled); c31 untouched |
+| 6 | `recordStep` | two VARIABLE blocks, 3 rows | `construction_action=[5,−1,8]`, `construction_logp=[−1.1,0,−0.9]`; stored old_logp = −2.3−1.6−1.1−0.9 = −5.9 (sum heads+cities) |
+| 7 | (train, later) `dataset.py`+`train.py` | per-step logp + GAE adv | pad to Nmax; live logp recomputes over recorded [5,−1,8]; ratio=exp(logp−(−5.9)); ×step advantage (terminal ±1 → GAE) |
+
+If `OUTPUT_CONSTRUCTION` were missing (OFF arm / old model): hop 3 returns −1 for all cities → heuristic builds → `construction_action=[−1,−1,−1]` → train summand 0 → identical to v6.
+</pre><h2>decisions.md</h2><pre># Decisions — selfplay-v7-construction
+
+## Discovery findings (Phase 1)
+
+### D-disc-1: Routed invariant docs are for a different project (noted, not blocking)
+`~/.claude/feature-workflow-internal/docs/invariants/*` describe the **Mentiora** stack
+(Next.js + FastAPI + Prisma + Stagehand agent tests). This repo is **Unciv** — a Kotlin/libGDX
+game engine + a Python RL training package (`python/unciv_train/`). The generic invariant docs
+do **not** govern this feature. The authoritative constraints are:
+- the user&#x27;s explicit **FROZEN / NON-GOALS** and **ACCEPTANCE CRITERIA** in the prompt, and
+- the established v5 (continual) / v6 (replay-buffer) code patterns in the repo.
+Testing philosophy (&quot;test what matters&quot;) maps here to **parity / no-op / legality / determinism**
+assertions, not browser/agent tests.
+
+### D-disc-2: The Medium experiment is a long, resumable background batch
+`python/run_v6.sh`: 4 arms run **sequentially** (CPU oversubscription if parallel), each = v5 continual
+config (structured, Medium, 16 rounds, gen 16 / eval 80, turn-cap 250), `--resume`-able per round, then
+a per-arm **200-game ceiling eval** @ eval-seed 4242424 + z-tests vs the fixed blind baseline (58/200 =
+28.9%). This is multi-hour compute. v7 collapses to **2 arms** (construction OFF == v6 tech+policy; ON ==
+v7) at `--replay-window 4`, the only changed axis being `--control-construction`.
+Acceptance ordering (from the prompt): **parity + no-op + legality green BEFORE the Medium run.**
+
+### D-disc-3: Fork topology — do NOT `git pull`
+`origin` = yairm210/Unciv (upstream public repo); `fork` = WhoIsJohannes/unciv-ai-training (self-play
+work). Local `master` is 48 ahead / 1 behind origin. The feature branch was cut from **local master**
+with no pull (pulling would merge unrelated upstream Unciv changes mid-feature).
+
+## Design decisions (from the prompt — marked &quot;decisive&quot;, carried verbatim into the plan)
+A) Control: pre-fill each city&#x27;s `constructionQueue[0]` at the civ-turn hook, after tech/policy.
+B) Seam: `PolicyProvider.chooseConstructionWithLogp(civ, city, cityRow, legalMask, turn)`.
+C) Net: per-city construction head on UN-pooled own_cities token embeddings → logits [B,Ncities,constrW].
+D) Record: two VARIABLE blocks (`construction_action`, `construction_logp`) aligned to own_cities; SCHEMA 4→5.
+E) Train: per-step logp += Σ_cities masked_logp(construction); shares the per-step GAE advantage; replay old_logp includes construction.
+F) No-op: `--control-construction {on,off}`, default ON; OFF reproduces v6 (and v5 at K=1).
+
+## Phase 2 JOIN — intake council triage (31 findings, 1 round, research-blind)
+
+Branches: research ✓ · council ✓ (8 lenses) · deep-scan ✓. research_seen_by_rounds = none (R1 was research-blind; stopped at R1 — substantive, diminishing returns).
+
+**🔴 Critical (10) — disposition:**
+- C1 logp summing vs stored old_logp scalar / C10 replay city-set frozen → **FOLD (design E)**: at generation, stored `behavior_logp`/old_logp = sum over heads + Σ_cities construction; live logp recomputes over the SAME recorded `construction_action` per city → ratio is a well-defined per-step scalar. Recorded city set+order is frozen in the sample.
+- C2 own_cities ordering cross-system contract → **FOLD**: centralize `x.cities.sortedBy{it.id}` (capped at maxOwnCities) in ONE shared fn reused by featurizer + decision loop + recorder; parity/determinism test asserts row alignment.
+- C3 schema v5 rollback / mixed replay → **FOLD**: v4 shards refuse to load (perishable, by design); v7 starts replay FRESH (no v6 carryover). Documented.
+- C4 ONNX fallback when construction output missing/bad → **FOLD**: OnnxPolicy → heuristic when OUTPUT_CONSTRUCTION absent / NaN / wrong dim / no legal after mask (record −1). This IS the OFF/no-op path too.
+- C5 **ship decision on NEGATIVE experiment result → USER DECISION (asked at JOIN).**
+- C6 parity/no-op/legality not defined → **FOLD**: Step 11 test spec defines exact names/assertions/tolerances.
+- C7 variable city-count edge cases → **FOLD**: 0 cities → empty block; decide only when city would choose (queue empty / on Perpetual) else −1; empty mask → −1; capture-between-obs-apply impossible (same synchronous handleCivTurn); invalid reverse → guard canConstruct.
+- C8 O(N) ONNX inference → **FOLD**: ONE memoized forward per (game,civ,turn) emits all city rows.
+- C9 GAE advantage scales with city count → **FOLD (deliberate)**: shared per-step advantage (research-confirmed standard A2C/AlphaStar); watch ratio/clip-fraction telemetry on the ON arm.
+
+**🟡 Worth considering (majors) — FOLD:** M11 keep PolicyProvider seam minimal (one method, default uniform-legal, no class hierarchy — per-entity signature genuinely differs from civ-level, so justified); M12 schema bump required (layout changed); M13 construction is a per-entity block, not a MASK_HEADS slot; M14 no-op = zero-summand equivalence proof (OFF records 0 construction decisions → summand≡0 → identical to v6); M15/M18 run_v7.sh mirrors v6 (resumable, --resume, heartbeat, per-round ckpt); M16/M26/M27 head is a small MLP, bench-onnx measures latency (AC#6), maxOwnCities bounds it; M17 add per-city debug logs (chosen id, legality); M19 copy FROZEN/NON-GOALS into plan explicitly; M21 two-proportion z-test, one-sided ON&gt;OFF, draws/timeouts=non-win, 200 fixed denom (analyze_v5/v6 convention); M22 throughput via bench-onnx (samples/sec vs heuristic ≥70%); M23 fixtures via TestGame; M28 OFF==v6 via zero-summand; M29 decide-when-idle mirrors heuristic cadence (correct, intentional); M30 covered by C7.
+
+**⚪ Low / OUT OF SCOPE — single-trust local training (no adversary):** M24 ONNX file signing, M25 replay data-poisoning, m31 reader u16 bound. Self-generated data, local box; documented as out-of-scope threat model (the `&lt;H` bound is already buffer-safe).
+
+**Net:** 30/31 folded into the plan; ONE genuine user decision (C5).
+
+### D-C5 (USER): Ship criterion = directional proof, not 50%
+Ship the per-entity construction machinery + RESULTS as long as we can PROVE it moves the
+win-rate in the right direction — i.e. **construction-ON beats construction-OFF at p&lt;0.05**
+within at least one rung — EVEN IF it doesn&#x27;t cross the 50% break-even. Crossing 50% is a
+**reported milestone, not a ship gate**. Default `--control-construction = ON` if the directional
+win is proven (else OFF; the infra still merges for reuse by the next promotion/GP/vote heads, but
+without a &quot;beneficial&quot; claim). A truly null/negative result (ON ≤ OFF, not significant) is reported
+honestly and does not get the directional-success claim.
+
+## Step 11 — plan council triage (31 findings: 5 critical, 21 major)
+**Folded refinements (6 actionable — sharpen plan + tests; none invalidate design):**
+- PR1 (crit &quot;no-op not a deterministic oracle&quot; + major &quot;conflates 2 claims): AC#5 gate = the
+  DETERMINISTIC zero-summand bit-identical-weights test (max|Δw|&lt;1e-6); the v6 training-CURVE match is
+  CONFIRMATORY only, not a gate.
+- PR2 (major &quot;ONNX fallback silently invalidates ON arm&quot; + &quot;heuristic fallback mixes policies&quot;): COUNT
+  construction-fallback events; the ON arms must report ~0 fallbacks (assert), else the ON-vs-OFF
+  comparison is contaminated → invalid. Guard-failure records −1 (policy abstains; heuristic builds; train
+  contributes 0 — no gradient mixing).
+- PR3 (major &quot;no cross-validation ONNX dim vs constrW&quot;): fail-loud assert at model load/first inference
+  that `construction_logits` width == `vocab.buildingCount+vocab.unitCount` (mirror test_contract_failloud).
+- PR4 (major &quot;null-pointer: constructionId null but canConstruct unconditional&quot;): explicit null-guard —
+  `constructionId(idx) ?: record −1` BEFORE any `canConstruct` call.
+- PR5 (crit &quot;unbudgeted 42% compute from throughput regression&quot;): bench-onnx is a PRE-run GATE (measure
+  ON-arm throughput BEFORE the multi-hour batch; a &lt;70% head is fixed before launch, not discovered mid-run).
+- PR6 (crit &quot;schema v5 rollback/operating plan&quot;): v7 runs in a FRESH OUT_ROOT, replay starts EMPTY, NO
+  cross-schema ckpt resume from v6 dirs; rollback = revert branch (v5 shards/replay are perishable &amp; separate).
+
+**Already-covered / intentional / out-of-scope:**
+- crit &quot;PyTorch pickle RCE via torch.load&quot; → OUT OF SCOPE (single-trust local training; pre-existing v5/v6
+  behavior, v7 adds no new load path). Note: `weights_only=True` is a cheap future hardening, not v7 scope.
+- &quot;f32 storage for discrete actions&quot; → intentional (matches existing f32 `actions`/`behavior_logp` FIXED blocks).
+- &quot;padding to max Ncities wastes compute&quot; → acceptable for Medium; mask zeros padded rows (could pack later).
+- &quot;decide-only-when-idle limits expressiveness&quot; → deliberate first-cut (mirrors heuristic cadence, won&#x27;t
+  interrupt a mid-build wonder); preemption is a future extension, not v7.
+- &quot;shared advantage over-credits idle cities&quot; → false: idle/heuristic cities record −1 → contribute 0 logp.
+- &quot;city-count log-ratio variance biases the comparison&quot; → training-stability risk (watch clip-fraction), NOT a
+  measurement bias (the 200-game eval is deterministic given the trained net; both arms use identical eval).
+- SLO/incident/timebox majors → run_v7.sh mirrors v6 (resumable --resume, heartbeat, per-round ckpt); user
+  chose drive-to-completion.
+- &quot;golden analyzer / bench contract / fallback / ordering fixture tests&quot; → defined in agent-test-spec.md; written in build.
+</pre></details>
+<section class="panel pr-nonce-p" aria-label="approval code"><h2>Approval code</h2><p>You reached the bottom. Paste this code back in the terminal to approve:</p><p><span class="pr-nonce" id="pr-nonce">garnet-pebble-2984</span> <button class="btn" id="pr-copy" type="button" aria-label="copy approval code">copy</button></p><p class="kv">request changes &rarr; reply <code>revise: &lt;what&gt;</code> &middot; stop &rarr; reply <code>abort</code></p></section>
+</main>
+<script>document.addEventListener('DOMContentLoaded',function(){var b=document.getElementById('pr-expand');if(b){b.addEventListener('click',function(){var open=b.getAttribute('aria-expanded')!=='true';document.querySelectorAll('details').forEach(function(d){d.open=open;});b.setAttribute('aria-expanded',open);b.textContent=open?'collapse all':'expand all';});}var c=document.getElementById('pr-copy');if(c){c.addEventListener('click',function(){var n=document.getElementById('pr-nonce');if(n&&navigator.clipboard){navigator.clipboard.writeText(n.textContent.trim());}});}});</script>
+</body></html>

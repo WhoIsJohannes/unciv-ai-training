@@ -1,0 +1,614 @@
+[
+  {
+    "title": "Redundant early-return guard in ConstructionAutomation couples heuristic to policy layer",
+    "severity": "minor",
+    "primary_lens": "yagni",
+    "target_file": "brief.md",
+    "target_section": "(A) CONTROL \u2014 pre-fill at the civ-turn hook",
+    "description": "The brief adds a special early-return guard inside `ConstructionAutomation.chooseNextConstruction` when the policy pre-filled the city's construction. However, the heuristic already returns immediately for any city whose current construction is not a `PerpetualConstruction`. Since the policy pre-fill replaces an idle (Perpetual) construction with a real one, the existing idle check ensures the heuristic will not overwrite it. The extra guard introduces an unnecessary dependency where the city automation must know whether the DataPlaneHooks control flag is on and whether the policy acted this turn.",
+    "rationale": "Redundant guards increase coupling and make the code harder to reason about. The state change (non-Perpetual construction) already encodes the intent; a junior developer reading the code would wonder why both checks exist. Removing the guard reduces control-flow complexity with zero loss of correctness.",
+    "suggested_addition": "Remove the `DataPlaneHooks.controls(city.civ) && <policy pre-filled this city this turn>` guard. Let `chooseNextConstruction`'s existing `if (getCurrentConstruction() !is PerpetualConstruction) return` handle the pre-filled case naturally. This mirrors how the heuristic already skips cities mid-build \u2014 policy-set construction is just another non-Perpetual item.",
+    "supporting_roles": [
+      "skeptic"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "`ConstructionAutomation.chooseNextConstruction` early-returns when `DataPlaneHooks.controls(city.civ) && <policy pre-filled this city this turn>` (mirror adoptPolicy:302).",
+      "`ConstructionAutomation.chooseNextConstruction()` ... early guard `if (getCurrentConstruction() !is PerpetualConstruction) return`"
+    ]
+  },
+  {
+    "title": "orderedOwnCities order is non-deterministic across obs/decide/record if city set mutates mid-list-build",
+    "severity": "major",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "Ordering contract (council C2 + scan surprise #1)",
+    "description": "The contract asserts row-alignment is guaranteed because obs and apply run in the same synchronous handleCivTurn. But the brief also pre-fills construction via setCurrentConstruction DURING the decision loop, and ConstructionAutomation reads `<policy pre-filled this city this turn>` state \u2014 meaning the loop mutates per-city state it is simultaneously iterating against. The shared orderedOwnCities helper guarantees ORDER stability but not that the per-city 'would choose this turn' predicate (PerpetualConstruction / empty-queue) is evaluated against the same snapshot the mask was built from.",
+    "rationale": "The mask was computed at obs time; the deciding-predicate is re-evaluated at apply time. If anything between obs-build and the per-city loop touches a city's queue (e.g. a prior city's pre-fill triggering shared civ-level validation), row i's recorded decision no longer corresponds to row i's mask, silently corrupting the training signal without tripping the legality test (which only checks applied \u2208 mask, not that the deciding-predicate matched obs-time state).",
+    "suggested_addition": "Add to the ordering contract: 'The deciding-predicate (idle / empty-queue / \u22651 legal) for row i MUST be evaluated against the SAME city snapshot used to build mask_construction[i] at obs time, not re-read after earlier cities in the loop have been pre-filled. Capture the per-city deciding-eligibility as part of orderedOwnCities (or alongside the obs) so the loop reads a frozen predicate. The parity test asserts: for each row, obs-time eligibility == apply-time recorded decision presence.'",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "decide a construction **iff the city would choose this turn** = its current construction is a `PerpetualConstruction` (idle) OR queue empty AND it has \u22651 legal construction",
+      "capture/destruction between obs and apply is impossible (same synchronous `handleCivTurn`)"
+    ]
+  },
+  {
+    "title": "Shared orderedOwnCities helper creates a Featurizer\u2192decision-loop\u2192recorder dependency hub with no owning module",
+    "severity": "major",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "Ordering contract (council C2 + scan surprise #1)",
+    "description": "Three concerns \u2014 featurization (mask/tokens), control (chooseAndApply decision loop), and recording (recordStep) \u2014 are all made to depend on Featurizer.orderedOwnCities. This places a control-flow and recording dependency on the Featurizer, a module whose single responsibility should be turning game state into observation tensors. The brief never states which module OWNS the ordering contract or why it lives on Featurizer rather than a neutral seam.",
+    "rationale": "Putting the canonical entity-ordering on the Featurizer means DataPlaneHooks (control) and ShardRecorder (record) now reach into a featurization class for a non-featurization concern, inverting the natural dependency direction and making the Featurizer a hub that every future per-entity head (promotion, GP, vote \u2014 all named as reusers) must route through.",
+    "suggested_addition": "State explicitly where orderedOwnCities lives and why, and that the cap+sort policy is a domain ordering contract, not a featurization detail. Consider extracting it to a neutral location (e.g. a `EntityOrdering`/`OwnCityOrder` value the Observation carries, computed once and read by all three consumers) so control and recording depend on the observation, not on Featurizer internals. Note this in NON-GOALS if deferred: 'v7 keeps it on Featurizer; future per-entity heads will pressure this \u2014 revisit ownership then.'",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Extract it into ONE shared function `Featurizer.orderedOwnCities(civ): List<City>` and reuse it in: the featurizer mask/tokens, the chooseAndApply decision loop, and the recorder."
+    ]
+  },
+  {
+    "title": "No-op equivalence proof conflates two distinct claims (zero-summand vs bit-identical v6 curve)",
+    "severity": "major",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "(F) NO-OP SAFETY",
+    "description": "The brief claims OFF is 'identical to v6' via two AC#5 assertions: (1) the construction summand \u2261 0, and (2) the OFF curve reproduces v6 within fp tolerance. But OFF still bumps SCHEMA 4\u21925, still adds two VARIABLE blocks (with zero rows or \u22121 rows) to every shard, and still runs the new construction head in the net (producing a discarded output). Claim (1) is provable analytically; claim (2) requires the head producing zero gradient AND the schema/block changes not perturbing dataloading order, padding, or RNG draw counts.",
+    "rationale": "If OFF records empty/\u22121 construction blocks, dataset.py still pads to max-Ncities and tensorizes them; if that padding or the extra block decode shifts any RNG state or micro-batch chunk boundary, the OFF curve will NOT be bit-identical to v6 and the no-op claim quietly fails \u2014 undermining the entire ON-vs-OFF causal attribution the ship criterion depends on.",
+    "suggested_addition": "Split AC#5 into: (5a) ANALYTIC: OFF construction summand \u2261 0 and construction_head receives zero gradient (assert grad norm == 0). (5b) PIPELINE-INERT: prove the schema-v5 OFF shard, padded construction blocks, and head forward do NOT alter RNG draw count, micro-batch chunk boundaries, or optimizer step order vs v6 \u2014 ideally by asserting byte-identical optimizer state after N steps, OR explicitly downgrade the claim to 'OFF is numerically equivalent to v6 up to the new-block decode, which is gradient-inert' and stop asserting bit-identity.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "OFF construction summand == 0 (asserted) AND the OFF curve reproduces v6 within fp tolerance (and v5 at K=1)",
+      "Bump `SampleSchema.VERSION 4\u21925` ... old v4 shards refuse"
+    ]
+  },
+  {
+    "title": "Positional JVM arg bridge (args[8]) is a brittle, type-unsafe contract for a load-bearing flag",
+    "severity": "minor",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "(F) NO-OP SAFETY \u2014 Positional Python\u2192JVM bridge",
+    "description": "The construction control flag \u2014 the single experimental axis the whole ship criterion rests on \u2014 is threaded as positional arg[8] (a stringified lowercase bool) through gradle_selfplay into SelfPlayRunner.gen/eval. There is no named binding, no enum, and parsing is by position only. A reordering or omission upstream silently shifts every subsequent arg.",
+    "rationale": "The flag that distinguishes ON from OFF is the entire basis of the p<0.05 directional claim; if a positional drift ever silently flips or misreads it, an ON arm could run as OFF (or vice versa) and the experiment would produce a confident-but-wrong result with no type-level guard to catch it.",
+    "suggested_addition": "Add a guard: SelfPlayRunner must assert args.size and that args[8] \u2208 {'on','off'} (fail-fast on anything else, never default-silently), and the parity/no-op test should include a round-trip assertion that --control-construction off actually produces controlConstruction==false at the JVM SampleConfig. Note the positional contract's fragility in the brief as accepted technical debt.",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "Positional Python\u2192JVM bridge (scan surprise #3): `run_loop.py --control-construction` \u2192 `gradle_selfplay([\"gen\",\u2026, str(control).lower()])` \u2192 `SelfPlayRunner.gen/eval` parses positional `args[8]`"
+    ]
+  },
+  {
+    "title": "Construction head reads pre-pool embeddings \u2014 an implicit coupling to _TokenEncoder internals",
+    "severity": "minor",
+    "primary_lens": "structure",
+    "target_file": "brief.md",
+    "target_section": "(C) NET \u2014 per-city construction head",
+    "description": "The construction head requires capturing own_cities pre-pool token embeddings 'currently discarded by masked_pool in _TokenEncoder'. This exposes an internal intermediate of _TokenEncoder (the per-entity embeddings before pooling) to a sibling head, creating a leaky abstraction: the head now depends on the encoder's internal layering, not just its output contract.",
+    "rationale": "The brief states 'no encoder rewrite' as a NON-GOAL, but reaching into _TokenEncoder to extract a previously-private intermediate IS a contract change to that module \u2014 any future encoder refactor (e.g. changing pooling or token_dim) now silently breaks the construction head, and the dependency is undeclared in the module's public surface.",
+    "suggested_addition": "Make the per-city embedding a declared output of _TokenEncoder (e.g. forward returns (pooled, per_entity_embeddings) or exposes it via a named attribute), rather than the head reaching into a discarded intermediate. State in the brief: 'own_cities per-entity embeddings become part of _TokenEncoder's public contract; downstream heads may read them; encoder refactors must preserve [B,Ncities,token_dim] shape.'",
+    "supporting_roles": [
+      "architect"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "capture the own_cities **pre-pool** token embeddings `[B,Ncities,token_dim]` (currently discarded by `masked_pool` in `_TokenEncoder`)",
+      "NO encoder rewrite (head reads existing own_cities embeddings)"
+    ]
+  },
+  {
+    "title": "No SLO or incident policy for the long-running v7 batch",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "Experiment  [AI_CODE]",
+    "description": "The brief says `run_v7.sh` is resumable and has heartbeat logs, but it does not define the operational contract for the multi-hour run: expected runtime, acceptable crash/stall rate, alert thresholds, ownership, or what constitutes a failed run versus an automatically recoverable one.",
+    "rationale": "At 3am, \"heartbeat logs\" are not enough; on-call needs concrete signals and thresholds to know whether to restart, resume, kill the arm, or preserve evidence. Without an SLO/error-budget-style contract, the experiment can silently waste compute or produce suspect results after partial failures.",
+    "suggested_addition": "Add an operational SLO for `run_v7.sh`: expected per-arm wall-clock range, max tolerated failed games/crashes, max heartbeat gap before alerting, owner/on-call contact, and explicit actions for `stalled`, `OOM`, `checkpoint missing`, and `eval denominator < 200`. Include a short runbook: commands to inspect current arm/round, resume safely, collect logs/artifacts, and abort without corrupting prior arms.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`run_v7.sh` (mirrors run_v6.sh, resumable `--resume`, heartbeat logs, per-round ckpt)",
+      "4 arms sequential, all `--replay-window 4 --continual --micro-batch-steps 256`, structured/Medium, 16 rounds, gen 16 / eval 80, turn-cap 250"
+    ]
+  },
+  {
+    "title": "Schema v5 has no safe rollback or mixed-version operating plan",
+    "severity": "critical",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "(D) RECORD \u2014 two VARIABLE blocks  [AI_CODE]",
+    "description": "The plan intentionally makes v4 shards refuse and starts v7 fresh, but it does not describe how to roll back a bad v7 deploy/code change while v5 shards/checkpoints already exist. It also does not state how older analysis/training scripts fail safely when pointed at a v7 output directory.",
+    "rationale": "A one-way schema bump is one of the easiest ways to turn a bad deploy into a long incident. If rollback requires deleting data or hand-editing directories, the on-call cannot recover in under two minutes and may accidentally mix incompatible replay data.",
+    "suggested_addition": "Add a rollback section: v7 writes to versioned output roots only, never into v6 replay dirs; rollback command is to disable `--control-construction` or revert code while preserving v7 dirs read-only; old tooling must fail with a clear `schema_version=5 unsupported` error before reading partial data. Specify whether v5 checkpoints/shards are disposable, how to quarantine them, and the exact safe cleanup/resume commands.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Bump `SampleSchema.VERSION 4\u21925` ... old v4 shards refuse (`expect_compatible`), perishable by design",
+      "v7 replay starts FRESH, no v6 carryover"
+    ]
+  },
+  {
+    "title": "ONNX construction fallback can silently invalidate the ON arm",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "(B) SEAM \u2014 `PolicyProvider.chooseConstructionWithLogp`  [AI_CODE]",
+    "description": "The graceful fallback returns `(-1, 0f)` for absent, NaN, wrong-dimension, or unusable construction logits, which is safe for gameplay but dangerous for experiment integrity. The brief does not require counters, structured logs, or a fail-fast mode to distinguish intentional OFF from a broken ONNX export in the ON arm.",
+    "rationale": "Fail-open is fine for user-facing availability, but for this experiment it can silently turn construction-ON into heuristic-OFF and produce a false negative or misleading no-op result. On-call needs a single metric that says whether the head is actually being used.",
+    "suggested_addition": "Add observability and gating for construction fallback: emit structured events with `arm`, `round`, `civ`, `turn`, `cityRow`, `reason`, and `model_path`; maintain counters for `construction_decisions_total`, `construction_fallback_total{reason}`, and `construction_applied_total`. In validation and ON experiment arms, fail the run if fallback rate exceeds a small threshold after warmup; reserve fail-open only for explicit OFF or ad-hoc smoke runs.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "if `OUTPUT_CONSTRUCTION` is absent / NaN / wrong city-dim / no legal action after masking \u2192 return `(-1, 0f)` \u2192 heuristic builds",
+      "this is also the OFF path"
+    ]
+  },
+  {
+    "title": "Throughput target lacks resource budgets and degradation signals",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "(C) NET \u2014 per-city construction head  [AI_CODE]",
+    "description": "The brief sets a throughput acceptance criterion, but it does not define hard resource budgets for ONNX inference, tensor shapes, memory, thread usage, or what happens when city count or construction vocabulary growth pushes latency beyond the budget.",
+    "rationale": "A benchmark percentage alone does not help operate the system when the JVM starts stalling or OOMing late-game. Production readiness needs bounded resource usage, metrics, and a known degradation path before adding a variable-count head.",
+    "suggested_addition": "Add capacity limits and runtime metrics: max `Ncities`, max `constrW`, max ONNX inference latency per civ-turn, max memory allocation per forward, and max ThreadLocal memo lifetime. Record `onnx_forward_ms`, `construction_logits_shape`, `n_cities`, `constrW`, and fallback-on-budget-exceeded counts. Define the degradation policy if latency exceeds budget, e.g. disable construction control for that civ-turn and emit an alertable counter.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`dynamic_axes[\"construction_logits\"]={0:\"batch\",1:\"n_cities\"}`",
+      "**THROUGHPUT (AC#6)**: bench-onnx \u2014 per-city head inference cost; \u226570% of heuristic baseline."
+    ]
+  },
+  {
+    "title": "Checkpoint recovery is mentioned but not made incident-safe",
+    "severity": "major",
+    "primary_lens": "production-readiness",
+    "target_file": "brief.md",
+    "target_section": "Experiment  [AI_CODE]",
+    "description": "The plan mentions per-round checkpoints and resume, but not atomic writes, checkpoint validation, retention, or the RPO/RTO expectation after interruption, disk-full, or partial checkpoint corruption.",
+    "rationale": "Long local training jobs fail in boring ways: disk fills, process dies during write, or the latest checkpoint is corrupt. Without an explicit recovery contract, the operator may resume from bad state and contaminate the result set.",
+    "suggested_addition": "Specify checkpoint/recovery semantics: write checkpoints atomically via temp file + rename, verify loadability after write, retain at least the last two good checkpoints per arm, and record a manifest with arm/round/seed/schema/model hash. Define RPO as at most one round lost and RTO as the time to resume from the previous verified checkpoint, with commands for validating and selecting the checkpoint.",
+    "supporting_roles": [
+      "practitioner"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "`run_v7.sh` ... resumable `--resume`, heartbeat logs, per-round ckpt",
+      "Run order: parity + no-op + legality green \u2192 THEN the Medium run"
+    ]
+  },
+  {
+    "title": "Merging dormant infrastructure on a negative experiment result",
+    "severity": "critical",
+    "primary_lens": "outcome-truth",
+    "target_file": "decisions.md",
+    "target_section": "D-C5 (USER): Ship criterion = directional proof, not 50%",
+    "description": "The brief commits to merging the complex per-entity infrastructure even if the experiment fails (ON \u2264 OFF), justifying it as 'reuse for next heads'. This guarantees we pay the maintenance tax of cross-system complexity (Kotlin/Python/ONNX/Schema bumps) for a feature that delivers zero immediate value.",
+    "rationale": "PMs know that 'we will use this infra later' is a trap. If the per-city construction head fails to improve the model, the fundamental assumption about the value of per-entity heads might be flawed. Merging dead code creates a permanent liability.",
+    "suggested_addition": "Add a strict merge gate: If the experiment is negative (ON \u2264 OFF), the infrastructure is NOT merged to master unless the team is explicitly committing to building the *immediate* next per-entity feature (e.g., promotion head) in the very next sprint. Otherwise, the branch is parked or discarded.",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Default `--control-construction = ON` if the directional win is proven (else OFF; the infra still merges for reuse by the next promotion/GP/vote heads, but without a 'beneficial' claim)."
+    ]
+  },
+  {
+    "title": "Missing iteration budget and timebox for the experiment",
+    "severity": "major",
+    "primary_lens": "outcome-truth",
+    "target_file": "brief.md",
+    "target_section": "Experiment",
+    "description": "The brief details the computational cost ('multi-hour compute') and the statistical success criteria, but lacks an engineering timebox or iteration budget. It does not define how many times the team is allowed to tweak hyperparameters or fix 'bugs' if the initial run fails to hit p<0.05.",
+    "rationale": "Without a hard timebox, ML/RL features often devolve into endless research loops ('just one more tweak'). A PM needs a predefined stopping condition to protect team velocity and prevent a 1-week feature from becoming a 6-week sinkhole.",
+    "suggested_addition": "Define a strict iteration budget. For example: 'Max 2 weeks of engineering time. If the experiment does not yield p<0.05 after a maximum of 3 training attempts/tweaks, we accept the OFF result, declare the experiment complete, and move on.'",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Run order: parity + no-op + legality green \u2192 THEN the Medium run (per AC).",
+      "analyze_v7.py (mirrors analyze_v6): per-rung ON-vs-OFF two-proportion one-sided z-test (H1: ON>OFF)"
+    ]
+  },
+  {
+    "title": "Throughput metric is disconnected from user-facing latency",
+    "severity": "major",
+    "primary_lens": "outcome-truth",
+    "target_file": "brief.md",
+    "target_section": "Tests",
+    "description": "The throughput acceptance criterion is set at '\u226570% of heuristic baseline', but it is not tied to a user-facing latency outcome (e.g., 'AI turn takes < 2 seconds').",
+    "rationale": "A 30% drop in throughput might be mathematically acceptable to an ML engineer, but if it pushes the AI's turn processing time past a human-noticeable threshold, it degrades the player experience. System benchmarks must be anchored to user outcomes.",
+    "suggested_addition": "Translate the \u226570% throughput metric into an absolute maximum latency per AI turn. Add: 'End-to-end AI turn processing must not exceed X milliseconds on standard hardware, ensuring players do not experience noticeable lag during the AI turn phase.'",
+    "supporting_roles": [
+      "product_manager"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "THROUGHPUT (AC#6): bench-onnx \u2014 per-city head inference cost; \u226570% of heuristic baseline."
+    ]
+  },
+  {
+    "title": "NO-OP curve equivalence is not a deterministic test oracle",
+    "severity": "critical",
+    "primary_lens": "testable-dod",
+    "target_file": "brief.md",
+    "target_section": "F) NO-OP SAFETY / Tests",
+    "description": "The brief requires OFF to reproduce v6 \"within fp tolerance\", but does not define what artifact is compared, which seeds are used, or what numeric tolerance applies. A training or eval curve is stochastic and is not a stable fp-level oracle unless the exact deterministic comparison surface is specified.",
+    "rationale": "QA cannot write a reliable acceptance test for \"curve reproduces v6\" from this brief alone. This is a non-negotiable safety claim for the OFF path, so ambiguity here can let a regression ship while appearing to satisfy AC#5.",
+    "suggested_addition": "Add a precise NO-OP test contract: `For a fixed fixture game, fixed model, fixed seed, and --control-construction off, generated shards must be byte-identical to v6 except for the schema/version presence of empty construction blocks if applicable; the computed construction summand tensor must be exactly 0; total live logp, old_logp, loss components, and gradients for pre-existing heads must match v6 with atol=<value>, rtol=<value>. If an eval-curve comparison remains required, define it separately as a smoke/regression check, not an fp-tolerance acceptance oracle.`",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "OFF \u21d2 no construction control (heuristic builds), the decision loop records zero construction decisions \u2192 \u03a3_cities _masked_logp(construction) \u2261 0 \u2192 loss/gradient identical to v6",
+      "NO-OP (AC#5): OFF \u2192 construction summand \u2261 0; OFF reproduces v6 within fp tolerance (and v5 at K=1)."
+    ]
+  },
+  {
+    "title": "Throughput AC lacks a reproducible benchmark contract",
+    "severity": "major",
+    "primary_lens": "testable-dod",
+    "target_file": "brief.md",
+    "target_section": "Tests / THROUGHPUT (AC#6)",
+    "description": "The throughput criterion gives a threshold but not the benchmark inputs, hardware/runtime assumptions, number of warmup/measured iterations, city-count distribution, or exact metric. \"\u226570% of heuristic baseline\" is not verifiable unless the baseline and measurement method are fixed.",
+    "rationale": "Performance acceptance tests are highly sensitive to fixture shape and machine noise. Without a benchmark contract, QA cannot tell whether a failure is a product regression, a benchmark setup difference, or an invalid comparison.",
+    "suggested_addition": "Add: `AC#6 benchmark: run <command> on <environment or CI label> using fixed recorded observations covering Ncities={0,1,3,maxOwnCities}; perform <N> warmup and <M> measured iterations; report median and p95 samples/sec plus per-forward latency. Pass if v7 ONNX policy throughput is >=70% of the named v6 heuristic/control baseline under the same fixture and batch settings. Store the benchmark fixture and expected output schema in tests/fixtures/v7_construction_bench.*.`",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "THROUGHPUT (AC#6): bench-onnx \u2014 per-city head inference cost; \u226570% of heuristic baseline.",
+      "construction_head = MLP(per_city_emb \u2295 broadcast trunk h) \u2192 [B,Ncities,constrW]"
+    ]
+  },
+  {
+    "title": "Fallback modes are specified but not acceptance-tested",
+    "severity": "major",
+    "primary_lens": "testable-dod",
+    "target_file": "brief.md",
+    "target_section": "B) SEAM \u2014 PolicyProvider.chooseConstructionWithLogp / Tests",
+    "description": "The brief lists critical fallback cases for missing, malformed, or unusable ONNX construction outputs, but the Tests section does not make these explicit acceptance tests. These conditions are the safety path for old models and OFF-like operation, so they need direct coverage with controlled/mocked outputs.",
+    "rationale": "If fallback behavior is only described in implementation prose, it is easy to miss during test planning. A bad ONNX output should never crash generation or silently record an invalid action; QA needs concrete negative tests.",
+    "suggested_addition": "Add a `FALLBACK` test group: `Mock OnnxPolicy/ONNX outputs for: missing OUTPUT_CONSTRUCTION, NaN logits, wrong city dimension, wrong construction width, all logits masked illegal, and invalid constructionId reverse-map. In every case chooseConstructionWithLogp returns (-1,0f), no construction is pre-filled by policy, heuristic construction proceeds where applicable, and recorded construction_action/logp rows are -1/0 for affected cities.`",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "Graceful fallback (council C4): if OUTPUT_CONSTRUCTION is absent / NaN / wrong city-dim / no legal action after masking \u2192 return (-1, 0f) \u2192 heuristic builds",
+      "Tests (definitions \u2014 council C6; RED-first in Step 11)"
+    ]
+  },
+  {
+    "title": "Ordering/cap contract needs explicit fixture coverage",
+    "severity": "major",
+    "primary_lens": "testable-dod",
+    "target_file": "brief.md",
+    "target_section": "Ordering contract / Tests",
+    "description": "The own-city ordering contract is load-bearing, but the test definition only says a parity/determinism test asserts alignment. It does not require fixtures that would catch the highest-risk failures: unsorted city IDs, cap truncation, excluded overflow cities, mid-build cities, and zero-city observations.",
+    "rationale": "A row-alignment bug can produce legal-looking but wrong-city construction choices, which may pass basic legality checks. QA needs adversarial fixture data to prove row `i` maps to the same city across featurizer, policy, application, and recorder.",
+    "suggested_addition": "Add explicit fixture requirements: `Create TestGame fixtures with city ids intentionally out of order, e.g. [54,12,31], and with caps.maxOwnCities lower than owned city count. Assert orderedOwnCities returns the sorted capped list, mask_construction rows correspond exactly to that list, chooseAndApply applies row i to the same city, recorder emits rows in the same order, and overflow cities receive no policy decision. Include separate 0-city, empty-legal-mask, and mid-build-city cases.`",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "x.cities.sortedBy { it.id }, capped at caps.maxOwnCities, is the canonical own_cities order.",
+      "A determinism+parity test asserts the alignment."
+    ]
+  },
+  {
+    "title": "Statistical acceptance needs golden analyzer tests",
+    "severity": "major",
+    "primary_lens": "testable-dod",
+    "target_file": "brief.md",
+    "target_section": "Experiment / Ship criterion",
+    "description": "The experiment acceptance depends on one-sided two-proportion z-tests and crash/draw handling, but the brief does not require golden test data for `analyze_v7.py`. Without known input/output cases, QA cannot verify the script's p-values, denominators, rung comparisons, or boundary behavior before trusting the ship decision.",
+    "rationale": "Here the analyzer is part of the acceptance gate, not just reporting. A small denominator, directionality, or non-win handling bug could flip the decision on whether construction-ON proved improvement.",
+    "suggested_addition": "Add analyzer acceptance tests: `Provide golden result fixtures for ON/OFF wins with fixed denominator 200, including draws/timeouts/crashes as non-wins, a clear significant ON>OFF case, a non-significant case, an ON<OFF case, and a 50% break-even boundary case. Tests must assert exact win rates, z statistic, p-value tolerance, one-sided direction, and final pass/fail label for each rung.`",
+    "supporting_roles": [
+      "qa_testing"
+    ],
+    "source_models": [
+      "openai/gpt-5.5"
+    ],
+    "source_excerpts": [
+      "construction-ON beats construction-OFF, p<0.05, in \u22651 rung",
+      "analyze_v7.py ... per-rung ON-vs-OFF two-proportion one-sided z-test (H1: ON>OFF), draws/timeouts/crashes = non-win, 200 fixed denominator"
+    ]
+  },
+  {
+    "title": "PyTorch checkpoint deserialization RCE via pickle \u2014 not covered by existing scope-out",
+    "severity": "critical",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "OUT OF SCOPE",
+    "description": "The `_load_warm()` function in `run_loop.py` and any checkpoint-loading path in `train.py` load `.pt` files, which use Python's pickle module under the hood. Pickle deserialization is inherently unsafe \u2014 a crafted `.pt` file can execute arbitrary code. This is distinct from the replay-shard data-poisoning threats already scoped out (C24/C25).",
+    "rationale": "A compromised CI dependency, a malicious collaborator sharing a 'warm start' checkpoint, or even a local process with write access to the checkpoint directory can plant a weaponized `.pt` file. When the training loop resumes or loads warm-start weights, the payload executes. Single-trust doesn't mean single-process \u2014 it means assuming the local machine isn't compromised, which is a weaker assumption than most threat models grant.",
+    "suggested_addition": "Add to the OUT OF SCOPE section (or elevate to a risk note): 'PyTorch checkpoint files (.pt) use pickle and are deserialized unsafely \u2014 loading a checkpoint from any non-self-generated source is RCE. Mitigations to consider: (1) `torch.load(..., weights_only=True)` for checkpoints (PyTorch 2.0+), (2) never load checkpoints from network sources, (3) assert checkpoint file ownership/permissions before loading. This risk is accepted for v7 given single-trust local execution, but must be documented.'",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "OUT OF SCOPE (council C24/C25/m31 \u2014 single-trust local training, no adversary): ONNX file signing, replay data-poisoning defenses, reader hardening beyond the existing buffer-safe `<H` decode.",
+      "v5 continual: `_load_warm()` (net+opt from `ckpt_round_{n-1}.pt`/`opt_round_{n-1}.pt`) at `run_loop.py:80-109`"
+    ]
+  },
+  {
+    "title": "Null-pointer risk in construction loop: `constructionId` returns null but `canConstruct` is called unconditionally",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "(A) CONTROL \u2014 pre-fill at the civ-turn hook",
+    "description": "The construction decision loop calls `vocab.constructionId(idx)` then guards with `city.cityConstructions.canConstruct(name)`. The brief specifies `constructionId` returns null for out-of-range indices, but the Kotlin call `canConstruct(name)` will receive a nullable `String?` \u2014 if `canConstruct`'s parameter is non-null `String`, this is a null-pointer exception that crashes the entire civ-turn, not a graceful fallback to heuristic.",
+    "rationale": "The edge cases section says 'invalid reverse-map \u2192 guarded by canConstruct \u2192 fall back to \u22121', but a null pointer exception doesn't fall back \u2014 it throws. If the model produces an out-of-range index (e.g., ONNX version mismatch, fp rounding on a near-boundary logit, corrupted model), the entire `handleCivTurn` crashes instead of falling back to the heuristic builder. This is a runtime reliability hole, not just a correctness edge case.",
+    "suggested_addition": "In the edge cases bullet, replace 'invalid reverse-map \u2192 guarded by canConstruct \u2192 fall back to \u22121' with: 'null or invalid reverse-map: if `constructionId(idx)` returns null OR `canConstruct(name)` returns false \u2192 record \u22121, do NOT pre-fill (heuristic builds). Kotlin null-safety requires explicit `?.let` or `if (name != null && canConstruct(name))` \u2014 a bare `canConstruct(null)` will NPE.'",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Edge cases (council C7/M30): ... invalid reverse-map \u2192 guarded by `canConstruct` \u2192 fall back to \u22121 (heuristic builds).",
+      "Add `Vocab.constructionId(idx: Int): String?` inverting the 0-indexed mask space ... out-of-range \u2192 null."
+    ]
+  },
+  {
+    "title": "No cross-validation between ONNX `construction_logits` dimension and Vocab `constrW` \u2014 silent corruption on mismatch",
+    "severity": "major",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "(B) SEAM \u2014 `PolicyProvider.chooseConstructionWithLogp` / (C) NET",
+    "description": "The design reads `constrW` from the Vocab schema (buildingCount + unitCount) and uses it to construct masks and index logit rows. The ONNX model independently outputs `construction_logits` with its own last dimension. If the model was exported with a different vocabulary than the runtime Vocab (e.g., stale model trained on an older game version, or vocab drift between training and inference), the row stride `constrW` will mismatch the ONNX output dimension, producing silently wrong logit reads or out-of-bounds array accesses.",
+    "rationale": "This is a classic deserialization-mismatch vulnerability: two systems agree on semantics but not on wire format. The ONNX dynamic axis `n_cities` handles the city-count dimension, but the per-city logit width is statically baked into the model graph. If the runtime `constrW` is 58 but the model outputs width 60, the row indexing `logits[cityRow * constrW + i]` reads garbage logits for later rows. The graceful-fallback check only catches 'OUTPUT_CONSTRUCTION absent / NaN / wrong city-dim' \u2014 not a mismatched last-dimension width.",
+    "suggested_addition": "Add to the `OnnxPolicy` graceful-fallback check: 'Assert that `OUTPUT_CONSTRUCTION`'s last dimension equals `vocab.buildingCount + vocab.unitCount` (runtime `constrW`). If mismatch \u2192 log warning, return `(-1, 0f)` for all cities (heuristic fallback).' Also add a startup-time validation in `export_onnx.py` that the exported model's construction-logit dimension is written into model metadata (or inferred from the first forward pass) so the JVM side can cross-check.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Graceful fallback (council C4): if `OUTPUT_CONSTRUCTION` is absent / NaN / wrong city-dim / no legal action after masking \u2192 return `(-1, 0f)`",
+      "`constrW` read from the schema (buildings+units, never hardcoded)"
+    ]
+  },
+  {
+    "title": "Python\u2192JVM `--control-construction` flag bridge: silent misbehavior on unexpected string values",
+    "severity": "minor",
+    "primary_lens": "red-team",
+    "target_file": "brief.md",
+    "target_section": "(F) NO-OP SAFETY \u2014 `--control-construction {on,off}`",
+    "description": "The Python side passes `str(control).lower()` as positional `args[8]` to the JVM. If argparse allows values beyond 'on'/'off' (e.g., 'true', 'false', '1', '0', empty string, or a typo like 'no'), the JVM receives an unexpected string. The brief doesn't specify how `SelfPlayRunner` parses `args[8]` into `SampleConfig.controlConstruction: Boolean`. If `toBoolean()` or a lenient coercion is used, 'off' and 'false' would both become `false` but 'no' might become `true` (Kotlin's `toBoolean()` treats 'true' (case-insensitive) as true and everything else as false \u2014 but the mapping isn't specified and could be the inverse of what the operator expects).",
+    "rationale": "The no-op safety proof (OFF \u2261 v6) depends on `controlConstruction` being reliably false when the user intends OFF. A silent parsing error either direction (OFF treated as ON \u2192 construction gets partial gradients from heuristic decisions; ON treated as OFF \u2192 the experiment arm is mislabeled) undermines the entire A/B comparison. The positional-arg bridge has no validation layer \u2014 Python doesn't constrain the value, and the JVM side's parsing is unspecified.",
+    "suggested_addition": "On the Python side: add `choices=['on','off']` to `add_argument('--control-construction', ...)` so argparse rejects unexpected values. On the JVM side: specify the exact parsing (e.g., `args[8].lower() == 'true'` or `'on'`) and add an explicit else-branch that logs a warning and defaults to OFF (safe fallback) for any unrecognized value. This keeps the bridge narrow and the mapping explicit.",
+    "supporting_roles": [
+      "security_red_team"
+    ],
+    "source_models": [
+      "deepseek/deepseek-v4-pro"
+    ],
+    "source_excerpts": [
+      "Positional Python\u2192JVM bridge (scan surprise #3): `run_loop.py --control-construction` \u2192 `gradle_selfplay(['gen',\u2026, str(control).lower()])` \u2192 `SelfPlayRunner.gen/eval` parses positional `args[8]` \u2192 `SampleConfig.controlConstruction`",
+      "No-op proof (council C4/M14/M28): OFF construction summand == 0 (asserted) AND the OFF curve reproduces v6 within fp tolerance"
+    ]
+  },
+  {
+    "title": "Inefficient Float32 storage for discrete categorical actions",
+    "severity": "major",
+    "primary_lens": "inference-cost",
+    "target_file": "brief.md",
+    "target_section": "(D) RECORD \u2014 two VARIABLE blocks",
+    "description": "The design specifies `DT_F32` for the `construction_action` block. Since this records a discrete vocabulary index (e.g., 0-58) or -1, using 32-bit floats wastes 75% of the storage and memory bandwidth compared to an 8-bit or 16-bit integer type.",
+    "rationale": "In self-play RL, replay buffers are massive and often bottlenecked by RAM and disk I/O. Bloating a per-city variable block by 4x violates right-sized infrastructure principles and will unnecessarily inflate the memory footprint of the training workers.",
+    "suggested_addition": "Change `construction_action` to use `DT_I16` or `DT_I8` (if supported by the `SampleSchema` block kinds). If `DT_F32` is strictly required by a legacy reader constraint, document that constraint and add a fast-follow task to support integer blocks.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "Block(\"construction_action\", DT_F32, VARIABLE, perItem=1, cAct)"
+    ]
+  },
+  {
+    "title": "Wasteful dense compute from padding to global max Ncities",
+    "severity": "major",
+    "primary_lens": "inference-cost",
+    "target_file": "brief.md",
+    "target_section": "(E) TRAIN \u2014 construction logp summand",
+    "description": "The brief states to \"pad to max Ncities\" before tensorizing. If this pads to the global `caps.maxOwnCities` rather than the dynamic maximum within the specific micro-batch, the MLP head will execute dense matrix multiplications on mostly padding (zeros) during the early game.",
+    "rationale": "Compute cost must be proportional to value. Executing the construction head on 90% padding (e.g., when a civ has 2 cities but the global max is 50) wastes GPU/CPU FLOPs, directly increasing training time and cloud compute costs.",
+    "suggested_addition": "Explicitly specify that `_pad_to_max` pads only to the maximum `Ncities` present *in the current micro-batch* (dynamic padding), rather than the global `maxOwnCities` constant.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "pad to max Ncities (action=\u22121, logp=0, mask=0 \u2014 inert rows contribute 0) BEFORE tensorizing so the micro-batch forward_chunk_fn(lo,hi) step-index slicing stays aligned"
+    ]
+  },
+  {
+    "title": "Unbudgeted 42% compute cost increase from throughput regression",
+    "severity": "critical",
+    "primary_lens": "inference-cost",
+    "target_file": "brief.md",
+    "target_section": "Tests (definitions)",
+    "description": "The throughput acceptance criterion allows performance to drop to \"\u226570% of heuristic baseline\". A 30% drop in throughput means generation workers will take ~1.42x as long to generate the same volume of self-play games.",
+    "rationale": "This will result in surprising cloud bills. A 42% increase in self-play compute hours is a massive cost multiplier. We must ensure the expected \"directional improvement\" in win-rate justifies this specific cost-per-unit increase before making it the default.",
+    "suggested_addition": "Add a FinOps gate: Quantify the absolute compute cost increase of the 70% throughput threshold. If the feature ships as `default ON`, the directional win (AC#5) must be weighed against this ~42% generation cost penalty.",
+    "supporting_roles": [
+      "cost_efficiency"
+    ],
+    "source_models": [
+      "google/gemini-3.1-pro-preview"
+    ],
+    "source_excerpts": [
+      "THROUGHPUT (AC#6): bench-onnx \u2014 per-city head inference cost; \u226570% of heuristic baseline."
+    ]
+  },
+  {
+    "title": "Shared per-step advantage over-credits idle/heuristic cities in the same gradient",
+    "severity": "major",
+    "primary_lens": "ml-correctness",
+    "target_file": "brief.md",
+    "target_section": "(E) TRAIN \u2014 construction logp summand",
+    "description": "The brief credits the WHOLE summed logp (tech+policy+\u03a3_cities construction) with one shared per-step GAE advantage. But the city set in a given step mixes deciding cities (real construction choices) with non-deciding cities (recorded \u22121 \u2192 0 logp). That is handled. The unaddressed issue: a single civ-turn's terminal-\u00b11 advantage is applied identically to a possibly-large number of independent construction decisions, so a civ-turn where the policy made 8 good city builds and 0 bad ones receives the same scalar advantage as one where it made 1 \u2014 credit is undifferentiated across cities AND across the temporal distance to terminal.",
+    "rationale": "From the RL-correctness lens this is the central modeling choice and it is asserted as 'research-confirmed standard' but the brief never states the consequence: with terminal-only reward and shared advantage, per-city construction credit is extremely high-variance and weakly causal, which can make the ON arm learn slowly or noisily and confound the very ON-vs-OFF directional test the ship gate depends on.",
+    "suggested_addition": "Add an explicit subsection: 'Credit-assignment limitation \u2014 per-city construction shares the civ-turn advantage; with terminal-only \u00b11 reward, individual city builds receive undifferentiated, high-variance credit. We accept this for the first per-entity head (matches A2C/AlphaStar) but call out that a null ON result may reflect credit dilution rather than construction being unhelpful. Telemetry: log mean |advantage|, per-step construction summand count, and ON-arm value-loss to distinguish signal-starvation from no-effect.'",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "The per-step GAE advantage (terminal \u00b11, current-value critic) multiplies the WHOLE summed logp \u2014 construction inherits the step's advantage (shared, research-confirmed standard; no per-decision reward, no shaping)."
+    ]
+  },
+  {
+    "title": "'Decide only when idle' couples policy expressiveness to the heuristic's cadence \u2014 limits learnable behavior",
+    "severity": "major",
+    "primary_lens": "ml-correctness",
+    "target_file": "brief.md",
+    "target_section": "(A) CONTROL \u2014 pre-fill at the civ-turn hook",
+    "description": "The policy decides a city's construction ONLY when the city is idle (PerpetualConstruction or empty queue with a legal build). A city mid-build keeps its existing item and the policy never reconsiders it. This means the learned policy can never (a) cancel a heuristic-chosen build it inherited, (b) reprioritize under threat, or (c) switch a long wonder for an urgent unit \u2014 the exact strategic levers production control is supposed to grant.",
+    "rationale": "From the domain lens, the question being answered is 'does controlling production move the learner toward 50%?' \u2014 but the design only lets the policy control the START of a build, not the build queue as a strategic instrument. A null result could mean 'production control doesn't help' OR 'we gave the policy too thin a slice of production control'; the brief conflates these.",
+    "suggested_addition": "Add to NON-GOALS or a 'Scope of production control' note: 'v7 controls only the build-selection decision at idle moments (mirrors heuristic cadence). The policy CANNOT cancel/reprioritize an in-progress build, manage the multi-item queue, or react mid-build. This is a deliberate thin first cut; a null directional result must be interpreted as null *for build-start selection*, not for production control generally.' Consider whether at least mid-build reconsideration is cheap enough to include given it changes what the experiment can conclude.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "decide a construction **iff the city would choose this turn** = its current construction is a `PerpetualConstruction` (idle) OR queue empty",
+      "Decision cadence == the heuristic's (decide only when idle) \u2014 intentional (council M29); a mid-build city keeps its item."
+    ]
+  },
+  {
+    "title": "Heuristic fallback on guard-failure silently mixes two policies into one recorded action",
+    "severity": "major",
+    "primary_lens": "ml-correctness",
+    "target_file": "brief.md",
+    "target_section": "(A) CONTROL \u2014 pre-fill at the civ-turn hook",
+    "description": "When the policy picks idx\u22650 but canConstruct fails (invalid reverse-map / stale legality), the design falls back to heuristic builds and records \u22121 (no decision). So the city's construction WAS set by the heuristic, but training sees it as 'policy made no decision here.' The brief treats this purely as an edge case but it is a domain-correctness hole: the on-policy data now contains heuristic actions labeled as non-decisions, and if guard-failures are non-rare on the ON arm, the policy is partly being trained as if it controls cities it actually ceded to the heuristic.",
+    "rationale": "On-policy PPO requires that recorded behavior matches the acting policy; a sampled-but-rejected action that silently defers to a different controller breaks that correspondence and biases the gradient toward whatever the masked-softmax over-weighted into illegal space.",
+    "suggested_addition": "Add: 'Guard-failure rate is a first-class telemetry metric (count canConstruct rejections / total deciding cities per arm). If non-negligible, investigate mask/legality drift \u2014 the mask should already exclude un-constructable items, so a rejection implies an obs\u2194apply legality mismatch that violates on-policy correctness, not a benign edge case.' State an expected guard-failure rate of \u22480 and assert it in the legality test.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "invalid reverse-map \u2192 guarded by `canConstruct` \u2192 fall back to \u22121 (heuristic builds).",
+      "if `idx\u22650` and `vocab.constructionId(idx)` is non-null and `city.cityConstructions.canConstruct(name)`, pre-fill"
+    ]
+  },
+  {
+    "title": "City-count-correlated log-ratio variance may bias the ON-vs-OFF comparison itself",
+    "severity": "major",
+    "primary_lens": "ml-correctness",
+    "target_file": "brief.md",
+    "target_section": "(E) TRAIN \u2014 construction logp summand",
+    "description": "Research insight #2 flags that \u03a3_cities log-ratio grows with city count, bounded by clamp(-20,20)+PPO clip. The brief treats this as a 'watch telemetry' note. But the deeper domain risk: the ON arm's effective learning signal is now correlated with how many cities a civ owns, i.e. with game phase and with winning (winners have more cities). This can systematically distort gradient magnitude toward late-game/large-empire states regardless of whether those builds were good.",
+    "rationale": "If the very metric that decides the ship gate (ON beats OFF, p<0.05) is influenced by a city-count-correlated variance artifact rather than build quality, the directional claim is confounded \u2014 a domain expert would not accept 'ON > OFF' as proof production control helps if the magnitude effect is structural.",
+    "suggested_addition": "Add a planned diagnostic: 'Before claiming the directional win, verify the ON-arm clip-fraction and per-step log-ratio are not dominated by high-city-count steps (bucket clip-fraction by Ncities). If they are, consider mean-over-cities (1/Ncities \u00b7 \u03a3) instead of sum for the construction summand, or per-head ratio normalization \u2014 decide this BEFORE the Medium run since it changes the loss.' Note this is a loss-shape decision, not telemetry-only.",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "the \u03a3_cities log-ratio grows with city count; the existing `logratio.clamp(-20,20)` + PPO clip bound it \u2014 watch ratio/clip-fraction telemetry on ON arms.",
+      "construction-ON beats construction-OFF, p<0.05"
+    ]
+  },
+  {
+    "title": "maxOwnCities cap silently drops construction decisions for overflow cities \u2014 undefined policy/heuristic boundary",
+    "severity": "minor",
+    "primary_lens": "ml-correctness",
+    "target_file": "brief.md",
+    "target_section": "Ordering contract (council C2 + scan surprise #1)",
+    "description": "own_cities is capped at caps.maxOwnCities. Cities beyond the cap are never in the mask, never decided by the policy, and (presumably) keep heuristic builds \u2014 but the brief never states this explicitly. For a civ with more than maxOwnCities cities, an arbitrary id-sorted suffix of the empire is permanently heuristic-controlled, which is a real domain behavior with strategic consequences (the largest empires are most cap-affected).",
+    "rationale": "From the domain lens, 'the policy controls production' is only true for the first maxOwnCities cities by id; the cap interacts with exactly the late-game large-empire states where production matters most, and leaving it implicit risks misinterpreting the experiment.",
+    "suggested_addition": "Add one line to the ordering contract: 'Cities beyond caps.maxOwnCities (id-sorted) are NOT decided by the policy and retain heuristic builds in both ON and OFF arms \u2014 production control is partial for empires exceeding the cap. Confirm maxOwnCities exceeds the typical own-city count at turn-cap 250 on Medium so the cap rarely binds; if it binds often, the experiment under-tests production control.'",
+    "supporting_roles": [
+      "domain_fidelity"
+    ],
+    "source_models": [
+      "anthropic/claude-opus-4.8"
+    ],
+    "source_excerpts": [
+      "`x.cities.sortedBy { it.id }`, **capped at `caps.maxOwnCities`**, is the canonical own_cities order.",
+      "**own_cities is CAPPED at `caps.maxOwnCities`**"
+    ]
+  }
+]

@@ -1,0 +1,14 @@
+{"step": 0, "phase": 1, "event": "end", "ts": "2026-06-29"}
+{"step": 3, "phase": 1, "event": "end", "ts": "2026-06-29"}
+{"step": 5, "phase": 2, "event": "start", "ts": "2026-06-29"}
+{"step": 7, "phase": 2, "event": "start", "ts": "2026-06-29"}
+{"step": 4, "phase": 2, "event": "start", "ts": "2026-06-29"}
+{"step": 4, "phase": 2, "event": "end", "ts": "2026-06-29"}
+{"event": "consolidation", "round": 1, "mode": "python", "raw_in": 31, "consolidated_out": 31, "ts": "2026-06-29T10:51:38Z"}
+{"step": 5, "phase": 2, "event": "end", "ts": "2026-06-29"}
+{"step": 7, "phase": 2, "event": "end", "ts": "2026-06-29"}
+{"step": 6, "phase": 2, "event": "skipped_no_conflicts", "ts": "2026-06-29"}
+{"step": 11, "phase": 2, "event": "start", "ts": "2026-06-29"}
+{"event": "consolidation", "round": 1, "mode": "python", "raw_in": 31, "consolidated_out": 31, "ts": "2026-06-29T11:04:36Z"}
+{"step": 11, "phase": 2, "event": "end", "ts": "2026-06-29"}
+{"step": 11, "phase": 2, "event": "gate_approved", "ts": "2026-06-29"}

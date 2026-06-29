@@ -1,0 +1,28 @@
+<h3>Schema delta — two new VARIABLE recorded blocks + version bump (lockstep)</h3>
+<table>
+  <caption>Recorded-step additions (one row per own city, in <code>orderedOwnCities</code> order). Reader is descriptor-generic → round-trips with no reader change.</caption>
+  <thead><tr><th scope="col">field</th><th scope="col">type</th><th scope="col">required / default</th><th scope="col">notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>construction_action</code></td><td>VARIABLE f32, perItem=1, count=ncities</td><td>new in v5</td><td>chosen <strong>0-indexed mask</strong> idx per own city; −1 = no decision</td></tr>
+    <tr><td><code>construction_logp</code></td><td>VARIABLE f32, perItem=1, count=ncities</td><td>new in v5</td><td>behavior log-prob per own city; 0 where no decision</td></tr>
+    <tr><td><code>SampleSchema.VERSION</code> / <code>SCHEMA_VERSION</code></td><td>int</td><td>4 → 5 (Kotlin + Python lockstep)</td><td>layout changed → old v4 shards refuse (<code>expect_compatible</code>); v7 replay starts fresh</td></tr>
+    <tr><td><code>OUTPUT_CONSTRUCTION</code> ("construction_logits")</td><td>ONNX output [B, n_cities(dyn), constrW]</td><td>new</td><td>value head still dropped from the policy-only export; dynamic city axis</td></tr>
+    <tr><td><code>actions</code> / <code>behavior_logp</code></td><td>FIXED f32, width 4 (MASK_HEADS)</td><td>unchanged</td><td>construction is a separate per-entity block, NOT a MASK_HEADS slot</td></tr>
+  </tbody>
+</table>
+<h3>Interface delta — new/changed signatures</h3>
+<pre><code>// Kotlin (engine)
+PolicyProvider.chooseConstructionWithLogp(civ, city, cityRow: Int, legalMask: BooleanArray, turn: Int): Pair&lt;Int,Float&gt;
+    // default impl = uniform-legal (RandomPolicy inherits); OnnxPolicy = one memoized forward → index row cityRow → MaskedChoice.chooseWithLogp
+Vocab.constructionId(idx: Int): String?           // inverse of the 0-INDEXED mask space (idx&lt;buildingCount→building; else→unit). NOT constructionCode (1-indexed).
+Featurizer.orderedOwnCities(civ): List&lt;City&gt;      // canonical: x.cities.sortedBy{it.id}, capped at caps.maxOwnCities — single source reused by featurizer + decision loop + recorder
+SampleConfig.controlConstruction: Boolean         // positional arg[8] across the Python→JVM bridge
+
+# Python (training)
+RichPolicyValueNet.forward(inputs) -> (tech, policy, construction, value)   // construction = [B, Ncities, constrW]
+run_loop.py: --control-construction {on,off}  (default ON for v7 arms)</code></pre>
+<h3>Training delta — joint logp gains one summand</h3>
+<pre><code>per-step logp = _masked_logp(tech) + _masked_logp(policy) + Σ_cities _masked_logp(construction_city)   # −1 → 0
+stored old_logp (behavior, incl. replay K=4) = the SAME sum  →  ratio exp(logp − old_logp) stays a per-step SCALAR
+advantage = terminal ±1 → GAE (current-value critic), multiplies the whole summed logp  (shared; no per-decision reward; no shaping)
+clip / value / entropy / GAE math otherwise verbatim from v6</code></pre>

@@ -1,0 +1,26 @@
+{
+  "slug": "selfplay-v7-construction",
+  "started": "2026-06-29",
+  "mode": "BUILD",
+  "size": "L",
+  "current_phase": 4,
+  "current_step": 17,
+  "last_completed_step": 16,
+  "spec_dir": "specs/2026-06-29-selfplay-v7-construction",
+  "repo_root": "/Users/j/Unciv",
+  "source_commit_at_start": "27feebe59d8063805bc127e8174b88884014bbe7",
+  "decisions": {
+    "rung": "both (4 arms)",
+    "experiment": "build-validate-then-run-to-completion"
+  },
+  "ship_criterion": "directional: ON>OFF p<0.05 within a rung, even below 50%",
+  "test_mode": "integration",
+  "validation": {
+    "AC1_legality": "PASS",
+    "AC2_parity": "PASS",
+    "AC4_schema": "PASS",
+    "AC5_noop": "PASS",
+    "AC6_throughput": "PASS(1.957x)",
+    "AC3_effect": "PENDING (4-arm Medium run)"
+  }
+}

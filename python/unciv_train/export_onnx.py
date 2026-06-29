@@ -47,15 +47,20 @@ class _PolicyOnly(nn.Module):
 
 class _RichPolicyOnly(nn.Module):
     """Export wrapper for the RICH net: takes POSITIONAL tensors (in `names` order — ONNX can't
-    trace a dict input), reassembles the dict the net expects, drops the value head."""
+    trace a dict input), reassembles the dict the net expects, drops the value head. v7: when
+    [with_construction] (structured nets), ALSO emits the per-city `construction_logits` output."""
 
-    def __init__(self, net: nn.Module, names: list[str]):
+    def __init__(self, net: nn.Module, names: list[str], with_construction: bool = False):
         super().__init__()
         self.net = net
         self.names = names
+        self.with_construction = with_construction
 
     def forward(self, *tensors):
         inputs = {name: t for name, t in zip(self.names, tensors)}
+        if self.with_construction:
+            tech, policy, construction, _value = self.net(inputs, with_construction=True)
+            return tech, policy, construction
         tech, policy, _value = self.net(inputs)
         return tech, policy
 
@@ -160,17 +165,25 @@ def export_rich(
             else:
                 dummy[k] = torch.as_tensor(np.asarray(v, dtype=np.float32))
 
-    wrapped = _RichPolicyOnly(net, names)
+    # v7: the structured net carries a per-city construction head → emit `construction_logits`
+    # [batch, n_own_cities, constr_w] (the n_own_cities axis is BOUND to the own_cities input's
+    # dynamic label, so the output city axis tracks the input city count). Rich-v2 nets lack the head.
+    with_construction = neighbors and hasattr(net, "construction_head")
+    output_names = [contract.OUTPUT_TECH, contract.OUTPUT_POLICY]
+    if with_construction:
+        output_names.append(contract.OUTPUT_CONSTRUCTION)
+        dyn[contract.OUTPUT_CONSTRUCTION] = {0: "batch", 1: "n_own_cities"}
+
+    wrapped = _RichPolicyOnly(net, names, with_construction)
     args = tuple(dummy[n] for n in names)  # POSITIONAL tensors in name order (ONNX-traceable)
     torch.onnx.export(
         wrapped, args, out_path,
         input_names=names,
-        output_names=[contract.OUTPUT_TECH, contract.OUTPUT_POLICY],
+        output_names=output_names,
         dynamic_axes=dyn,
         opset_version=opset,
     )
-    model = onnx.load(out_path)
-    onnx.helper.set_model_props(model, {
+    props = {
         contract.META_SCHEMA_VERSION: str(schema_version),
         contract.META_RULESET_FINGERPRINT: ruleset_fingerprint,
         contract.META_CONTRACT_VERSION: str(contract_version),
@@ -178,5 +191,9 @@ def export_rich(
         contract.META_TECH_WIDTH: str(dims.tech_w),
         contract.META_POLICY_WIDTH: str(dims.policy_w),
         contract.META_INPUT_NAMES: ",".join(names),
-    })
+    }
+    if with_construction:
+        props[contract.META_CONSTRUCTION_WIDTH] = str(int(net.constr_w))
+    model = onnx.load(out_path)
+    onnx.helper.set_model_props(model, props)
     _atomic_save(model, out_path)

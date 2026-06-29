@@ -50,4 +50,51 @@ class ConstructionCodeTest {
         // unknown name → 0 (no/empty construction)
         assertEquals(0, vocab.constructionCode("___not_a_real_construction___"))
     }
+
+    /**
+     * v7: [Vocab.constructionId] MUST invert the 0-INDEXED construction-MASK space (the layout of
+     * [LegalActionMasks.constructionMask] and the per-city net logits) — NOT the 1-indexed
+     * [Vocab.constructionCode]. The control path samples an index into the mask and decodes it with
+     * constructionId, so an off-by-one here would silently mislabel buildings as units (recorded != applied).
+     */
+    @Test
+    fun constructionIdInvertsTheZeroIndexedMaskSpace() {
+        val g = TestGame()
+        val vocab = Vocab(g.ruleset)
+        // buildings occupy mask indices [0, buildingCount): constructionId(building idx) == that building.
+        for (name in g.ruleset.buildings.keys) {
+            val idx = vocab.building(name)
+            if (idx >= 0) assertEquals("constructionId must invert the building mask index", name, vocab.constructionId(idx))
+        }
+        // units occupy mask indices [buildingCount, buildingCount+unitCount): offset by buildingCount.
+        for (name in g.ruleset.units.keys) {
+            val idx = vocab.unit(name)
+            if (idx >= 0) assertEquals("constructionId must invert the unit mask index (offset by buildingCount)",
+                name, vocab.constructionId(vocab.buildingCount + idx))
+        }
+        // out-of-range / negative → null (the abstain / no-decision sentinel).
+        assertEquals(null, vocab.constructionId(-1))
+        assertEquals(null, vocab.constructionId(vocab.buildingCount + vocab.unitCount))
+    }
+
+    /**
+     * v7: round-trip the mask itself — [LegalActionMasks.constructionMask] is exactly constrW wide and
+     * every set bit decodes (via constructionId) to a real building/unit id. Guards the per-city head's
+     * action-space width and the recorded-action → applied-construction mapping.
+     */
+    @Test
+    fun constructionMaskWidthAndRoundTrip() {
+        val g = TestGame(); g.makeHexagonalMap(4)
+        val civ = g.addCiv()
+        val city = g.addCity(civ, g.getTile(0, 0))
+        val vocab = Vocab(g.ruleset)
+        val mask = LegalActionMasks.constructionMask(city, vocab)
+        assertEquals("mask width must be buildingCount+unitCount", vocab.buildingCount + vocab.unitCount, mask.size)
+        var legal = 0
+        for (k in mask.indices) if (mask[k]) {
+            legal++
+            assertTrue("legal mask slot $k must decode to a real construction id", vocab.constructionId(k) != null)
+        }
+        assertTrue("a founded city must have ≥1 legal construction", legal > 0)
+    }
 }

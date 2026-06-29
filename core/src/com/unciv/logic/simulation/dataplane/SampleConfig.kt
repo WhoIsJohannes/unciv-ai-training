@@ -38,4 +38,7 @@ data class SampleConfig(
     val caps: SampleCaps = SampleCaps.DEFAULT,
     /** Route GameStarter's player shuffle through the seeded RNG (sim path only). */
     val deterministicShuffle: Boolean = true,
+    /** v7: when true, the installed policy DRIVES each deciding city's production (per-city construction
+     *  head); off ⇒ construction stays heuristic (the no-op / v6 path). MUST default off. */
+    val controlConstruction: Boolean = false,
 )

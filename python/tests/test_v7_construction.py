@@ -1,0 +1,232 @@
+"""v7 — per-city construction control head: schema contract (AC#4).
+
+RED until the v7 schema bump lands:
+  * Kotlin SampleSchema.VERSION 4 -> 5 AND Python unciv_dataplane.SCHEMA_VERSION 4 -> 5 (lockstep).
+  * The descriptor-generic reader must round-trip the two NEW variable f32 blocks
+    (`construction_action`, `construction_logp`, perItem=1, one row per own city) with NO reader change.
+
+These tests fail today because SCHEMA_VERSION == 4 (so `assert == 5` fails AND a v5 shard is refused
+by `expect_compatible`). They go GREEN once the lockstep bump lands — and the round-trip test proves
+AC#4 (new variable blocks decode without touching reader.py). The deeper trainer/no-op/parity/legality
+assertions (AC#1,#2,#5) live in the Kotlin suite + the construction-aware trainer tests added in build.
+"""
+
+import json
+import struct
+import zlib
+from pathlib import Path
+
+import pytest
+
+from unciv_dataplane import SCHEMA_VERSION, load
+
+MAGIC = b"UNCVSMP1"
+_STEP = struct.Struct("<ii4Bf")  # turn, civSlot, isFirst,isLast,isTerminal,overflow, reward
+
+
+def _build_shard_v7(*, version, n_steps=3, n_cities=3, constr_w=5) -> bytes:
+    """A shard whose layout includes the two new v7 VARIABLE f32 blocks aligned to own_cities."""
+    layout = [
+        {"name": "global", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
+        {"name": "mask_tech", "dtype": "<u1", "kind": "fixed", "perItem": 0, "len": 8},
+        {"name": "mask_construction", "dtype": "<u1", "kind": "var", "perItem": constr_w, "len": 0},
+        {"name": "actions", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
+        {"name": "behavior_logp", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
+        {"name": "construction_action", "dtype": "<f4", "kind": "var", "perItem": 1, "len": 0},
+        {"name": "construction_logp", "dtype": "<f4", "kind": "var", "perItem": 1, "len": 0},
+    ]
+    header = {
+        "schemaVersion": version, "uncivVersionText": "4.20.15", "uncivVersionNumber": 1229,
+        "compatibilityNumber": 4, "rulesetFingerprint": "abc123", "gitSha": None,
+        "gameId": "fixed-game-id", "seed": 42, "nTiles": 91, "caps": {"maxMajorCivs": 16},
+        "spatialChannels": ["visibility_state"], "layout": layout,
+    }
+    hdr = json.dumps(header).encode("utf-8")
+    records = bytearray()
+    for i in range(n_steps):
+        payload = bytearray()
+        payload += _STEP.pack(i, 0, 1 if i == 0 else 0, 1 if i == n_steps - 1 else 0,
+                              1 if i == n_steps - 1 else 0, 0, 0.0)
+        for blk in layout:
+            if blk.get("kind") == "var":
+                rows = n_cities
+                payload += struct.pack("<H", rows)
+                n = rows * blk["perItem"]
+                payload += (struct.pack(f"<{n}f", *([0.0] * n)) if blk["dtype"] == "<f4" else bytes(n))
+            else:
+                n = blk["len"]
+                payload += (struct.pack(f"<{n}f", *([0.0] * n)) if blk["dtype"] == "<f4" else bytes(n))
+        records += struct.pack("<I", len(payload)) + payload
+    out = bytearray()
+    out += MAGIC + struct.pack("<H", version) + struct.pack("<I", len(hdr)) + hdr + records
+    out += struct.pack("<II", n_steps, zlib.crc32(bytes(records)) & 0xFFFFFFFF)
+    return bytes(out)
+
+
+def test_schema_version_is_5():
+    """Lockstep bump landed on the Python side (mirrors Kotlin SampleSchema.VERSION)."""
+    assert SCHEMA_VERSION == 5, f"v7 requires SCHEMA_VERSION 5 (got {SCHEMA_VERSION})"
+
+
+def test_construction_blocks_round_trip(tmp_path):
+    """AC#4: the two new VARIABLE f32 blocks round-trip with NO reader change."""
+    n_cities, constr_w = 3, 5
+    p = tmp_path / "v7.bin"
+    p.write_bytes(_build_shard_v7(version=SCHEMA_VERSION, n_cities=n_cities, constr_w=constr_w))
+    shard = load(p)  # refuses today (SCHEMA_VERSION==4 != 5); GREEN after the bump
+    s0 = shard.steps[0]
+    assert "construction_action" in s0.blocks and "construction_logp" in s0.blocks
+    assert s0.blocks["construction_action"].shape == (n_cities, 1)
+    assert s0.blocks["construction_logp"].shape == (n_cities, 1)
+    assert s0.blocks["mask_construction"].shape == (n_cities, constr_w)
+
+
+def test_old_v4_shard_refused(tmp_path):
+    """A v4 shard must refuse to load against the v5 reader (perishable old data)."""
+    p = tmp_path / "old.bin"
+    p.write_bytes(_build_shard_v7(version=4))
+    from unciv_dataplane import ShardError
+    with pytest.raises(ShardError, match="VERSION"):
+        load(p)
+
+
+# ---- v7 trainer: no-op zero-summand oracle (AC#5 / PR1) + construction-trains sanity ----------------
+import copy as _copy
+
+import numpy as np
+import pytest as _pytest
+
+_pytest.importorskip("torch")
+import torch  # noqa: E402
+
+from unciv_train.contract import Dims  # noqa: E402
+from unciv_train.dataset import TrainTrajectory  # noqa: E402
+from unciv_train.model import RUNGS, StructuredPolicyValueNet, _SPATIAL_FIELD_PLAN  # noqa: E402
+from unciv_train.train import train_actor_critic_structured  # noqa: E402
+
+_TS = {"spatial": len(_SPATIAL_FIELD_PLAN), "own_units": 9, "opp_units": 9,
+       "own_cities": 17, "opp_cities": 17, "civ_tokens": 84}
+_VC = {"terrain": 6, "resource": 5, "improvement": 4, "religion": 3, "era": 4,
+       "building": 7, "unit": 8, "nation": 2, "promotion": 3}
+_CONSTR_W = _VC["building"] + _VC["unit"]
+
+
+def _traj_with_construction(dims, n_steps=4, *, n_cities=2, acted=False):
+    """A structured trajectory whose per-step rich dicts carry construction blocks. `acted=False` →
+    every city records action −1 (the OFF / no-op case); `acted=True` → real legal actions."""
+    rng = np.random.default_rng(0)
+    steps = []
+    for i in range(n_steps):
+        n_tiles = 3 + (i % 3)
+        coords = np.stack([np.arange(n_tiles), (np.arange(n_tiles) % 2)], axis=1).astype(np.float32)
+        mask = np.zeros((n_cities, _CONSTR_W), np.float32)
+        mask[:, :4] = 1.0                                   # first 4 constructions legal
+        if acted:
+            a = np.array([1 + (j % 3) for j in range(n_cities)], np.float32)  # legal idx in [0,4)
+            lp = np.full(n_cities, -1.3, np.float32)
+        else:
+            a = np.full(n_cities, -1.0, np.float32)
+            lp = np.zeros(n_cities, np.float32)
+        steps.append({
+            "global": np.zeros(dims.global_w, np.float32), "acting_civ": np.zeros(dims.acting_w, np.float32),
+            "spatial": rng.integers(0, 4, size=(n_tiles, _TS["spatial"])).astype(np.float32),
+            "spatial_coords": coords,
+            "own_units": rng.standard_normal((1, 9)).astype(np.float32), "opp_units": np.zeros((0, 9), np.float32),
+            "own_cities": rng.standard_normal((n_cities, 17)).astype(np.float32),
+            "opp_cities": np.zeros((0, 17), np.float32), "civ_tokens": rng.standard_normal((2, 84)).astype(np.float32),
+            "mask_construction": mask, "construction_action": a, "construction_logp": lp,
+        })
+    rewards = np.zeros(n_steps, np.float32); rewards[-1] = 1.0
+    return TrainTrajectory(np.zeros((n_steps, dims.input_w), np.float32),
+                           np.zeros(n_steps, np.int64), np.zeros(n_steps, np.int64),
+                           np.ones((n_steps, dims.tech_w), np.float32), np.ones((n_steps, dims.policy_w), np.float32),
+                           rewards, steps)
+
+
+def _weights(net):
+    return torch.cat([p.detach().reshape(-1) for p in net.parameters()])
+
+
+def test_construction_offarm_is_bit_identical_noop():
+    """AC#5 / PR1 deterministic oracle: with every city action −1 (OFF), wiring the construction
+    summand must NOT change the SHARED weights vs the pure-v6 path (construction=False) — max|Δw|<1e-6."""
+    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    tj = _traj_with_construction(dims, acted=False)
+    torch.manual_seed(0); net0 = StructuredPolicyValueNet(dims, _TS, _VC, **RUNGS["small"])
+    net_off, _, _ = train_actor_critic_structured(
+        [tj], dims, _TS, _VC, RUNGS["small"], epochs=2, lr=1e-3, seed=0, clip_eps=0.2,
+        net=_copy.deepcopy(net0), construction=False)
+    net_on, _, _ = train_actor_critic_structured(
+        [tj], dims, _TS, _VC, RUNGS["small"], epochs=2, lr=1e-3, seed=0, clip_eps=0.2,
+        net=_copy.deepcopy(net0), construction=True)
+    # compare only the SHARED params (the construction head exists in both deepcopies, untouched at init).
+    shared = [k for k in net0.state_dict() if not k.startswith("construction_head.")]
+    max_dw = max((net_off.state_dict()[k] - net_on.state_dict()[k]).abs().max().item() for k in shared)
+    assert max_dw < 1e-6, f"OFF construction summand is not a no-op: max|Δw|={max_dw}"
+
+
+def test_construction_trains_when_cities_act():
+    """Sanity: when cities DO record real construction actions, the construction summand changes the
+    gradient (construction=True diverges from the construction=False path) — the head actually learns."""
+    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    tj = _traj_with_construction(dims, acted=True)
+    torch.manual_seed(1); net0 = StructuredPolicyValueNet(dims, _TS, _VC, **RUNGS["small"])
+    net_off, _, _ = train_actor_critic_structured(
+        [tj], dims, _TS, _VC, RUNGS["small"], epochs=2, lr=1e-3, seed=0, clip_eps=0.2,
+        net=_copy.deepcopy(net0), construction=False)
+    net_on, _, _ = train_actor_critic_structured(
+        [tj], dims, _TS, _VC, RUNGS["small"], epochs=2, lr=1e-3, seed=0, clip_eps=0.2,
+        net=_copy.deepcopy(net0), construction=True)
+    assert (_weights(net_off) - _weights(net_on)).abs().max().item() > 1e-5, \
+        "construction actions did not affect training — the summand is inert when it shouldn't be"
+
+
+def test_construction_noop_holds_under_replay():
+    """The no-op must also hold with v6 replay (behavior_logp=True): an OFF step's stored old_logp
+    includes a 0 construction term, so the importance ratio and weights stay v6-identical."""
+    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    tj = _traj_with_construction(dims, acted=False)
+    torch.manual_seed(2); net0 = StructuredPolicyValueNet(dims, _TS, _VC, **RUNGS["small"])
+    net_off, _, _ = train_actor_critic_structured(
+        [tj], dims, _TS, _VC, RUNGS["small"], epochs=1, lr=1e-3, seed=0, clip_eps=0.2,
+        net=_copy.deepcopy(net0), behavior_logp=True, construction=False)
+    net_on, _, _ = train_actor_critic_structured(
+        [tj], dims, _TS, _VC, RUNGS["small"], epochs=1, lr=1e-3, seed=0, clip_eps=0.2,
+        net=_copy.deepcopy(net0), behavior_logp=True, construction=True)
+    shared = [k for k in net0.state_dict() if not k.startswith("construction_head.")]
+    max_dw = max((net_off.state_dict()[k] - net_on.state_dict()[k]).abs().max().item() for k in shared)
+    assert max_dw < 1e-6, f"OFF no-op broken under replay: max|Δw|={max_dw}"
+
+
+def test_construction_logits_ort_matches_torch():
+    """AC#2 (parity): the ONNX-runtime per-city construction logits == the torch construction head on
+    a fixed observation (atol 1e-4). The JVM OnnxPolicy reads the SAME ORT output, so ORT==torch is the
+    cross-boundary numerical guarantee for the new per-city head."""
+    ort = _pytest.importorskip("onnxruntime")
+    import tempfile, os
+    import unciv_train.contract as C
+    from unciv_train.export_onnx import export_rich
+    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    torch.manual_seed(3)
+    net = StructuredPolicyValueNet(dims, _TS, _VC, **RUNGS["medium"]); net.eval()
+    N, M = 5, 3
+    inp = {"global": torch.randn(1, 8), "acting_civ": torch.randn(1, 6),
+           "spatial": torch.randn(1, N, _TS["spatial"]), "spatial_mask": torch.ones(1, N),
+           "neighbor_index": torch.zeros(1, N, 6, dtype=torch.long), "neighbor_mask": torch.ones(1, N, 6)}
+    for n in ("own_units", "opp_units", "own_cities", "opp_cities", "civ_tokens"):
+        cnt = M if n == "own_cities" else 1
+        inp[n] = torch.randn(1, cnt, _TS[n]); inp[n + "_mask"] = torch.ones(1, cnt)
+    with torch.no_grad():
+        _t, _p, c_torch, _v = net(inp, with_construction=True)
+    tmp = tempfile.mktemp(suffix=".onnx")
+    export_rich(net, dims, _TS, tmp, schema_version=5, ruleset_fingerprint="fp",
+                sample_inputs={k: v.numpy() for k, v in inp.items()}, neighbors=True,
+                contract_version=C.CONTRACT_VERSION_STRUCTURED)
+    sess = ort.InferenceSession(tmp)
+    feed = {i.name: (inp[i.name].numpy() if i.name != "neighbor_index" else inp[i.name].numpy().astype("int64"))
+            for i in sess.get_inputs()}
+    c_ort = sess.run([C.OUTPUT_CONSTRUCTION], feed)[0]
+    os.remove(tmp)
+    assert c_ort.shape == tuple(c_torch.shape), f"{c_ort.shape} != {tuple(c_torch.shape)}"
+    assert np.allclose(c_torch.numpy(), c_ort, atol=1e-4), \
+        f"construction logits ORT != torch: max|Δ|={np.abs(c_torch.numpy()-c_ort).max()}"

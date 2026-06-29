@@ -144,6 +144,19 @@ def _rich_step_blocks(blocks: dict, n_channels: int) -> dict:
         if arr.ndim == 1:                      # empty VARIABLE block decoded as 1D
             arr = arr.reshape(0, arr.shape[0] if arr.size else 0)
         out[name] = arr
+    # v7: per-city construction — the legal mask [ncities, constr_w] + the recorded action / behavior
+    # logp [ncities] (−1 / 0 where the city did not decide), aligned to own_cities (orderedOwnCities).
+    mc = blocks.get("mask_construction")
+    mc = np.asarray(mc, dtype=np.float32) if mc is not None else np.zeros((0, 0), np.float32)
+    if mc.ndim == 1:
+        mc = mc.reshape(0, mc.shape[0] if mc.size else 0)
+    out["mask_construction"] = mc
+    ca = blocks.get("construction_action")
+    out["construction_action"] = (np.asarray(ca, dtype=np.float32).reshape(-1)
+                                  if ca is not None else np.zeros(0, np.float32))
+    cl = blocks.get("construction_logp")
+    out["construction_logp"] = (np.asarray(cl, dtype=np.float32).reshape(-1)
+                                if cl is not None else np.zeros(0, np.float32))
     return out
 
 

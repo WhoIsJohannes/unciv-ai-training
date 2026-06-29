@@ -437,6 +437,23 @@ class StructuredPolicyValueNet(nn.Module):
         self.value_head = nn.Linear(trunk_w, 1)
         _small_init_value_head(self.value_head)
 
+        # v7 per-city CONSTRUCTION head: reads each own_cities token's embedding (gnn_channels in the
+        # Phase-A GNN-only path, attn_dim after self-attn in Phase-B) ⊕ the broadcast trunk body, →
+        # per-city logits over the construction-mask space (buildings ∪ units, width from the schema —
+        # NEVER hardcoded). Per-city, NOT pooled. Inert for OFF arms (no construction actions → 0 logp).
+        self.constr_w = int(vocab_counts["building"]) + int(vocab_counts["unit"])
+        own_city_emb_w = gnn_channels if not self.use_attn else attn_dim
+        self.construction_head = nn.Sequential(
+            nn.Linear(own_city_emb_w + trunk_w, trunk_w), nn.ReLU(),
+            nn.Linear(trunk_w, self.constr_w),
+        )
+
+    def _construction_logits(self, own_city_emb: torch.Tensor, body: torch.Tensor) -> torch.Tensor:
+        """Per-city construction logits [B, M, constr_w] from each own_city embedding ⊕ broadcast trunk."""
+        m = own_city_emb.shape[1]
+        body_b = body.unsqueeze(1).expand(-1, m, -1)                  # [B, M, trunk_w]
+        return self.construction_head(torch.cat([own_city_emb, body_b], dim=-1))
+
     def _gather_node_by_tile(self, h_pad: torch.Tensor, tile_idx: torch.Tensor,
                              N: int) -> torch.Tensor:
         """Gather each entity's co-located GNN node embedding (FND-0036 entity↔node join).
@@ -451,7 +468,10 @@ class StructuredPolicyValueNet(nn.Module):
         gathered = torch.gather(h_pad, 1, idx.unsqueeze(-1).expand(B, M, C))  # [B,M,C]
         return gathered
 
-    def forward(self, inputs: dict[str, torch.Tensor]):
+    def forward(self, inputs: dict[str, torch.Tensor], with_construction: bool = False):
+        """FROZEN seam: returns (tech, policy, tanh(value)). v7: when [with_construction], returns
+        (tech, policy, construction[B,M,constr_w], value) — the trainer + ONNX export opt in; every
+        existing 3-tuple caller is unchanged."""
         g = inputs[self.INPUT_GLOBAL]
         a = inputs[self.INPUT_ACTING]
         spatial = inputs[self.SPATIAL]                       # [B,N,13] float
@@ -465,16 +485,25 @@ class StructuredPolicyValueNet(nn.Module):
             h = layer(h, nbr_idx, nbr_mask)                  # [B,N,C]
 
         if not self.use_attn:
-            # ---- Phase A path (GNN-only) — unchanged. ----
+            # ---- Phase A path (GNN-only) — unchanged seam. ----
             board = _masked_mean(h, spatial_mask)            # [B,C] board vector
             parts = [board]
+            own_city_emb = None
             for name in self.ENTITY_NAMES:
-                parts.append(self.entity_enc[name](inputs[name], inputs[name + "_mask"]))
+                enc = self.entity_enc[name]
+                if with_construction and name == "own_cities":
+                    own_city_emb = enc.proj(inputs[name])    # [B,M,gnn_channels] per-city (pre-pool)
+                    parts.append(_masked_mean(own_city_emb, inputs[name + "_mask"]))
+                else:
+                    parts.append(enc(inputs[name], inputs[name + "_mask"]))
             parts += [g, a]
             body = self.shared(torch.cat(parts, dim=1))
             ph = self.policy_body(body)
             vh = self.value_body(body)
-            return self.tech_head(ph), self.policy_head(ph), torch.tanh(self.value_head(vh))
+            tech, policy, value = self.tech_head(ph), self.policy_head(ph), torch.tanh(self.value_head(vh))
+            if with_construction:
+                return tech, policy, self._construction_logits(own_city_emb, body), value
+            return tech, policy, value
 
         # ---- Phase B path (attention). ----
         B, N, C = h.shape
@@ -485,6 +514,7 @@ class StructuredPolicyValueNet(nn.Module):
         # D4 per-entity-set self-attention (with the FND-0036 entity↔node join where a tile index
         # exists). Refined tokens + masks are kept for the cross-attention union.
         ent_tok, ent_mask = [], []
+        own_city_emb = None
         for name in self.ENTITY_NAMES:
             tok = inputs[name]                               # [B,M,raw_width]
             m = inputs[name + "_mask"]                       # [B,M]
@@ -503,6 +533,8 @@ class StructuredPolicyValueNet(nn.Module):
                 t = t + self.node_to_attn(node)              # [B,M,attn_dim] fused
             for blk in self.self_attn[name]:
                 t = blk(t, t, m)                             # self-attn: q=kv=t, presence mask
+            if with_construction and name == "own_cities":
+                own_city_emb = t                             # [B,M,attn_dim] refined per-city (pre-zero)
             # zero out padded tokens so they contribute nothing as cross-attn keys/values.
             t = t * m.unsqueeze(-1)
             ent_tok.append(t)
@@ -521,4 +553,7 @@ class StructuredPolicyValueNet(nn.Module):
         body = self.shared(torch.cat([cross_ctx, g, a], dim=1))
         ph = self.policy_body(body)
         vh = self.value_body(body)
-        return self.tech_head(ph), self.policy_head(ph), torch.tanh(self.value_head(vh))
+        tech, policy, value = self.tech_head(ph), self.policy_head(ph), torch.tanh(self.value_head(vh))
+        if with_construction:
+            return tech, policy, self._construction_logits(own_city_emb, body), value
+        return tech, policy, value

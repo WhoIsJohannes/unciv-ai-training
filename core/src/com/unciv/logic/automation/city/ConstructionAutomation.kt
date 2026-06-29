@@ -12,6 +12,7 @@ import com.unciv.logic.civilization.NotificationIcon
 import com.unciv.logic.map.BFS
 import com.unciv.logic.map.mapunit.MapUnit
 import com.unciv.logic.map.tile.Tile
+import com.unciv.logic.simulation.dataplane.DataPlaneHooks
 import com.unciv.models.ruleset.Building
 import com.unciv.models.ruleset.IConstruction
 import com.unciv.models.ruleset.INonPerpetualConstruction
@@ -114,6 +115,7 @@ class ConstructionAutomation(val cityConstructions: CityConstructions) {
 
 
     fun chooseNextConstruction(): Unit = timeThis("ConstructionAutomation.chooseNextConstruction") {
+        if (DataPlaneHooks.constructionControlled(city)) return  // v7: the policy pre-filled this city's production this turn
         if (cityConstructions.getCurrentConstruction() !is PerpetualConstruction) return  // don't want to be stuck on these forever
         
         addBuildingChoices()

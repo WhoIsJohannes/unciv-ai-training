@@ -42,6 +42,32 @@ def _entropy(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return -(p * logp).sum(dim=1)
 
 
+def _construction_logp_sum(logits: torch.Tensor, actions: torch.Tensor,
+                           mask: torch.Tensor) -> torch.Tensor:
+    """v7 per-step construction logp: Σ_cities log π(a_city | s) over the legal-masked softmax, 0 where
+    the city did not act (action < 0). `logits`/`mask`: [n, M, W]; `actions`: [n, M] → returns [n]. The
+    −1 gating makes an OFF step (all cities −1) contribute EXACTLY 0 (bit-identical no-op vs v6)."""
+    neg = torch.where(mask > 0, logits, torch.full_like(logits, -1e9))
+    logp = F.log_softmax(neg, dim=2)                       # over the W construction-action axis
+    acted = actions >= 0                                   # [n, M]
+    idx = actions.clamp(min=0).unsqueeze(2)                # [n, M, 1]
+    chosen = logp.gather(2, idx).squeeze(2)               # [n, M]
+    chosen = torch.where(acted, chosen, torch.zeros_like(chosen))
+    return chosen.sum(dim=1)                               # [n]
+
+
+def _construction_entropy_sum(logits: torch.Tensor, actions: torch.Tensor,
+                              mask: torch.Tensor) -> torch.Tensor:
+    """v7 per-step construction entropy, summed over ACTING cities only (gated by action ≥ 0) so an
+    OFF step contributes 0 — preserving the bit-identical no-op. [n, M, W] → [n]."""
+    neg = torch.where(mask > 0, logits, torch.full_like(logits, -1e9))
+    p = F.softmax(neg, dim=2)
+    logp = F.log_softmax(neg, dim=2)
+    ent = -(p * logp).sum(dim=2)                           # [n, M]
+    ent = torch.where(actions >= 0, ent, torch.zeros_like(ent))
+    return ent.sum(dim=1)                                  # [n]
+
+
 def compute_gae(rewards, values, gamma: float = 0.99, lam: float = 0.95):
     """Episodic GAE over ONE trajectory. reward terminal-only (0 except the last step);
     V(terminal)=0 bootstrap. Returns (advantages, returns) as float32 arrays of the same length.
@@ -136,10 +162,39 @@ def _optimize_actor_critic(
     norm_adv: bool,
     stored_old_logp: torch.Tensor | None = None,  # v6: per-step SUM of head behavior logps for REPLAYED
                                                   # (off-policy) data. None ⇒ recompute = on-policy = v5 path.
+    a_construction: torch.Tensor | None = None,   # v7: per-step per-city construction action [n, M] (−1 = no decision)
+    m_construction: torch.Tensor | None = None,   # v7: per-city construction legal mask [n, M, W]
 ) -> tuple[object, dict]:
     import copy
     opt = optimizer                  # v5: persistent optimizer (built once in the trainer, carried by run_loop)
     n = int(a_tech.shape[0])
+    use_construction = a_construction is not None   # v7: forward_fn returns a 4-tuple (+construction logits)
+
+    def _unpack(out):
+        """forward_fn / forward_chunk_fn return (tl, pl, val) normally; (tl, pl, cl, val) when the
+        construction head is wired. Normalize to (tl, pl, cl|None, val)."""
+        if use_construction:
+            return out  # (tl, pl, cl, val)
+        tl, pl, val = out
+        return tl, pl, None, val
+
+    def _policy_logp(tl, pl, cl, lo, hi):
+        """Per-step joint logp = tech + policy (+ Σ_cities construction). Slices the construction
+        tensors to [lo:hi] (None lo/hi ⇒ whole batch). Construction adds EXACTLY 0 when no city acted."""
+        s = _masked_logp(tl, a_tech[lo:hi], m_tech[lo:hi]) + _masked_logp(pl, a_policy[lo:hi], m_policy[lo:hi])
+        if cl is not None:
+            ac, mc = a_construction[lo:hi], m_construction[lo:hi]
+            if cl.shape[1] != ac.shape[1]:
+                raise ValueError(f"construction city-axis mismatch: net {cl.shape[1]} != actions {ac.shape[1]} "
+                                 "(own_cities padding must equal construction padding — same orderedOwnCities count)")
+            s = s + _construction_logp_sum(cl, ac, mc)
+        return s
+
+    def _policy_entropy(tl, pl, cl, lo, hi):
+        e = _entropy(tl, m_tech[lo:hi]) + _entropy(pl, m_policy[lo:hi])
+        if cl is not None:
+            e = e + _construction_entropy_sum(cl, a_construction[lo:hi], m_construction[lo:hi])
+        return e
     use_micro = (micro_batch_steps is not None and micro_batch_steps > 0
                  and forward_chunk_fn is not None and micro_batch_steps < n)  # <=0 ⇒ whole-batch no-op
     # v6 GUARD: with stored behavior logp (off-policy replay), clip_eps MUST be truthy — the
@@ -165,18 +220,17 @@ def _optimize_actor_critic(
             v_parts, lp_parts = [], []
             for lo in range(0, n, micro_batch_steps):
                 hi = min(lo + micro_batch_steps, n)
-                tl0, pl0, v0 = forward_chunk_fn(lo, hi)
+                tl0, pl0, cl0, v0 = _unpack(forward_chunk_fn(lo, hi))
                 v_parts.append(v0.reshape(-1))
                 if stored_old_logp is None:                 # only recompute when on-policy
-                    lp_parts.append(_masked_logp(tl0, a_tech[lo:hi], m_tech[lo:hi])
-                                    + _masked_logp(pl0, a_policy[lo:hi], m_policy[lo:hi]))
+                    lp_parts.append(_policy_logp(tl0, pl0, cl0, lo, hi))
             val0 = torch.cat(v_parts)
             old_logp = stored_old_logp.detach() if stored_old_logp is not None else torch.cat(lp_parts).detach()
         else:
-            tl0, pl0, val0 = forward_fn()
+            tl0, pl0, cl0, val0 = _unpack(forward_fn())
             val0 = val0.reshape(-1)
             old_logp = (stored_old_logp.detach() if stored_old_logp is not None
-                        else (_masked_logp(tl0, a_tech, m_tech) + _masked_logp(pl0, a_policy, m_policy)).detach())
+                        else _policy_logp(tl0, pl0, cl0, None, None).detach())
     v_np = val0.cpu().numpy()
     adv_np = np.zeros(n, dtype=np.float32)
     ret_np = np.zeros(n, dtype=np.float32)
@@ -203,9 +257,9 @@ def _optimize_actor_critic(
             for lo in range(0, n, micro_batch_steps):
                 hi = min(lo + micro_batch_steps, n)
                 w = (hi - lo) / n
-                tl, pl, val = forward_chunk_fn(lo, hi)
+                tl, pl, cl, val = _unpack(forward_chunk_fn(lo, hi))
                 val = val.reshape(-1)
-                logp = _masked_logp(tl, a_tech[lo:hi], m_tech[lo:hi]) + _masked_logp(pl, a_policy[lo:hi], m_policy[lo:hi])
+                logp = _policy_logp(tl, pl, cl, lo, hi)
                 if clip_eps:
                     logratio = (logp - old_logp[lo:hi]).clamp(-20.0, 20.0)
                     ratio = torch.exp(logratio)
@@ -217,7 +271,7 @@ def _optimize_actor_critic(
                 else:
                     policy_loss = -(adv[lo:hi] * logp).mean()
                 value_loss = F.mse_loss(val, ret[lo:hi])
-                ent = (_entropy(tl, m_tech[lo:hi]) + _entropy(pl, m_policy[lo:hi])).mean()
+                ent = _policy_entropy(tl, pl, cl, lo, hi).mean()
                 loss_c = (policy_loss + value_coef * value_loss - entropy_coef * ent) * w
                 loss_c.backward()                           # accumulate grad; free the chunk graph
                 loss_total += float(loss_c.detach())
@@ -240,9 +294,9 @@ def _optimize_actor_critic(
             if clip_eps:
                 stats.update(mean_ratio=ratio_sum / n, clip_frac=clip_count / n)
         else:
-            tl, pl, val = forward_fn()
+            tl, pl, cl, val = _unpack(forward_fn())
             val = val.reshape(-1)
-            logp = _masked_logp(tl, a_tech, m_tech) + _masked_logp(pl, a_policy, m_policy)
+            logp = _policy_logp(tl, pl, cl, None, None)
             if clip_eps:                                        # PPO clip (default ON; 0/None ⇒ plain A2C)
                 logratio = (logp - old_logp).clamp(-20.0, 20.0)  # guard exp() overflow on big policy shifts
                 ratio = torch.exp(logratio)
@@ -254,7 +308,7 @@ def _optimize_actor_critic(
             else:                                               # plain A2C (single-epoch use)
                 policy_loss = -(adv * logp).mean()
             value_loss = F.mse_loss(val, ret)
-            ent = (_entropy(tl, m_tech) + _entropy(pl, m_policy)).mean()
+            ent = _policy_entropy(tl, pl, cl, None, None).mean()
             loss = policy_loss + value_coef * value_loss - entropy_coef * ent
 
             if not torch.isfinite(loss):                        # divergence guard (R8 + council 🔴)
@@ -298,6 +352,38 @@ def _stack_traj(trajectories: list[TrainTrajectory]):
     b_logp_tech = torch.tensor(np.concatenate([_blogp("b_logp_tech", t) for t in trajectories]))
     b_logp_policy = torch.tensor(np.concatenate([_blogp("b_logp_policy", t) for t in trajectories]))
     return a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy
+
+
+def _stack_construction(trajectories: list[TrainTrajectory], constr_w: int):
+    """v7: per-step ragged construction (action / logp / mask, in `rich` dicts) → dense padded tensors
+    aligned to the SAME max city count `build_rich_batch` pads own_cities to (per-step own_cities count
+    == construction count == orderedOwnCities size). Pad action=−1 / logp=0 / mask=0 (inert rows → 0
+    logp). Returns (a_construction[n,M] int, b_logp_construction[n] f32, m_construction[n,M,W] f32)."""
+    acts, logps, masks = [], [], []
+    for t in trajectories:
+        rich = t.rich
+        for i in range(len(t.rewards)):
+            step = rich[i] if rich is not None else None
+            a = np.asarray(step["construction_action"], np.int64).reshape(-1) if step is not None and "construction_action" in step else np.zeros(0, np.int64)
+            lp = np.asarray(step["construction_logp"], np.float32).reshape(-1) if step is not None and "construction_logp" in step else np.zeros(0, np.float32)
+            mk = np.asarray(step["mask_construction"], np.float32) if step is not None and "mask_construction" in step else np.zeros((0, constr_w), np.float32)
+            if mk.ndim == 1:
+                mk = mk.reshape(0, constr_w)
+            acts.append(a); logps.append(lp); masks.append(mk)
+    n = len(acts)
+    big_m = max((a.shape[0] for a in acts), default=0)
+    m_dim = max(1, big_m)                                   # ≥1 so the tensors aren't degenerate
+    a_c = np.full((n, m_dim), -1, np.int64)
+    lp_c = np.zeros((n, m_dim), np.float32)
+    mk_c = np.zeros((n, m_dim, constr_w), np.float32)
+    for i, (a, lp, mk) in enumerate(zip(acts, logps, masks)):
+        k = a.shape[0]
+        if k:
+            a_c[i, :k] = a
+            lp_c[i, :k] = lp
+            if mk.shape[0] == k and mk.shape[1] == constr_w:
+                mk_c[i, :k] = mk
+    return torch.tensor(a_c), torch.tensor(lp_c.sum(axis=1)), torch.tensor(mk_c)
 
 
 def train_actor_critic_blind(
@@ -421,6 +507,7 @@ def train_actor_critic_structured(
     optimizer=None,                  # v5: warm optimizer; None ⇒ built once here and carried by run_loop
     micro_batch_steps: int | None = None,  # v5: chunk the dense traversal (medium rung on Medium)
     behavior_logp: bool = False,     # v6: use stored behavior logp as old_logp (off-policy replay); False ⇒ v5 recompute
+    construction: bool = True,       # v7: train the per-city construction head; False ⇒ pure v6 path (no-op oracle)
 ) -> tuple[object, dict, object]:
     """v4 STRUCTURED variant: same encoder-AGNOSTIC core (_optimize_actor_critic) + same rich
     batch/stacking as train_actor_critic_rich — ONLY the nn.Module is swapped for
@@ -443,11 +530,20 @@ def train_actor_critic_structured(
     stored = (b_logp_tech + b_logp_policy) if behavior_logp else None
     inputs = build_rich_batch(trajectories, dims, token_specs)
 
+    # v7: per-city construction tensors (action / behavior-logp-sum / mask), padded to the SAME city
+    # axis build_rich_batch pads own_cities to. The construction summand is part of the per-step joint
+    # logp AND (for replay) the stored old_logp — the importance ratio covers all heads jointly.
+    a_construction = m_construction = None
+    if construction:
+        a_construction, b_logp_construction, m_construction = _stack_construction(trajectories, net.constr_w)
+        if stored is not None:
+            stored = stored + b_logp_construction
+
     def forward_fn():
-        return net(inputs)
+        return net(inputs, with_construction=construction)
 
     def forward_chunk_fn(lo, hi):    # slice every [B,...] tensor on axis 0 (per-row independent forward)
-        return net({k: v[lo:hi] for k, v in inputs.items()})
+        return net({k: v[lo:hi] for k, v in inputs.items()}, with_construction=construction)
 
     net, stats = _optimize_actor_critic(
         net, forward_fn, optimizer=optimizer, forward_chunk_fn=forward_chunk_fn,
@@ -456,5 +552,6 @@ def train_actor_critic_structured(
         rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
         gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
         clip_eps=clip_eps, norm_adv=norm_adv, stored_old_logp=stored,
+        a_construction=a_construction, m_construction=m_construction,
     )
     return net, stats, optimizer

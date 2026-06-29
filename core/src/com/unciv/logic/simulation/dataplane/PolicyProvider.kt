@@ -1,6 +1,7 @@
 package com.unciv.logic.simulation.dataplane
 
 import com.unciv.logic.automation.unit.UnitAutomation
+import com.unciv.logic.city.City
 import com.unciv.logic.civilization.Civilization
 import com.unciv.logic.map.mapunit.MapUnit
 import kotlin.math.ln
@@ -33,6 +34,19 @@ interface PolicyProvider {
         return idx to (if (nLegal > 0) ln(1.0 / nLegal).toFloat() else 0f)
     }
 
+    /**
+     * v7 — per-ENTITY construction decision: pick a legal construction-mask index for [city] (row
+     * [cityRow] in the civ's [Featurizer.orderedOwnCities]) PLUS its behavior log-prob log π_b, for
+     * off-policy replay. The index is in the 0-indexed construction-mask space (width
+     * buildingCount+unitCount), decoded back to a building/unit id via [Vocab.constructionId].
+     *
+     * Default: ABSTAIN (`-1 to 0f`) ⇒ the heuristic `ConstructionAutomation` builds. This is the
+     * safe fallback for any policy that doesn't model construction (and the OFF / no-op path).
+     * [RandomPolicy] overrides with uniform-over-legal (the opponent is "random" on construction the
+     * same way it is on tech/policy); [OnnxPolicy] overrides with the net's masked-softmax sample.
+     */
+    fun chooseConstructionWithLogp(civ: Civilization, city: City, cityRow: Int, legalMask: BooleanArray, turn: Int): Pair<Int, Float> = -1 to 0f
+
     /** Act on a unit. Default policies route this into the existing UnitAutomation sub-routines. */
     fun actUnit(unit: MapUnit)
 }
@@ -48,6 +62,15 @@ class RandomPolicy(private val rngFor: (Civilization, Int) -> Random) : PolicyPr
         val legal = legalMask.indices.filter { legalMask[it] }
         if (legal.isEmpty()) return -1
         return legal[rngFor(civ, turn).nextInt(legal.size)]
+    }
+
+    /** Uniform-over-legal construction with its uniform log-prob `ln(1/nLegal)` — the opponent is
+     *  "random" on construction the same way it is on tech/policy. Deterministic via [rngFor]. */
+    override fun chooseConstructionWithLogp(civ: Civilization, city: City, cityRow: Int, legalMask: BooleanArray, turn: Int): Pair<Int, Float> {
+        val legal = legalMask.indices.filter { legalMask[it] }
+        if (legal.isEmpty()) return -1 to 0f
+        val idx = legal[rngFor(civ, turn).nextInt(legal.size)]
+        return idx to ln(1.0 / legal.size).toFloat()
     }
 
     override fun actUnit(unit: MapUnit) {

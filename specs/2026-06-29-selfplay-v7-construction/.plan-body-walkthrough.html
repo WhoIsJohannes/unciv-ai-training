@@ -1,0 +1,11 @@
+<p><em>Illustrative mock values — not measured; sanity-check against the design above.</em> Civ "Rome" (controlled, construction ON), turn 80, 3 cities; buildingCount=40, unitCount=18 → constrW=58.</p>
+<ol>
+  <li><strong>observe(Rome)</strong> → <code>orderedOwnCities=[c12,c31,c54]</code>; <code>mask_construction</code> rows: c12 legal {Granary=idx5, Worker=idx40}, c31 mid-building a Wonder, c54 idle (Perpetual-Gold) legal {Library=idx8, Warrior=idx41}.</li>
+  <li><strong>chooseAndApply</strong> tech→idx14 (logp −2.3), policy→idx3 (logp −1.6).</li>
+  <li><strong>construction loop</strong>: c12 deciding (row0); c31 NOT idle → −1; c54 idle (row2).</li>
+  <li><strong>OnnxPolicy</strong> ONE memoized forward → <code>construction_logits[3][58]</code>; row0 masked-softmax (single RNG draw) → idx5 Granary (logp −1.1); row2 → idx8 Library (logp −0.9).</li>
+  <li><strong>pre-fill + guard</strong>: c12.queue[0]="Granary", c54.queue[0]="Library"; <code>ConstructionAutomation</code> skips c12,c54 (controls && pre-filled); c31 untouched.</li>
+  <li><strong>recordStep</strong>: <code>construction_action=[5,−1,8]</code>, <code>construction_logp=[−1.1,0,−0.9]</code>; stored old_logp = −2.3−1.6−1.1−0.9 = −5.9.</li>
+  <li><strong>train (later)</strong>: pad to Nmax; live logp recomputes over recorded [5,−1,8]; ratio=exp(logp−(−5.9)) × step GAE advantage (terminal ±1).</li>
+</ol>
+<p>OFF arm / missing <code>OUTPUT_CONSTRUCTION</code>: hop 3 returns −1 for all cities → heuristic builds → summand 0 → identical to v6.</p>

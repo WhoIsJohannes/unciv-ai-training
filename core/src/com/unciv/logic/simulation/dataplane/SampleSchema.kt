@@ -13,6 +13,12 @@ package com.unciv.logic.simulation.dataplane
  */
 object SampleSchema {
     /**
+     * VERSION 5 (was 4): v7 per-city CONSTRUCTION control head. Adds two per-step VARIABLE blocks
+     * aligned to the `own_cities` tokens (same `x.cities.sortedBy{it.id}`-capped order): the chosen
+     * construction action [BLOCK_CONSTRUCTION_ACTION] (0-indexed mask idx, −1 = no decision) and its
+     * behavior log-prob [BLOCK_CONSTRUCTION_LOGP] (0 where no decision). A v4 shard lacks the blocks ⇒
+     * not layout-compatible ⇒ the Python reader refuses it ⇒ regenerate (v4/v5 replay never mix).
+     *
      * VERSION 4 (was 3): adds a per-step [BLOCK_BEHAVIOR_LOGP] block for off-policy replay (v6) — the
      * per-head behavior-policy log π_b recorded AT SAMPLING TIME. A v3 shard lacks the block ⇒ it is
      * not layout-compatible ⇒ the Python reader refuses it ⇒ regenerate.
@@ -24,7 +30,7 @@ object SampleSchema {
      * is not layout-compatible. (VERSION 2 was: real terminal reward + applied civ-level action.)
      * The Python reader REFUSES a VERSION mismatch ⇒ regenerate; datasets are perishable by design.
      */
-    const val VERSION = 4
+    const val VERSION = 5
 
     /** 8 ASCII bytes at the head of every shard. */
     const val MAGIC = "UNCVSMP1"
@@ -35,8 +41,9 @@ object SampleSchema {
      * the cross-boundary PARITY test). Tensor SHAPES/WIDTHS are runtime-derived from the loaded GnK
      * vocab (`Vocab.techCount`/`policyCount`) — never hardcoded — and stamped into the ONNX metadata.
      *
-     * v1 models ONLY the `tech` + `policy` civ-level heads; `greatPerson`/`diplomaticVote` and all
-     * per-entity heads keep the heuristic/RandomPolicy fallback.
+     * v1 models the `tech` + `policy` civ-level heads; v7 adds the per-city `construction` head as an
+     * OPTIONAL extra output [OUTPUT_CONSTRUCTION] on the structured path (a model lacking it falls back
+     * to the heuristic). `greatPerson`/`diplomaticVote` and unit-intent keep the heuristic fallback.
      */
     object OnnxContract {
         /** Contract v1 = blind single-tensor input ("obs"); v1-reinforce + blind-critic models. */
@@ -64,8 +71,15 @@ object SampleSchema {
         const val HEX_DEGREE = 6
         const val OUTPUT_TECH = "tech_logits"
         const val OUTPUT_POLICY = "policy_logits"
-        /** The civ-level heads the net controls, in `actions`-block order. */
+        /** v7 per-city construction head: OPTIONAL extra output on the structured path, shaped
+         *  [B, n_cities(dynamic), constrW] where constrW = vocab.buildingCount + vocab.unitCount.
+         *  A model without this output ⇒ OnnxPolicy falls back to the heuristic (no construction control). */
+        const val OUTPUT_CONSTRUCTION = "construction_logits"
+        /** The civ-level heads the net controls, in `actions`-block order. Construction is per-ENTITY
+         *  (one decision per own city), recorded in its own VARIABLE blocks — NOT a MASK_HEADS slot. */
         val MODELED_HEADS = listOf("tech", "policy")
+        /** ONNX metadata: the construction head's per-city width (constrW), for the load-time dim cross-check. */
+        const val META_CONSTRUCTION_WIDTH = "construction_width"
         // ONNX metadata_props keys (provenance gate — read on the JVM via session.getMetadata()).
         const val META_SCHEMA_VERSION = "schema_version"
         const val META_RULESET_FINGERPRINT = "ruleset_fingerprint"
@@ -131,6 +145,16 @@ object SampleSchema {
      * replayed steps; it is NOT an ONNX model I/O (the model emits logits; logp is derived from them).
      */
     const val BLOCK_BEHAVIOR_LOGP = "behavior_logp"
+
+    /**
+     * v7 (VERSION 5): the per-city CONSTRUCTION decision, recorded as two VARIABLE f32 blocks (perItem=1,
+     * one row per own city in the `own_cities` / `mask_construction` order). [BLOCK_CONSTRUCTION_ACTION]
+     * is the chosen 0-indexed construction-mask idx (−1 = the city did not decide this turn);
+     * [BLOCK_CONSTRUCTION_LOGP] is its masked-softmax behavior log-prob (0f where no decision). SHARD-ONLY
+     * — the trainer sums log π_b(construction) over deciding cities into the per-step off-policy old_logp.
+     */
+    const val BLOCK_CONSTRUCTION_ACTION = "construction_action"
+    const val BLOCK_CONSTRUCTION_LOGP = "construction_logp"
 
     /** Factored legal-action mask heads (boolean per candidate). Unit-intent + per-city
      *  construction are emitted per-entity in the UNIT/CITY tokens, not as global heads. */
