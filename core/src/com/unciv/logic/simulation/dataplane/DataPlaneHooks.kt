@@ -5,6 +5,7 @@ import com.unciv.logic.GameInfo
 import com.unciv.logic.automation.civilization.NextTurnAutomation
 import com.unciv.logic.city.City
 import com.unciv.logic.civilization.Civilization
+import com.unciv.models.ruleset.PerpetualConstruction
 import com.unciv.models.ruleset.unique.GameContext
 import com.unciv.utils.Log
 import java.io.File
@@ -60,12 +61,7 @@ object DataPlaneHooks {
         { civ, turn -> GameContext(civInfo = civ).stateBasedRandom("dataplane-policy-$turn") }
 
     // ---- per-game state: a Featurizer (always, for control masks + emit obs) + an optional recorder ----
-    private class GameState(val featurizer: Featurizer, val vocab: Vocab, val recorder: ShardRecorder?) {
-        /** v7: cityId → the turn at which the policy pre-filled that city's production. Read by
-         *  [constructionControlled] so `ConstructionAutomation.chooseNextConstruction` skips the
-         *  heuristic for exactly the cities the policy drove this turn. */
-        val prefilledConstruction = ConcurrentHashMap<String, Int>()
-    }
+    private class GameState(val featurizer: Featurizer, val vocab: Vocab, val recorder: ShardRecorder?)
     private val games = ConcurrentHashMap<GameInfo, GameState>()
     @Volatile private var installedPolicy: PolicyProvider? = null
 
@@ -105,11 +101,13 @@ object DataPlaneHooks {
     fun controls(civ: Civilization): Boolean =
         installedPolicy != null && civ.isMajorCiv() && !civ.isSpectator() && games.containsKey(civ.gameInfo)
 
-    /** v7 — true iff the policy pre-filled [city]'s production THIS turn (the no-op-safe controlled-civ
-     *  guard `ConstructionAutomation.chooseNextConstruction` uses to skip the heuristic for exactly the
-     *  cities the policy drove). False when construction control is off / the city abstained. */
-    fun constructionControlled(city: City): Boolean =
-        games[city.civ.gameInfo]?.prefilledConstruction?.get(city.id) == city.civ.gameInfo.turns
+    /** v7.1 — true iff per-city construction control is ACTIVE for [civ] (a controlled civ in a game
+     *  whose config has `controlConstruction`). `ConstructionAutomation.chooseNextConstruction` returns
+     *  early for these civs, so the heuristic NEVER refills construction — a controlled city goes idle
+     *  (PerpetualConstruction) when its current item COMPLETES, and the policy picks the next at the
+     *  following civ-turn (commit-until-done cadence: ONE decision per construction, no per-turn churn). */
+    fun controlsConstruction(civ: Civilization): Boolean =
+        controls(civ) && games[civ.gameInfo]?.featurizer?.config?.controlConstruction == true
 
     private fun handleCivTurn(civ: Civilization, state: GameState) {
         val policy = installedPolicy ?: return
@@ -117,7 +115,7 @@ object DataPlaneHooks {
         val config = state.featurizer.config
         val obs = state.featurizer.observe(civ)
         val turn = civ.gameInfo.turns
-        val d = chooseAndApply(civ, policy, state.vocab, config, state.prefilledConstruction, obs, turn)
+        val d = chooseAndApply(civ, policy, state.vocab, config, obs, turn)
         state.recorder?.recordStep(civ, obs, d.actions, d.behaviorLogp, d.constructionActions, d.constructionLogp, turn)
     }
 
@@ -136,7 +134,7 @@ object DataPlaneHooks {
      *  off-policy replay (summed across heads + cities into the per-step old_logp). */
     private fun chooseAndApply(
         civ: Civilization, policy: PolicyProvider, vocab: Vocab, config: SampleConfig,
-        prefilled: ConcurrentHashMap<String, Int>, obs: Observation, turn: Int,
+        obs: Observation, turn: Int,
     ): CivTurnDecision {
         val actions = FloatArray(SampleSchema.MASK_HEADS.size) { -1f }
         val behaviorLogp = FloatArray(SampleSchema.MASK_HEADS.size) { 0f }
@@ -169,21 +167,22 @@ object DataPlaneHooks {
             val maskFlat = obs.block("mask_construction")
             if (maskFlat.size == cities.size * constrW) {  // alignment guard (must always hold)
                 cities.forEachIndexed { i, city ->
-                    // The policy DRIVES each city's production every turn (pre-fills queue[0]). It does NOT
-                    // wait for the city to be idle-on-perpetual: at the onCivTurn hook the heuristic has
-                    // kept every city mid-build, so a perpetual-only gate fires ~never (the lever would be
-                    // inert). Switching is non-destructive — Unciv stores accumulated production per
-                    // construction (`inProgressConstructions`), so the policy can re-pick freely and the
-                    // reward shapes coherent choices. Puppet cities (no player construction control) skip.
+                    // v7.1 COMMIT-UNTIL-DONE cadence: decide ONLY when the city is idle (on a
+                    // PerpetualConstruction). Because the heuristic chooseNextConstruction is disabled for
+                    // controlled-construction civs (see ConstructionAutomation / [controlsConstruction]),
+                    // the city goes idle exactly when its current item COMPLETES — so the policy picks the
+                    // NEXT construction once per item, NOT every turn. This avoids the per-turn churn that
+                    // made the construction logp/entropy summand dominate the joint PPO objective (~6
+                    // decisions/step → instability + the whole policy fails to learn; v7 small-rung 47%→14%).
                     if (city.isPuppet) return@forEachIndexed
+                    if (city.cityConstructions.getCurrentConstruction() !is PerpetualConstruction) return@forEachIndexed
                     val row = BooleanArray(constrW) { k -> maskFlat[i * constrW + k] != 0f }
-                    if (row.none { it }) return@forEachIndexed   // no legal construction → heuristic (−1)
+                    if (row.none { it }) return@forEachIndexed   // no legal construction → stays idle (−1)
                     val (idx, logp) = policy.chooseConstructionWithLogp(civ, city, i, row, turn)
                     if (idx < 0) return@forEachIndexed
                     val name = vocab.constructionId(idx) ?: return@forEachIndexed   // PR4 null-guard
                     if (!city.cityConstructions.getConstruction(name).isBuildable(city.cityConstructions)) return@forEachIndexed
-                    city.cityConstructions.setCurrentConstruction(name)   // pre-fill queue[0]
-                    prefilled[city.id] = turn                              // controlled-civ guard marker
+                    city.cityConstructions.setCurrentConstruction(name)   // commit queue[0]
                     cActions[i] = idx.toFloat(); cLogp[i] = logp
                 }
             }

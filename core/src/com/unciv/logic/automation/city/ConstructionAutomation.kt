@@ -115,7 +115,7 @@ class ConstructionAutomation(val cityConstructions: CityConstructions) {
 
 
     fun chooseNextConstruction(): Unit = timeThis("ConstructionAutomation.chooseNextConstruction") {
-        if (DataPlaneHooks.constructionControlled(city)) return  // v7: the policy pre-filled this city's production this turn
+        if (DataPlaneHooks.controlsConstruction(city.civ)) return  // v7.1: policy owns this civ's production (heuristic disabled → city goes idle at completion, policy re-picks)
         if (cityConstructions.getCurrentConstruction() !is PerpetualConstruction) return  // don't want to be stuck on these forever
         
         addBuildingChoices()
