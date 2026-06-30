@@ -33,7 +33,28 @@ axis within each rung pair. **Construction-ON does not beat OFF in either rung; 
   merely non-beneficial at higher capacity. It is NOT the lever that crosses 50% — at least not in this
   design.
 
-## What this does NOT rule out (explicit v7.1 follow-ups — not run here)
+## v7.1 investigation (per "understand why before the 10h re-run") — ROOT CAUSE FOUND
+The churning hypothesis was tested and **disproven**. Two findings:
+1. **Cadence is not the cause.** v7.1 changed per-turn override → commit-until-done (decide only at
+   construction completion; heuristic disabled for controlled civs). This cut decisions/step 5.8 → 0.6
+   and **fixed the training instability** (entropy 0.39→1.13 healthy like OFF; no grad-norm 957 spike).
+   But small-ON got **WORSE: 2.0% (4/204)** — commit-until-done amplifies bad choices (the city is stuck
+   building each pick). So churning/objective-domination was a symptom, not the root cause.
+2. **Root cause = UNIT-BIAS from weak credit assignment.** The net over-builds UNITS (military) and
+   starves BUILDINGS (economy), beyond mask availability:
+   - small-ON (2%): chose 58% units vs 42% offered → **+16pp unit-bias**.
+   - medium-ON (37%): chose 43% units vs 35% offered → **+8pp unit-bias** (more capacity → less bias → better).
+   Economy buildings pay off over a long horizon — too hard to credit-assign from a terminal-only ±1
+   reward — so the net defaults to "build a unit now," stalling its economy. The hand-tuned heuristic
+   knows to build economy (OFF 47%). The unit-bias magnitude tracks the harm (small +16%→2%, medium +8%→37%).
+
+**Conclusion: construction control via from-scratch RL with terminal-only reward learns a unit-biased,
+economy-starving policy that the heuristic beats. Not a cadence bug, not a mechanical bug — a sparse-reward
+credit-assignment limit over a large per-city action space.** A real fix needs imitation warm-start (init
+the head from the heuristic) OR a denser/shaped reward (the latter is FROZEN out of v7 scope). Neither is
+a quick tweak; further full runs would only re-confirm the negative.
+
+## What this does NOT rule out (explicit follow-ups — require a bigger effort, not run here)
 1. **Decision cadence** — decide at construction-completion (the natural commit point) rather than every
    turn, to remove churning. (The plan's perpetual-only gate was inert because the heuristic keeps cities
    busy; a completion-triggered gate is the untested middle ground.)
