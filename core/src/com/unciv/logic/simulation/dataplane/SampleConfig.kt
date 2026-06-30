@@ -41,4 +41,8 @@ data class SampleConfig(
     /** v7: when true, the installed policy DRIVES each deciding city's production (per-city construction
      *  head); off ⇒ construction stays heuristic (the no-op / v6 path). MUST default off. */
     val controlConstruction: Boolean = false,
+    /** v7.1b: restrict the policy's construction choice to BUILDINGS (mask out units in
+     *  `mask_construction` when [controlConstruction]); units fall back to the heuristic. Removes the
+     *  diagnosed unit-bias (the net over-built units, starving the economy) + halves the action space. */
+    val constructionBuildingsOnly: Boolean = true,
 )

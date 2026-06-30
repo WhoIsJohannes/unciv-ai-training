@@ -120,9 +120,15 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
 
         // ---- masks ----
         val constrW = vocab.buildingCount + vocab.unitCount
+        // v7.1b: when the policy controls construction buildings-only, mask out units (indices ≥
+        // buildingCount) so the per-city head can only choose BUILDINGS — units fall to the heuristic.
+        // This removes the diagnosed unit-bias (the net over-built units, starving the economy). Gated on
+        // controlConstruction so the OFF arm's mask is unchanged (no-op vs v6 preserved).
+        val buildingsOnly = config.controlConstruction && config.constructionBuildingsOnly
         val construction = FloatArray(ownCityList.size * constrW)
         ownCityList.forEachIndexed { i, c ->
-            val m = LegalActionMasks.constructionMask(c, vocab); for (k in m.indices) if (m[k]) construction[i * constrW + k] = 1f
+            val m = LegalActionMasks.constructionMask(c, vocab)
+            for (k in m.indices) if (m[k] && !(buildingsOnly && k >= vocab.buildingCount)) construction[i * constrW + k] = 1f
         }
         val promoW = vocab.promotionCount
         val promotion = FloatArray(ownUnitList.size * promoW)
