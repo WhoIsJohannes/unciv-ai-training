@@ -133,6 +133,7 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
     # v6: window-gated source switch — replay active ⇒ use the STORED behavior logp as old_logp for
     # the (off-policy) replayed steps; else behavior_logp=False ⇒ literal v5 recompute path.
     bl = replay_active if replay_active is not None else (getattr(args, "replay_window", 1) > 1)
+    rsc = getattr(args, "reward_shaping_coef", 0.0)   # v7.2: PBRS coefficient (0 ⇒ terminal-only)
     if variant == "v1-reinforce":   # v1 is not continual — ignores warm net/opt
         net, stats = tr.train_reinforce(trajectories_or_steps, dims, epochs=args.epochs,
                                         lr=args.lr, seed=seed, entropy_coef=args.entropy_coef)
@@ -142,7 +143,7 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             trajectories_or_steps, dims, epochs=args.epochs, lr=args.lr, seed=seed,
             gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
-            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl)
+            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl, reward_shaping_coef=rsc)
         return net, stats, "blind", optimizer
     if variant == "rich-critic":
         token_specs = contract.token_specs_from_schema(schema_path)
@@ -150,7 +151,7 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             trajectories_or_steps, dims, token_specs, epochs=args.epochs, lr=args.lr, seed=seed,
             gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
-            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl)
+            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl, reward_shaping_coef=rsc)
         return net, stats, ("rich", token_specs), optimizer
     if variant == "structured":
         from .model import RUNGS
@@ -161,7 +162,7 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             trajectories_or_steps, dims, token_specs, vocab_counts, rung, epochs=args.epochs,
             lr=args.lr, seed=seed, gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
-            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl,
+            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl, reward_shaping_coef=rsc,
             construction=(getattr(args, "control_construction", "off") == "on"))   # v7: train the per-city head only when ON
         return net, stats, ("structured", token_specs), optimizer
     raise ValueError(f"unknown variant {variant!r}")
@@ -261,6 +262,12 @@ def main(argv=None) -> int:
                          "construction head) in gen+eval AND the trainer sums the construction logp into "
                          "the joint PPO ratio. 'off' ⇒ construction stays heuristic (the v6 / no-op path). "
                          "Only the STRUCTURED variant carries the head.")
+    ap.add_argument("--reward-shaping-coef", type=float, default=0.0,
+                    help="v7.2: potential-based reward shaping coefficient. Adds F = coef·(γ·Φ(s')−Φ(s)) "
+                         "to each step, where Φ is the recorded log-stabilized economy potential. PBRS is "
+                         "policy-invariant (Ng-Harada) — it shortens the credit horizon for long-payoff "
+                         "decisions (construction) WITHOUT changing the optimal 'win the game' policy. "
+                         "0 ⇒ terminal-only (unchanged). Try ~0.1.")
     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
     args = ap.parse_args(argv)
     if args.variant == "rich-v2":   # alias for the v4 structured encoder

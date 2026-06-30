@@ -61,6 +61,9 @@ class TrainTrajectory:
     # replay; real shards (SCHEMA_VERSION≥4) always populate both. _stack_traj treats None as zeros.
     b_logp_tech: np.ndarray | None = None
     b_logp_policy: np.ndarray | None = None
+    # v7.2: per-step log-stabilized economy potential Φ(s), [T] f32. None for synthetic trajectories
+    # (no shaping). The trainer forms the policy-invariant shaping reward F = γ·Φ(s')−Φ(s) from it.
+    phi: np.ndarray | None = None
 
 
 def _learner_slot(header: dict, learner_civ_id: str) -> int | None:
@@ -209,8 +212,10 @@ def load_trajectories(
         # SCHEMA_VERSION=4 guarantees the block (fail-loud, matching the perishable-dataset discipline).
         b_logp_tech = np.array([float(s.blocks["behavior_logp"][0]) for s in steps], dtype=np.float32)
         b_logp_policy = np.array([float(s.blocks["behavior_logp"][1]) for s in steps], dtype=np.float32)
+        # v7.2: per-step economy potential Φ(s) (SCHEMA_VERSION≥6). Fail-loud — no .get() fallback.
+        phi = np.array([float(s.blocks["phi"][0]) for s in steps], dtype=np.float32)
         rich_blocks = ([_rich_step_blocks(s.blocks, expected_spatial_channels) for s in steps]
                        if rich else None)
         out.append(TrainTrajectory(obs, a_tech, a_policy, mask_tech, mask_policy, rewards, rich_blocks,
-                                   b_logp_tech, b_logp_policy))
+                                   b_logp_tech, b_logp_policy, phi=phi))
     return out

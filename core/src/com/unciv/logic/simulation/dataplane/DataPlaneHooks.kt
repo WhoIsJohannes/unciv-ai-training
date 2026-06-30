@@ -10,6 +10,7 @@ import com.unciv.models.ruleset.unique.GameContext
 import com.unciv.utils.Log
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.ln
 import kotlin.random.Random
 
 /** Per-run wiring bundle handed to [Simulation] when the data plane is enabled. */
@@ -283,7 +284,8 @@ class ShardRecorder(
             Observation.Block("actions", SampleSchema.DT_F32, BlockKind.FIXED, 0, actions) +
             Observation.Block(SampleSchema.BLOCK_BEHAVIOR_LOGP, SampleSchema.DT_F32, BlockKind.FIXED, 0, behaviorLogp) +
             Observation.Block(SampleSchema.BLOCK_CONSTRUCTION_ACTION, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionActions) +
-            Observation.Block(SampleSchema.BLOCK_CONSTRUCTION_LOGP, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionLogp)
+            Observation.Block(SampleSchema.BLOCK_CONSTRUCTION_LOGP, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionLogp) +
+            Observation.Block(SampleSchema.BLOCK_PHI, SampleSchema.DT_F32, BlockKind.FIXED, 0, floatArrayOf(economyPotential(x)))
         if (!opened) {
             layout = blocks
             val header = DataPlaneHooks.buildHeaderJson(gameInfo, fingerprint, gameId, seed, config.caps, blocks, vocab)
@@ -293,6 +295,20 @@ class ShardRecorder(
         }
         emitter.record(framePayload(turn, civSlot, isFirst = isFirst, isLast = false, isTerminal = false,
             overflow = obs.overflow, reward = 0f, blocks = blocks))
+    }
+
+    /** v7.2: the civ's log-stabilized ECONOMY POTENTIAL Φ(s) — ln(1+Σprod)+ln(1+Σfood)+ln(1+Σscience)
+     *  over its cities + ln(1+#techs). The ln keeps Φ bounded so the potential-based shaping reward
+     *  F = γ·Φ(s')−Φ(s) the trainer forms cannot drift-dominate the terminal ±1. Reads the cached
+     *  per-city currentCityStats (good enough — PBRS is policy-invariant for any Φ that tracks strength). */
+    private fun economyPotential(x: Civilization): Float {
+        var prod = 0.0; var food = 0.0; var sci = 0.0
+        for (c in x.cities) {
+            val s = c.cityStats.currentCityStats
+            prod += s.production.toDouble(); food += s.food.toDouble(); sci += s.science.toDouble()
+        }
+        return (ln(1.0 + prod) + ln(1.0 + food) + ln(1.0 + sci)
+            + ln(1.0 + x.tech.getNumberOfTechsResearched())).toFloat()
     }
 
     /** Emit one terminal reward-carrier per recorded civ: isTerminal=1, reward=±1 (winner/loser) or

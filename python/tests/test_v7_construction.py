@@ -34,6 +34,7 @@ def _build_shard_v7(*, version, n_steps=3, n_cities=3, constr_w=5) -> bytes:
         {"name": "behavior_logp", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
         {"name": "construction_action", "dtype": "<f4", "kind": "var", "perItem": 1, "len": 0},
         {"name": "construction_logp", "dtype": "<f4", "kind": "var", "perItem": 1, "len": 0},
+        {"name": "phi", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 1},  # v7.2 economy potential
     ]
     header = {
         "schemaVersion": version, "uncivVersionText": "4.20.15", "uncivVersionNumber": 1229,
@@ -63,9 +64,9 @@ def _build_shard_v7(*, version, n_steps=3, n_cities=3, constr_w=5) -> bytes:
     return bytes(out)
 
 
-def test_schema_version_is_5():
-    """Lockstep bump landed on the Python side (mirrors Kotlin SampleSchema.VERSION)."""
-    assert SCHEMA_VERSION == 5, f"v7 requires SCHEMA_VERSION 5 (got {SCHEMA_VERSION})"
+def test_schema_version_is_6():
+    """Lockstep bump landed on the Python side (mirrors Kotlin SampleSchema.VERSION). v6 = v7.2 phi."""
+    assert SCHEMA_VERSION == 6, f"v7.2 requires SCHEMA_VERSION 6 (got {SCHEMA_VERSION})"
 
 
 def test_construction_blocks_round_trip(tmp_path):
@@ -230,3 +231,35 @@ def test_construction_logits_ort_matches_torch():
     assert c_ort.shape == tuple(c_torch.shape), f"{c_ort.shape} != {tuple(c_torch.shape)}"
     assert np.allclose(c_torch.numpy(), c_ort, atol=1e-4), \
         f"construction logits ORT != torch: max|Δ|={np.abs(c_torch.numpy()-c_ort).max()}"
+
+
+# ---- v7.2 potential-based reward shaping (PBRS) ----------------------------------------------------
+def test_pbrs_telescopes_to_constant_offset():
+    """Policy-invariance (Ng-Harada): the shaping the trainer applies — shaped[t] += coef*(γ*φ[t+1]-φ[t])
+    for t<L-1, last step unshaped — adds to the DISCOUNTED return exactly coef*(γ^(L-1)*φ[L-1] - φ[0]),
+    a constant determined only by the (fixed-start) φ[0] and a vanishing γ^(L-1) tail. So the optimal
+    policy over the discounted return is unchanged; only the credit timing shifts."""
+    rng = np.random.default_rng(0)
+    gamma, coef, L = 0.99, 0.1, 40
+    phi = rng.standard_normal(L).astype(np.float32) * 3 + 10
+    rewards = np.zeros(L, np.float32); rewards[-1] = 1.0
+    shaped = rewards.copy()
+    shaped[:L-1] += coef * (gamma * phi[1:] - phi[:-1])               # the exact code formula
+    disc = gamma ** np.arange(L)
+    offset = float((disc * (shaped - rewards)).sum())
+    expected = coef * (gamma ** (L - 1) * phi[L-1] - phi[0])          # telescoped form
+    assert abs(offset - expected) < 1e-4, f"PBRS does not telescope to a constant: {offset} vs {expected}"
+
+
+def test_pbrs_coef_zero_and_none_phi_are_noops():
+    """coef=0 OR phi=None ⇒ no shaping ⇒ bit-identical training to the terminal-only path."""
+    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    tj = _traj_with_construction(dims, acted=False)   # phi defaults None on this synthetic trajectory
+    torch.manual_seed(0); net0 = StructuredPolicyValueNet(dims, _TS, _VC, **RUNGS["small"])
+    base, _, _ = train_actor_critic_structured([tj], dims, _TS, _VC, RUNGS["small"], epochs=2, lr=1e-3,
+        seed=0, clip_eps=0.2, net=_copy.deepcopy(net0), construction=False, reward_shaping_coef=0.0)
+    # coef>0 but phi is None (synthetic) → the None-guard must make it a no-op.
+    coefpos, _, _ = train_actor_critic_structured([tj], dims, _TS, _VC, RUNGS["small"], epochs=2, lr=1e-3,
+        seed=0, clip_eps=0.2, net=_copy.deepcopy(net0), construction=False, reward_shaping_coef=0.1)
+    max_dw = (_weights(base) - _weights(coefpos)).abs().max().item()
+    assert max_dw < 1e-6, f"PBRS not a no-op when phi is None: max|Δw|={max_dw}"

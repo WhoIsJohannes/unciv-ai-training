@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 
 # Mirror of com.unciv.logic.simulation.dataplane.SampleSchema.VERSION — keep in lockstep.
+# v6 (v7.2 potential-based reward shaping): adds a per-step FIXED f32 scalar `phi` — the civ's log-
+# stabilized economy potential Φ(s). The trainer adds the policy-invariant shaping reward
+# F = γ·Φ(s')−Φ(s) (Ng-Harada) to shorten the credit horizon. A v5 shard lacks `phi` ⇒ refuse ⇒ regen.
 # v5 (v7 per-city construction head): adds two per-step VARIABLE f32 blocks aligned to own_cities —
 # `construction_action` (chosen 0-indexed construction-mask idx; −1 = no decision) and
 # `construction_logp` (its behavior log-prob; 0 where no decision). A v4 shard lacks the blocks ⇒ not
@@ -22,7 +25,7 @@ from typing import Any
 # recorded at sampling time). A v3 shard lacks the block ⇒ not layout-compatible ⇒ reader refuses.
 # v3 (v4 structured encoder): adds the per-tile spatial_coords (f32 x,y) block, map dims in global,
 # per-entity tile-index, and the construction-namespace fix. v2/v1 shards are not layout-compatible.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class SchemaError(Exception):

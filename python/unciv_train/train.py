@@ -164,6 +164,8 @@ def _optimize_actor_critic(
                                                   # (off-policy) data. None ⇒ recompute = on-policy = v5 path.
     a_construction: torch.Tensor | None = None,   # v7: per-step per-city construction action [n, M] (−1 = no decision)
     m_construction: torch.Tensor | None = None,   # v7: per-city construction legal mask [n, M, W]
+    phi_np: np.ndarray | None = None,             # v7.2: per-step economy potential Φ(s), flat-batch [n]
+    reward_shaping_coef: float = 0.0,             # v7.2: PBRS coefficient; 0 ⇒ no shaping (terminal-only)
 ) -> tuple[object, dict]:
     import copy
     opt = optimizer                  # v5: persistent optimizer (built once in the trainer, carried by run_loop)
@@ -232,11 +234,25 @@ def _optimize_actor_critic(
             old_logp = (stored_old_logp.detach() if stored_old_logp is not None
                         else _policy_logp(tl0, pl0, cl0, None, None).detach())
     v_np = val0.cpu().numpy()
+    # v7.2 POTENTIAL-BASED REWARD SHAPING (Ng-Harada, policy-invariant): add F_t = coef·(γ·Φ_{t+1}−Φ_t)
+    # to each non-terminal step WITHIN a trajectory; the LAST step keeps only the terminal ±1 (F=0 there,
+    # so the terminal reward stands alone). The F terms telescope to a constant, leaving the optimal
+    # policy unchanged — they only shorten the credit horizon (a Granary's economic payoff registers in
+    # a few steps via Φ instead of ~200 turns later via the terminal critic). coef=0 ⇒ exact terminal-only.
+    shaped_rewards = rewards_np
+    if reward_shaping_coef and phi_np is not None:
+        shaped_rewards = rewards_np.copy()
+        off = 0
+        for L in traj_lens:
+            if L >= 2:
+                ph = phi_np[off:off + L]
+                shaped_rewards[off:off + L - 1] += reward_shaping_coef * (gamma * ph[1:] - ph[:-1])
+            off += L
     adv_np = np.zeros(n, dtype=np.float32)
     ret_np = np.zeros(n, dtype=np.float32)
     off = 0
     for L in traj_lens:
-        a, r = compute_gae(rewards_np[off:off + L], v_np[off:off + L], gamma, lam)
+        a, r = compute_gae(shaped_rewards[off:off + L], v_np[off:off + L], gamma, lam)
         adv_np[off:off + L] = a
         ret_np[off:off + L] = r
         off += L
@@ -351,7 +367,9 @@ def _stack_traj(trajectories: list[TrainTrajectory]):
         return v if v is not None else np.zeros(len(t.rewards), dtype=np.float32)
     b_logp_tech = torch.tensor(np.concatenate([_blogp("b_logp_tech", t) for t in trajectories]))
     b_logp_policy = torch.tensor(np.concatenate([_blogp("b_logp_policy", t) for t in trajectories]))
-    return a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy
+    # v7.2: per-step economy potential Φ(s), flat-batch order; None ⇒ zeros (no shaping for synthetic trajs).
+    phi_np = np.concatenate([_blogp("phi", t) for t in trajectories]).astype(np.float32)
+    return a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy, phi_np
 
 
 def _stack_construction(trajectories: list[TrainTrajectory], constr_w: int):
@@ -403,6 +421,7 @@ def train_actor_critic_blind(
     optimizer=None,                  # v5: warm optimizer; None ⇒ built once here
     micro_batch_steps: int | None = None,
     behavior_logp: bool = False,     # v6: use stored behavior logp as old_logp (off-policy replay); False ⇒ v5 recompute
+    reward_shaping_coef: float = 0.0,  # v7.2: PBRS coefficient (F = coef·(γ·Φ'−Φ)); 0 ⇒ terminal-only
 ) -> tuple[PolicyNet, dict, object]:
     if net is None:
         torch.manual_seed(seed)
@@ -411,7 +430,7 @@ def train_actor_critic_blind(
         optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     if not trajectories:
         return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}, optimizer
-    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy = _stack_traj(trajectories)
+    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy, phi_np = _stack_traj(trajectories)
     # v6: stored behavior logp (sum of per-head logps) for off-policy replayed data; None ⇒ on-policy (v5).
     stored = (b_logp_tech + b_logp_policy) if behavior_logp else None
     obs = torch.tensor(np.concatenate([t.obs for t in trajectories]))
@@ -429,6 +448,7 @@ def train_actor_critic_blind(
         rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
         gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
         clip_eps=clip_eps, norm_adv=norm_adv, stored_old_logp=stored,
+        phi_np=phi_np, reward_shaping_coef=reward_shaping_coef,
     )
     return net, stats, optimizer
 
@@ -451,6 +471,7 @@ def train_actor_critic_rich(
     optimizer=None,                  # v5: warm optimizer; None ⇒ built once here
     micro_batch_steps: int | None = None,
     behavior_logp: bool = False,     # v6: use stored behavior logp as old_logp (off-policy replay); False ⇒ v5 recompute
+    reward_shaping_coef: float = 0.0,  # v7.2: PBRS coefficient (F = coef·(γ·Φ'−Φ)); 0 ⇒ terminal-only
 ) -> tuple[object, dict, object]:
     """Rich variant. Trajectories carry `rich` dicts of padded per-step token tensors + masks
     (assembled by features.build_rich_batch). The whole round is one padded batch.
@@ -465,7 +486,7 @@ def train_actor_critic_rich(
         optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     if not trajectories:
         return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}, optimizer
-    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy = _stack_traj(trajectories)
+    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy, phi_np = _stack_traj(trajectories)
     # v6: stored behavior logp (sum of per-head logps) for off-policy replayed data; None ⇒ on-policy (v5).
     stored = (b_logp_tech + b_logp_policy) if behavior_logp else None
     inputs = build_rich_batch(trajectories, dims, token_specs)  # dict[name -> tensor], padded
@@ -483,6 +504,7 @@ def train_actor_critic_rich(
         rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
         gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
         clip_eps=clip_eps, norm_adv=norm_adv, stored_old_logp=stored,
+        phi_np=phi_np, reward_shaping_coef=reward_shaping_coef,
     )
     return net, stats, optimizer
 
@@ -507,6 +529,7 @@ def train_actor_critic_structured(
     optimizer=None,                  # v5: warm optimizer; None ⇒ built once here and carried by run_loop
     micro_batch_steps: int | None = None,  # v5: chunk the dense traversal (medium rung on Medium)
     behavior_logp: bool = False,     # v6: use stored behavior logp as old_logp (off-policy replay); False ⇒ v5 recompute
+    reward_shaping_coef: float = 0.0,  # v7.2: PBRS coefficient (F = coef·(γ·Φ'−Φ)); 0 ⇒ terminal-only
     construction: bool = True,       # v7: train the per-city construction head; False ⇒ pure v6 path (no-op oracle)
 ) -> tuple[object, dict, object]:
     """v4 STRUCTURED variant: same encoder-AGNOSTIC core (_optimize_actor_critic) + same rich
@@ -525,7 +548,7 @@ def train_actor_critic_structured(
         optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     if not trajectories:
         return net, {"loss": 0.0, "n": 0, "note": "no steps", "ret_pos": 0}, optimizer
-    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy = _stack_traj(trajectories)
+    a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy, phi_np = _stack_traj(trajectories)
     # v6: stored behavior logp (sum of per-head logps) for off-policy replayed data; None ⇒ on-policy (v5).
     stored = (b_logp_tech + b_logp_policy) if behavior_logp else None
     inputs = build_rich_batch(trajectories, dims, token_specs)
@@ -552,6 +575,7 @@ def train_actor_critic_structured(
         rewards_np=rewards_np, traj_lens=traj_lens, n_pos=n_pos, epochs=epochs, lr=lr,
         gamma=gamma, lam=lam, value_coef=value_coef, entropy_coef=entropy_coef,
         clip_eps=clip_eps, norm_adv=norm_adv, stored_old_logp=stored,
+        phi_np=phi_np, reward_shaping_coef=reward_shaping_coef,
         a_construction=a_construction, m_construction=m_construction,
     )
     return net, stats, optimizer

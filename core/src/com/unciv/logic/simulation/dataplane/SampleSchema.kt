@@ -13,6 +13,12 @@ package com.unciv.logic.simulation.dataplane
  */
 object SampleSchema {
     /**
+     * VERSION 6 (was 5): v7.2 potential-based reward shaping. Adds a per-step FIXED scalar [BLOCK_PHI] —
+     * the deciding civ's log-stabilized economy potential Φ(s). The Python trainer adds the policy-
+     * invariant shaping reward F = γ·Φ(s') − Φ(s) to each step (Ng-Harada: telescopes to a constant, so
+     * the optimal "win the game" policy is unchanged), shortening the credit horizon for long-payoff
+     * decisions like construction. A v5 shard lacks the block ⇒ regenerate.
+     *
      * VERSION 5 (was 4): v7 per-city CONSTRUCTION control head. Adds two per-step VARIABLE blocks
      * aligned to the `own_cities` tokens (same `x.cities.sortedBy{it.id}`-capped order): the chosen
      * construction action [BLOCK_CONSTRUCTION_ACTION] (0-indexed mask idx, −1 = no decision) and its
@@ -30,7 +36,7 @@ object SampleSchema {
      * is not layout-compatible. (VERSION 2 was: real terminal reward + applied civ-level action.)
      * The Python reader REFUSES a VERSION mismatch ⇒ regenerate; datasets are perishable by design.
      */
-    const val VERSION = 5
+    const val VERSION = 6
 
     /** 8 ASCII bytes at the head of every shard. */
     const val MAGIC = "UNCVSMP1"
@@ -155,6 +161,16 @@ object SampleSchema {
      */
     const val BLOCK_CONSTRUCTION_ACTION = "construction_action"
     const val BLOCK_CONSTRUCTION_LOGP = "construction_logp"
+
+    /**
+     * v7.2 (VERSION 6): the deciding civ's log-stabilized ECONOMY POTENTIAL Φ(s), one FIXED f32 scalar
+     * per step. Φ = ln(1+Σproduction) + ln(1+Σfood) + ln(1+Σscience) + ln(1+#techs) over the civ's cities.
+     * The trainer forms the POLICY-INVARIANT potential-based shaping reward F = γ·Φ(s')−Φ(s) (Ng-Harada),
+     * which shortens the credit horizon for long-payoff decisions WITHOUT changing the optimal policy
+     * (the F terms telescope to a constant). SHARD-ONLY; not an ONNX I/O. The ln keeps Φ bounded so F
+     * cannot accumulate a drift that swamps the terminal ±1.
+     */
+    const val BLOCK_PHI = "phi"
 
     /** Factored legal-action mask heads (boolean per candidate). Unit-intent + per-city
      *  construction are emitted per-entity in the UNIT/CITY tokens, not as global heads. */
