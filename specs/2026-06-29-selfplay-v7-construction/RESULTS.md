@@ -83,9 +83,28 @@ side the spec allows (user-approved). It does NOT change what's optimal; it only
    so `ln(1+Σfood)` went NaN → non-finite loss → the divergence guard skipped ~half the treatment rounds.
    PBRS still beat control through that. **Fixed** (`coerceAtLeast(0)` on the yield sums + `nan_to_num`);
    verified Φ finite, diverged=0, critic trains.
-2. **Efficacy (RUNNING):** clean OFF+PBRS vs ON+PBRS (full construction, commit-until-done cadence,
-   rw1, coef 0.1, NaN-fixed). Does shortened credit let the net learn good FULL construction and BEAT the
-   OFF baseline? This is the decisive test of whether construction control finally works.
+2. **Efficacy (DONE — PBRS did NOT salvage construction):** clean OFF+PBRS **37.3%** vs ON+PBRS **1.5%**
+   (3/204, Δ−35.8pp, z=−9.15), 0 divergence both arms. Construction-ON still craters even with the credit
+   horizon fixed. Diagnostics: ON+PBRS is **still +12.4% unit-biased** (chose 54% units vs 41% offered —
+   unchanged from no-PBRS's +16%) and its **economy is measurably starved** (mean Φ 12.64 vs OFF's 16.69).
+
+**REFINED ROOT CAUSE — it was per-city credit ATTRIBUTION, not the credit HORIZON.** PBRS shortened the
+horizon (and is policy-invariant/honest — clean OFF+PBRS 37.3% ≈ no-PBRS control 39.7%, within noise; the
+gate's apparent +8pp was a buggy-divergence artifact). But the per-step **advantage is a single scalar
+shared across ALL heads and ALL cities** — PBRS makes it reflect economy growth, but it cannot attribute
+that growth to the specific city/construction that caused it. So the construction head gets a noisy,
+non-causal, diluted signal and never learns buildings>units for a given city. PBRS fixes *when* credit
+arrives, not *which* per-city decision earned it. **Construction-via-RL is a robust negative across 4
+approaches (per-turn 14%, commit 2%, buildings-only [dodge], PBRS 1.5%).**
+
+**Spin-off result:** PBRS itself is correctly implemented + honest (policy-invariant), but **clean PBRS is
+~neutral** for the civ-global heads (no efficacy boost) — the credit horizon was not actually limiting
+tech/policy. So PBRS is a validated-but-neutral capability (kept, default coef 0), not a win.
+
+**Remaining untested levers (bigger efforts):** (a) per-city counterfactual/difference rewards (credit each
+city for its MARGINAL ΔΦ — the actual attribution fix, but needs stable per-city identity tracking the
+panel flagged as hard); (b) imitation warm-start from the heuristic (sidesteps learning attribution
+entirely — the net starts from a good construction policy and RL-finetunes).
 
 ## What this does NOT rule out (explicit follow-ups — require a bigger effort, not run here)
 1. **Decision cadence** — decide at construction-completion (the natural commit point) rather than every
