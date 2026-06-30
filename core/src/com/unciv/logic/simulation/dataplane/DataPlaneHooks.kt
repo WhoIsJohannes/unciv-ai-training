@@ -307,7 +307,10 @@ class ShardRecorder(
             val s = c.cityStats.currentCityStats
             prod += s.production.toDouble(); food += s.food.toDouble(); sci += s.science.toDouble()
         }
-        return (ln(1.0 + prod) + ln(1.0 + food) + ln(1.0 + sci)
+        // Clamp the yield sums to ≥0 before ln: a starving city has NEGATIVE food, so a net-negative sum
+        // would make ln(1+Σ) = NaN → NaN shaping reward → non-finite loss → the divergence guard skips the
+        // round. coerceAtLeast(0) keeps Φ finite (low = weak economy, the correct potential semantics).
+        return (ln(1.0 + prod.coerceAtLeast(0.0)) + ln(1.0 + food.coerceAtLeast(0.0)) + ln(1.0 + sci.coerceAtLeast(0.0))
             + ln(1.0 + x.tech.getNumberOfTechsResearched())).toFloat()
     }
 

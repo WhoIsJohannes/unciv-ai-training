@@ -368,7 +368,9 @@ def _stack_traj(trajectories: list[TrainTrajectory]):
     b_logp_tech = torch.tensor(np.concatenate([_blogp("b_logp_tech", t) for t in trajectories]))
     b_logp_policy = torch.tensor(np.concatenate([_blogp("b_logp_policy", t) for t in trajectories]))
     # v7.2: per-step economy potential Φ(s), flat-batch order; None ⇒ zeros (no shaping for synthetic trajs).
-    phi_np = np.concatenate([_blogp("phi", t) for t in trajectories]).astype(np.float32)
+    # nan_to_num guards against any non-finite Φ leaking into the shaping reward (→ NaN loss → divergence).
+    phi_np = np.nan_to_num(np.concatenate([_blogp("phi", t) for t in trajectories]).astype(np.float32),
+                           nan=0.0, posinf=0.0, neginf=0.0)
     return a_tech, a_policy, m_tech, m_policy, rewards_np, traj_lens, n_pos, b_logp_tech, b_logp_policy, phi_np
 
 
