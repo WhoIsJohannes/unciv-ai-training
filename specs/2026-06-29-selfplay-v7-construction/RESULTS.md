@@ -54,6 +54,35 @@ credit-assignment limit over a large per-city action space.** A real fix needs i
 the head from the heuristic) OR a denser/shaped reward (the latter is FROZEN out of v7 scope). Neither is
 a quick tweak; further full runs would only re-confirm the negative.
 
+## v7.2 — the real fix: potential-based reward shaping (PBRS) — IN PROGRESS
+The user reframed sharply: the problem is that **the reward is too far in the future** (long-horizon
+credit), and asked for the principled fix. A design panel (7 RL approaches → adversarial vetting →
+synthesis) confirmed: among reward-shaping / critic-decomposition / return-redistribution / horizon
+options, **PBRS is the only one that both (a) actually shortens the credit horizon AND (b) provably keeps
+the objective honest.** The critic/decomposition alternatives were vetted down to "bias-neutral baseline
+shifts that reach ~47% neutral at best" or "myopic economy proxies that flip the failure to UNDER-building
+military."
+
+**Mechanism (committed):** record a per-step log-stabilized economy potential
+`Φ = ln(1+Σprod)+ln(1+Σfood)+ln(1+Σscience)+ln(1+#techs)` (SampleSchema VERSION 5→6, `BLOCK_PHI`), and add
+the shaping reward `F = γ·Φ(s')−Φ(s)` to each step in `_optimize_actor_critic` (`--reward-shaping-coef`,
+0 ⇒ terminal-only). **Ng-Harada policy-invariance:** the `F` terms telescope to a constant
+(`coef·(γ^(L-1)·Φ_{L-1} − Φ_0)`), so the optimal "win the game" policy is UNCHANGED — only the credit
+timing shifts (~250 → ~5 steps), so a Granary's economic payoff registers immediately instead of 200 turns
+later. `ln` keeps Φ bounded so F can't drift-dominate the terminal ±1. Tests: telescopes-to-constant
+(policy-invariance), coef=0/phi=None no-op, schema-6 round-trip; Φ recorded (range 1.1–17, grows w/ economy).
+
+**Honesty note:** this RELAXES the frozen "no shaping" rule, but only on the principled policy-invariant
+side the spec allows (user-approved). It does NOT change what's optimal; it only speeds credit.
+
+**Staged validation:**
+1. **Honesty gate (RUNNING):** small-rung, construction OFF, `--replay-window 1` (on-policy, clean PBRS),
+   control (coef 0) vs treatment (coef 0.1). Gate: treatment must be **non-regressive** (PBRS must not bias
+   the already-working tech/policy heads off-baseline) AND show **faster value-loss drop** (proves it
+   injects usable signal). A regression ⇒ the potential is mis-specified → re-tune before the construction run.
+2. **Efficacy (pending green gate):** construction-ON + PBRS small-arm vs OFF (47%) — does shortened credit
+   let the net learn good construction and BEAT the heuristic?
+
 ## What this does NOT rule out (explicit follow-ups — require a bigger effort, not run here)
 1. **Decision cadence** — decide at construction-completion (the natural commit point) rather than every
    turn, to remove churning. (The plan's perpetual-only gate was inert because the heuristic keeps cities
