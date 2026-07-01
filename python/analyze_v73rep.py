@@ -91,8 +91,10 @@ def main():
                   f"{'MOVES THE RIGHT WAY (construction no longer hurts)' if moves_right else 'still below OFF'}")
         _, dps, sps, nps = _paired(root, "on-pcc", "on-shared", seeds)
         if dps is not None:
-            print(f"  per-city credit vs shared-adv: Δ={dps*100:+.1f}pp — "
-                  f"{'the credit MECHANISM helps' if dps > 0 else 'no mechanism gain over shared-adv'}")
+            helps = (sps is not None and nps >= 2 and dps > 2 * sps)   # real only if Δ > 2·SE
+            print(f"  per-city credit vs shared-adv: Δ={dps*100:+.1f}pp"
+                  f"{f' ±{sps*100:.1f}' if sps is not None else ''} — "
+                  f"{'the credit MECHANISM helps (Δ>2·SE)' if helps else 'NO mechanism gain over shared-adv (within noise)'}")
 
 
 if __name__ == "__main__":

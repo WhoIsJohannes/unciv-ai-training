@@ -156,11 +156,36 @@ OFF/rw1 path; net is per-sample so micro-batch 0 ≡ 256.
 wide distribution and is individually unreliable. The v7 "construction is a robust negative" verdict is being
 **re-tested under replication.**
 
-### Replicated experiment (`python/run_v73rep.sh` + `analyze_v73rep.py`) — IN PROGRESS
+### Replicated experiment (`python/run_v73rep.sh` + `analyze_v73rep.py`) — DONE: per-city credit is a NEGATIVE
 3 arms (off / on-shared coef 0 / on-pcc coef 0.5) × **4 seeds** {1000,2000,3000,4000}, small/Medium/16-round/
-mb0/rw1, 200-game ceiling @ 4242424. Reports per-arm **mean±SE** + **PAIRED per-seed differences** (same
-gen-seed controls the shared variance → tight effect estimate). _Verdict pending; this section will be updated
-with the mean ceilings + paired Δ(on-pcc − off) and Δ(on-pcc − on-shared)._
+mb0/rw1, 200-game ceiling @ 4242424. Per-arm **mean±SE** + **PAIRED per-seed differences** (same gen-seed
+controls the shared variance → tight effect estimate):
+
+| arm | s1000 | s2000 | s3000 | s4000 | mean±SE |
+|---|---|---|---|---|---|
+| **off** | 17.2 | 8.8 | 41.7 | 35.3 | **25.7% ± 7.7** |
+| **on-shared** (coef 0) | 1.5 | 0.0 | 0.0 | 0.0 | **0.4% ± 0.4** |
+| **on-pcc** (coef 0.5) | 1.5 | 0.0 | 0.5 | 0.0 | **0.5% ± 0.3** |
+
+Paired: **on-pcc − off = −25.2pp** (per-seed [−15.7,−8.8,−41.2,−35.3], t≈−3.27, >2·SE — significant despite
+OFF's variance, because construction-ON is consistently ~0). **on-pcc − on-shared = +0.1pp** (per-seed
+[0,0,+0.5,0] — a single extra win at one seed; within noise, t≈1.0).
+
+**VERDICT — per-city credit does NOT fix construction; it is a clean, replicated, well-powered NEGATIVE:**
+1. **Construction control is a robust, CATASTROPHIC negative** — both construction arms crater to ~0–1.5% vs
+   OFF's ~9–42%. Crucially this is LOW-variance (on-shared/on-pcc are ~0 at every seed, incl. seed 3000 where
+   OFF hits 41.7%), so — unlike the noisy OFF baseline — the construction-hurts effect is REAL, not variance.
+   This *confirms the v7 negative under replication*, and more severely (~26%→0.5%, not 47%→14%).
+2. **Per-city credit adds nothing** — on-pcc ≡ on-shared (+0.1pp, noise). The attribution fix is falsified: the
+   per-city value baseline + per-city advantage does not change the outcome. Controlling production breaks the
+   learner regardless of how construction credit is assigned.
+
+**Ship disposition (per D-C5 "ship if it moves the right way"):** per-city credit does NOT move the right way
+(−25pp vs OFF, ≡ shared-adv), so it does NOT meet the effect bar. But the per-city-credit INFRASTRUCTURE
+(schema-7 `econ_city`, per-city value head, per-city GAE + PPO ratio, `--construction-credit-coef`) is built,
+validated (14 tests green), and correct — the durable deliverable, default OFF (`coef 0` reproduces v7.2). The
+per-entity machinery remains reusable for the next heads (promotion / great-person / diplomatic-vote), which
+have FAR smaller action spaces than construction's ~250-wide per-city space and may work where it doesn't.
 
 ## What this does NOT rule out (explicit follow-ups — require a bigger effort, not run here)
 1. **Decision cadence** — decide at construction-completion (the natural commit point) rather than every
