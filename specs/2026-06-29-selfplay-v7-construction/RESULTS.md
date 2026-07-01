@@ -106,6 +106,43 @@ city for its MARGINAL ΔΦ — the actual attribution fix, but needs stable per-
 panel flagged as hard); (b) imitation warm-start from the heuristic (sidesteps learning attribution
 entirely — the net starts from a good construction policy and RL-finetunes).
 
+## v7.3 — the attribution fix: per-city credit assignment — IN PROGRESS
+User directive after PBRS: **"Attack attribution directly: per-city credit."** This is lever (a) above,
+implemented as a per-city *value baseline* (not raw difference rewards — no cross-city counterfactual
+rollout needed, so no unstable per-city identity tracking).
+
+**Mechanism.** Each city's construction is credited by ITS OWN economy return instead of the single civ-wide
+scalar:
+- **Record** (schema 6→7, `BLOCK_ECON_CITY`): per-step VARIABLE f32 `econ_city`, one row per own city
+  (aligned to construction) = that city's raw log-economy `ln(1+prod+food+sci)`.
+- **Net:** a per-city VALUE head parallel to the construction head (own-city embedding ⊕ trunk body → V_city),
+  final layer zero-init so V_city≈0 at init. Train-only, dropped from the ONNX export.
+- **Trainer** (`--construction-credit-coef`, >0 activates): construction is pulled OUT of the joint PPO ratio
+  and trained by a SEPARATE per-city PG term. A per-city GAE over `econ_city` gives A_city; the construction
+  advantage is `shared_adv + coef·A_city` (COMA/difference-rewards direction). `econ_city` is per-round
+  standardized then average-reward scaled ×(1−γ) so R_city is O(1); PG + entropy are MEAN over present cities
+  (city-count-invariant — summing ~6 cities was the v7 objective-domination bug); value loss masked to
+  present cities. **coef=0 reproduces the legacy v7.2 shared-adv joint-PPO path exactly.** On-policy
+  (`--replay-window 1` — the per-city term has no importance ratio).
+
+**Validation (all green before the run):** Kotlin dataplane suite + full Python suite pass (fixed two stale
+v6 shard-builders predating the v7.2 fail-loud `phi` read; the determinism test is a pre-existing
+engine-level flake — same-seed runs already diverge in *step count*, unrelated to `econ_city`, which is a
+pure function of city stats). End-to-end Tiny smoke: 3 rounds gen→train→eval, econ_city finite, per-city
+branch fires, no divergence. Diagnosed + fixed the per-city value-loss scale (raw log-economy level → R_city
+~10²; standardize + ×(1−γ) + zero-init head → R_city O(0.14), value loss O(0.2)). Micro-batch path matches
+whole-batch within the size-weighting tolerance (Δw 0.004).
+
+**Experiment (running, resumable — `python/run_v73eff.sh`):** 3 arms, small rung, Medium, 16 rounds, rw1,
+NO PBRS, 200-game ceiling @ eval-seed 4242424:
+- `off`       — construction OFF (baseline, tech+policy only)
+- `on-shared` — construction ON, coef 0 (the v7 negative under MATCHED rw1 conditions — the control)
+- `on-pcc`    — construction ON, coef 0.5 (the fix)
+
+The question: does per-city credit turn the negative around — `on-pcc ≥ off` (moves the right way, per the
+ship criterion) and `on-pcc > on-shared` (proving the credit MECHANISM, not just re-running construction)?
+_Results pending — this section will be updated with the 3-way ceiling comparison + verdict._
+
 ## What this does NOT rule out (explicit follow-ups — require a bigger effort, not run here)
 1. **Decision cadence** — decide at construction-completion (the natural commit point) rather than every
    turn, to remove churning. (The plan's perpetual-only gate was inert because the heuristic keeps cities
