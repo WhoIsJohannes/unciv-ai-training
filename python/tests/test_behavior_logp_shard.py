@@ -30,6 +30,7 @@ def _build_shard(*, version=SCHEMA_VERSION, fingerprint="deadbeef", lp_tech=-2.3
         {"name": "mask_policy", "dtype": "<u1", "kind": "fixed", "perItem": 0, "len": policy_w},
         {"name": "actions", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
         {"name": "behavior_logp", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
+        {"name": "phi", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 1},  # v7.2 fail-loud economy potential
     ]
     header = json.dumps({
         "schemaVersion": version, "rulesetFingerprint": fingerprint, "gameId": "ep-0", "seed": 1,
@@ -44,6 +45,7 @@ def _build_shard(*, version=SCHEMA_VERSION, fingerprint="deadbeef", lp_tech=-2.3
         body += np.ones(policy_w, "<u1").tobytes()
         body += np.array([a_tech, a_policy, -1, -1], "<f4").tobytes()
         body += np.array([blp_t, blp_p, 0, 0], "<f4").tobytes()
+        body += np.array([3.0], "<f4").tobytes()          # phi (v7.2); terminal phi is never read
         return body
 
     records = b""

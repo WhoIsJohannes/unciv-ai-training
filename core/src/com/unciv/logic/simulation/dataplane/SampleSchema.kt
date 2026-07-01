@@ -13,6 +13,13 @@ package com.unciv.logic.simulation.dataplane
  */
 object SampleSchema {
     /**
+     * VERSION 7 (was 6): v7.3 per-city credit assignment. Adds a per-step VARIABLE scalar block
+     * [BLOCK_ECON_CITY] (perItem=1, aligned to `own_cities`/`construction_*`): each own city's raw
+     * log-economy `ln(1+max(0,prod)+max(0,food)+max(0,science))`. The trainer builds a PER-CITY value
+     * baseline + per-city GAE advantage from it, so each city's construction is credited by ITS OWN
+     * economy return (fixing the attribution failure where the shared civ-scalar advantage couldn't tell
+     * which city's construction grew the economy). A v6 shard lacks the block ⇒ regenerate.
+     *
      * VERSION 6 (was 5): v7.2 potential-based reward shaping. Adds a per-step FIXED scalar [BLOCK_PHI] —
      * the deciding civ's log-stabilized economy potential Φ(s). The Python trainer adds the policy-
      * invariant shaping reward F = γ·Φ(s') − Φ(s) to each step (Ng-Harada: telescopes to a constant, so
@@ -36,7 +43,7 @@ object SampleSchema {
      * is not layout-compatible. (VERSION 2 was: real terminal reward + applied civ-level action.)
      * The Python reader REFUSES a VERSION mismatch ⇒ regenerate; datasets are perishable by design.
      */
-    const val VERSION = 6
+    const val VERSION = 7
 
     /** 8 ASCII bytes at the head of every shard. */
     const val MAGIC = "UNCVSMP1"
@@ -171,6 +178,14 @@ object SampleSchema {
      * cannot accumulate a drift that swamps the terminal ±1.
      */
     const val BLOCK_PHI = "phi"
+
+    /**
+     * v7.3 (VERSION 7): per-city raw log-economy `ln(1+max(0,prod)+max(0,food)+max(0,science))`, one
+     * VARIABLE f32 per own city (perItem=1), aligned to `own_cities` / [BLOCK_CONSTRUCTION_ACTION]. The
+     * trainer uses it as the per-city reward for a PER-CITY value head + per-city GAE advantage, so each
+     * city's construction decision is credited by ITS OWN economy return (attribution fix). SHARD-ONLY.
+     */
+    const val BLOCK_ECON_CITY = "econ_city"
 
     /** Factored legal-action mask heads (boolean per candidate). Unit-intent + per-city
      *  construction are emitted per-entity in the UNIT/CITY tokens, not as global heads. */

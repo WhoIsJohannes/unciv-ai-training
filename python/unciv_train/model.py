@@ -447,12 +447,31 @@ class StructuredPolicyValueNet(nn.Module):
             nn.Linear(own_city_emb_w + trunk_w, trunk_w), nn.ReLU(),
             nn.Linear(trunk_w, self.constr_w),
         )
+        # v7.3 per-city VALUE head: same input (own_city emb ⊕ trunk body) → a scalar V_city per city. The
+        # trainer uses it as the per-city baseline for a per-city GAE advantage over the recorded per-city
+        # economy return, so each city's construction is credited by ITS OWN outcome (attribution fix).
+        # TRAIN-ONLY (dropped from the ONNX export, like the civ value head).
+        self.city_value_head = nn.Sequential(
+            nn.Linear(own_city_emb_w + trunk_w, trunk_w), nn.ReLU(),
+            nn.Linear(trunk_w, 1),
+        )
+        # Zero-init the final layer so V_city ≈ 0 at init: the per-city return target is O(0.1) (average-
+        # reward scaled), so a large random init would spike the round-0 per-city value loss and leak a
+        # transient gradient into the shared trunk. Starting at 0 makes the init loss ≈ mean(R²) (tiny).
+        nn.init.zeros_(self.city_value_head[-1].weight)
+        nn.init.zeros_(self.city_value_head[-1].bias)
 
     def _construction_logits(self, own_city_emb: torch.Tensor, body: torch.Tensor) -> torch.Tensor:
         """Per-city construction logits [B, M, constr_w] from each own_city embedding ⊕ broadcast trunk."""
         m = own_city_emb.shape[1]
         body_b = body.unsqueeze(1).expand(-1, m, -1)                  # [B, M, trunk_w]
         return self.construction_head(torch.cat([own_city_emb, body_b], dim=-1))
+
+    def _city_value(self, own_city_emb: torch.Tensor, body: torch.Tensor) -> torch.Tensor:
+        """Per-city value V_city [B, M] (the per-city baseline for the per-city construction advantage)."""
+        m = own_city_emb.shape[1]
+        body_b = body.unsqueeze(1).expand(-1, m, -1)
+        return self.city_value_head(torch.cat([own_city_emb, body_b], dim=-1)).squeeze(-1)
 
     def _gather_node_by_tile(self, h_pad: torch.Tensor, tile_idx: torch.Tensor,
                              N: int) -> torch.Tensor:
@@ -502,7 +521,8 @@ class StructuredPolicyValueNet(nn.Module):
             vh = self.value_body(body)
             tech, policy, value = self.tech_head(ph), self.policy_head(ph), torch.tanh(self.value_head(vh))
             if with_construction:
-                return tech, policy, self._construction_logits(own_city_emb, body), value
+                return (tech, policy, self._construction_logits(own_city_emb, body),
+                        self._city_value(own_city_emb, body), value)
             return tech, policy, value
 
         # ---- Phase B path (attention). ----
@@ -555,5 +575,6 @@ class StructuredPolicyValueNet(nn.Module):
         vh = self.value_body(body)
         tech, policy, value = self.tech_head(ph), self.policy_head(ph), torch.tanh(self.value_head(vh))
         if with_construction:
-            return tech, policy, self._construction_logits(own_city_emb, body), value
+            return (tech, policy, self._construction_logits(own_city_emb, body),
+                    self._city_value(own_city_emb, body), value)
         return tech, policy, value

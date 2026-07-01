@@ -59,8 +59,8 @@ class _RichPolicyOnly(nn.Module):
     def forward(self, *tensors):
         inputs = {name: t for name, t in zip(self.names, tensors)}
         if self.with_construction:
-            tech, policy, construction, _value = self.net(inputs, with_construction=True)
-            return tech, policy, construction
+            tech, policy, construction, _city_value, _value = self.net(inputs, with_construction=True)
+            return tech, policy, construction   # city_value + value are train-only, dropped from the export
         tech, policy, _value = self.net(inputs)
         return tech, policy
 

@@ -160,6 +160,10 @@ def _rich_step_blocks(blocks: dict, n_channels: int) -> dict:
     cl = blocks.get("construction_logp")
     out["construction_logp"] = (np.asarray(cl, dtype=np.float32).reshape(-1)
                                 if cl is not None else np.zeros(0, np.float32))
+    # v7.3: per-city raw log-economy (aligned to construction), for the per-city value/advantage.
+    ec = blocks.get("econ_city")
+    out["econ_city"] = (np.asarray(ec, dtype=np.float32).reshape(-1)
+                        if ec is not None else np.zeros(0, np.float32))
     return out
 
 

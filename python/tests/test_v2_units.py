@@ -28,6 +28,7 @@ def _shard_with_steps(steps_spec, *, global_w=4, acting_w=3, tech_w=5, policy_w=
         {"name": "mask_policy", "dtype": "<u1", "kind": "fixed", "perItem": 0, "len": policy_w},
         {"name": "actions", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
         {"name": "behavior_logp", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
+        {"name": "phi", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 1},  # v7.2 fail-loud economy potential
         {"name": "spatial", "dtype": "<u1", "kind": "fixed", "perItem": 0, "len": n_tiles * 13},
         {"name": "own_units", "dtype": "<f4", "kind": "var", "perItem": 8, "len": 0},
         {"name": "opp_units", "dtype": "<f4", "kind": "var", "perItem": 8, "len": 0},
@@ -48,6 +49,7 @@ def _shard_with_steps(steps_spec, *, global_w=4, acting_w=3, tech_w=5, policy_w=
         body += np.ones(policy_w, "<u1").tobytes()
         body += np.array([a_tech, a_policy, -1, -1], "<f4").tobytes()
         body += np.array([-1.2, -0.3, 0, 0], "<f4").tobytes()     # behavior_logp per head (v6)
+        body += np.array([3.0], "<f4").tobytes()                  # phi (v7.2)
         body += np.zeros(n_tiles * 13, "<u1").tobytes()           # spatial (FIXED u8)
         for _ in range(5):                                         # 5 VARIABLE entity blocks, count 0
             body += struct.pack("<H", 0)

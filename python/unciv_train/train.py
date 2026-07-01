@@ -68,6 +68,57 @@ def _construction_entropy_sum(logits: torch.Tensor, actions: torch.Tensor,
     return ent.sum(dim=1)                                  # [n]
 
 
+def _construction_logp_percity(logits: torch.Tensor, actions: torch.Tensor,
+                               mask: torch.Tensor) -> torch.Tensor:
+    """v7.3: PER-CITY construction logp (NOT summed over cities) → [n, M], 0 where the city did not act.
+    Same masked-softmax gather as `_construction_logp_sum` but keeps the city axis so each city's logp can
+    be weighted by ITS OWN advantage in the separate per-city construction PG term."""
+    neg = torch.where(mask > 0, logits, torch.full_like(logits, -1e9))
+    logp = F.log_softmax(neg, dim=2)
+    acted = actions >= 0                                   # [n, M]
+    idx = actions.clamp(min=0).unsqueeze(2)
+    chosen = logp.gather(2, idx).squeeze(2)               # [n, M]
+    return torch.where(acted, chosen, torch.zeros_like(chosen))
+
+
+def _construction_entropy_percity(logits: torch.Tensor, actions: torch.Tensor,
+                                  mask: torch.Tensor) -> torch.Tensor:
+    """v7.3: per-city construction entropy [n, M], 0 for non-acting cities (mirrors the per-city logp)."""
+    neg = torch.where(mask > 0, logits, torch.full_like(logits, -1e9))
+    p = F.softmax(neg, dim=2)
+    logp = F.log_softmax(neg, dim=2)
+    ent = -(p * logp).sum(dim=2)                           # [n, M]
+    return torch.where(actions >= 0, ent, torch.zeros_like(ent))
+
+
+def _per_city_gae(econ, city_val, present, traj_lens, gamma: float, lam: float):
+    """v7.3 PER-CITY GAE. `econ`/`city_val`/`present`: [n, M] (padded to the batch max city count M).
+    Each city row is credited by ITS OWN economy return: the per-city reward is the raw log-economy
+    `econ[t, i]` (a LEVEL, not ΔΦ — ΔΦ telescopes to a state function and gives no action credit), the
+    per-city value `city_val[t, i]` is the baseline, and GAE runs down each trajectory independently per
+    city. Padded/absent cities (present=0) get advantage/return 0. Returns (A_city, R_city) as [n, M]
+    float32 arrays. This is the ATTRIBUTION fix: construction in city i is credited by city i's outcome,
+    not the single civ-wide scalar shared across all heads+cities."""
+    econ = np.asarray(econ, dtype=np.float32)
+    city_val = np.asarray(city_val, dtype=np.float32)
+    present = np.asarray(present, dtype=np.float32)
+    A = np.zeros_like(econ)
+    off = 0
+    for L in traj_lens:
+        gae = np.zeros(econ.shape[1], dtype=np.float32)     # [M], per-city running GAE
+        for t in range(L - 1, -1, -1):
+            row = off + t
+            next_v = city_val[row + 1] if t + 1 < L else np.zeros(econ.shape[1], np.float32)
+            delta = econ[row] + gamma * next_v - city_val[row]
+            gae = delta + gamma * lam * gae
+            A[row] = gae
+        off += L
+    R = A + city_val
+    A = A * present                                         # zero the padded/absent city rows
+    R = R * present
+    return A, R
+
+
 def compute_gae(rewards, values, gamma: float = 0.99, lam: float = 0.95):
     """Episodic GAE over ONE trajectory. reward terminal-only (0 except the last step);
     V(terminal)=0 bootstrap. Returns (advantages, returns) as float32 arrays of the same length.
@@ -166,25 +217,36 @@ def _optimize_actor_critic(
     m_construction: torch.Tensor | None = None,   # v7: per-city construction legal mask [n, M, W]
     phi_np: np.ndarray | None = None,             # v7.2: per-step economy potential Φ(s), flat-batch [n]
     reward_shaping_coef: float = 0.0,             # v7.2: PBRS coefficient; 0 ⇒ no shaping (terminal-only)
+    econ_city: torch.Tensor | None = None,        # v7.3: per-city raw log-economy [n, M] (padded); the per-city reward
+    city_present: torch.Tensor | None = None,     # v7.3: per-city presence mask [n, M] (1 real city, 0 padding)
+    construction_credit_coef: float = 0.0,        # v7.3: weight of the per-city economy advantage (0 ⇒ shared-adv only)
 ) -> tuple[object, dict]:
     import copy
     opt = optimizer                  # v5: persistent optimizer (built once in the trainer, carried by run_loop)
     n = int(a_tech.shape[0])
-    use_construction = a_construction is not None   # v7: forward_fn returns a 4-tuple (+construction logits)
+    use_construction = a_construction is not None   # v7: forward_fn returns a 5-tuple (+construction logits, +city value)
+    # v7.3 PER-CITY CREDIT: when econ_city is supplied, construction is pulled OUT of the joint PPO ratio
+    # and trained by a SEPARATE per-city policy-gradient term whose advantage is the shared civ advantage
+    # PLUS a per-city economy advantage (so each city's construction is credited by its OWN outcome). When
+    # econ_city is None (OFF arm, or the legacy v7.2 shared-adv mode) construction stays in the joint logp.
+    use_percity_credit = use_construction and econ_city is not None
+    constr_in_joint = use_construction and not use_percity_credit
 
     def _unpack(out):
-        """forward_fn / forward_chunk_fn return (tl, pl, val) normally; (tl, pl, cl, val) when the
-        construction head is wired. Normalize to (tl, pl, cl|None, val)."""
+        """forward_fn / forward_chunk_fn return (tl, pl, val) normally; (tl, pl, cl, cval, val) when the
+        construction head is wired. Normalize to (tl, pl, cl|None, cval|None, val)."""
         if use_construction:
-            return out  # (tl, pl, cl, val)
+            tl, pl, cl, cval, val = out
+            return tl, pl, cl, cval, val
         tl, pl, val = out
-        return tl, pl, None, val
+        return tl, pl, None, None, val
 
     def _policy_logp(tl, pl, cl, lo, hi):
-        """Per-step joint logp = tech + policy (+ Σ_cities construction). Slices the construction
-        tensors to [lo:hi] (None lo/hi ⇒ whole batch). Construction adds EXACTLY 0 when no city acted."""
+        """Per-step joint logp = tech + policy (+ Σ_cities construction ONLY in the legacy shared-adv mode).
+        In v7.3 per-city-credit mode construction is a SEPARATE term (see the epoch loop) and is excluded
+        here. Slices to [lo:hi] (None ⇒ whole batch)."""
         s = _masked_logp(tl, a_tech[lo:hi], m_tech[lo:hi]) + _masked_logp(pl, a_policy[lo:hi], m_policy[lo:hi])
-        if cl is not None:
+        if constr_in_joint and cl is not None:
             ac, mc = a_construction[lo:hi], m_construction[lo:hi]
             if cl.shape[1] != ac.shape[1]:
                 raise ValueError(f"construction city-axis mismatch: net {cl.shape[1]} != actions {ac.shape[1]} "
@@ -194,9 +256,32 @@ def _optimize_actor_critic(
 
     def _policy_entropy(tl, pl, cl, lo, hi):
         e = _entropy(tl, m_tech[lo:hi]) + _entropy(pl, m_policy[lo:hi])
-        if cl is not None:
+        if constr_in_joint and cl is not None:
             e = e + _construction_entropy_sum(cl, a_construction[lo:hi], m_construction[lo:hi])
         return e
+
+    def _construction_credit_loss(cl, cval, lo, hi):
+        """v7.3 SEPARATE per-city construction objective for chunk [lo:hi]. Returns (pg_loss, value_loss,
+        entropy) as scalar tensors. pg_loss = −Σ_cities logπ(a_city)·A_constr_city (on-policy A2C, no PPO
+        ratio — replay-window 1); A_constr_city = shared_adv + coef·A_city (per-city economy advantage,
+        detached). value_loss = masked MSE(V_city, R_city). All means/sums are over the STEP axis so they
+        compose with the size-weighted micro-batch accumulation exactly like the civ terms."""
+        ac, mc = a_construction[lo:hi], m_construction[lo:hi]
+        if cl.shape[1] != ac.shape[1]:
+            raise ValueError(f"construction city-axis mismatch: net {cl.shape[1]} != actions {ac.shape[1]}")
+        pres = city_present[lo:hi]                           # [chunk, M]
+        # MEAN over present cities per step (NOT sum) — city-count-invariant so the construction gradient
+        # stays comparable to a single civ head. Summing over ~6 cities was the v7 objective-domination bug:
+        # grad clipping would then shrink the civ (tech/policy) gradient too. Per-step denom = #present cities.
+        denom = pres.sum(dim=1).clamp(min=1.0)              # [chunk]
+        logp_pc = _construction_logp_percity(cl, ac, mc)    # [chunk, M], 0 for non-acting cities
+        constr_adv = adv[lo:hi].unsqueeze(1) + construction_credit_coef * A_city[lo:hi]   # [chunk, M]
+        pg = -((logp_pc * constr_adv.detach()).sum(dim=1) / denom).mean()   # per-city mean, then mean steps
+        ent = (_construction_entropy_percity(cl, ac, mc).sum(dim=1) / denom).mean()
+        cval = cval.reshape(pres.shape)
+        se = (cval - R_city[lo:hi]).pow(2) * pres           # mask padded/absent cities
+        vloss = se.sum() / pres.sum().clamp(min=1.0)
+        return pg, vloss, ent
     use_micro = (micro_batch_steps is not None and micro_batch_steps > 0
                  and forward_chunk_fn is not None and micro_batch_steps < n)  # <=0 ⇒ whole-batch no-op
     # v6 GUARD: with stored behavior logp (off-policy replay), clip_eps MUST be truthy — the
@@ -217,23 +302,54 @@ def _optimize_actor_critic(
     # v6: val0 (current-net V) is ALWAYS recomputed here — GAE must use the CURRENT critic, never a
     # stored value. Only the policy-logp SOURCE switches: stored behavior logp for replayed steps,
     # else the recomputed current-net logp (the literal v5 on-policy path).
+    cval0_parts = []                                        # v7.3: per-city value snapshot [·, M] chunks
     with torch.no_grad():
         if use_micro:                                       # v5: chunk the snapshot; cat → math-identical
             v_parts, lp_parts = [], []
             for lo in range(0, n, micro_batch_steps):
                 hi = min(lo + micro_batch_steps, n)
-                tl0, pl0, cl0, v0 = _unpack(forward_chunk_fn(lo, hi))
+                tl0, pl0, cl0, cv0, v0 = _unpack(forward_chunk_fn(lo, hi))
                 v_parts.append(v0.reshape(-1))
+                if use_percity_credit:
+                    cval0_parts.append(cv0)
                 if stored_old_logp is None:                 # only recompute when on-policy
                     lp_parts.append(_policy_logp(tl0, pl0, cl0, lo, hi))
             val0 = torch.cat(v_parts)
             old_logp = stored_old_logp.detach() if stored_old_logp is not None else torch.cat(lp_parts).detach()
         else:
-            tl0, pl0, cl0, val0 = _unpack(forward_fn())
+            tl0, pl0, cl0, cv0, val0 = _unpack(forward_fn())
             val0 = val0.reshape(-1)
+            if use_percity_credit:
+                cval0_parts.append(cv0)
             old_logp = (stored_old_logp.detach() if stored_old_logp is not None
                         else _policy_logp(tl0, pl0, cl0, None, None).detach())
     v_np = val0.cpu().numpy()
+    # v7.3: per-city GAE off the value snapshot — A_city[t,i] credits city i's construction by ITS OWN
+    # discounted economy return (baseline V_city). Computed ONCE per round (like the civ adv/ret).
+    A_city = R_city = None
+    if use_percity_credit:
+        cval0_np = torch.cat(cval0_parts).cpu().numpy()     # [n, M]
+        econ_np = econ_city.cpu().numpy()
+        pres_np = city_present.cpu().numpy()
+        # v7.3: bound the per-city value target to O(1) so it can't dwarf the civ policy/value losses and
+        # swamp the shared trunk. Two steps, both advantage-preserving up to the norm_adv re-scale below:
+        #  (1) per-round STANDARDIZE econ over present cities → the signal is each city's economy RELATIVE
+        #      to the round mean (COMA-flavored); a constant offset shifts R_city and V_city equally.
+        #  (2) AVERAGE-REWARD scale ×(1−γ): a city's economy is autocorrelated (≈constant over its own
+        #      steps), so a raw discounted sum multiplies the level by ~1/(1−γ)≈100. Scaling by (1−γ) makes
+        #      R_city a γ-weighted AVERAGE of the standardized economy ⇒ O(1) value target, O(1) value loss.
+        pm = pres_np > 0
+        if pm.sum() > 1:
+            mu, sd = float(econ_np[pm].mean()), float(econ_np[pm].std()) + 1e-6
+            econ_np = np.where(pm, (1.0 - gamma) * (econ_np - mu) / sd, 0.0).astype(np.float32)
+        a_city_np, r_city_np = _per_city_gae(econ_np, cval0_np, pres_np, traj_lens, gamma, lam)
+        if norm_adv and a_city_np.size > 1:                 # normalize over PRESENT cities only
+            m = pres_np > 0
+            if m.sum() > 1:
+                vals = a_city_np[m]
+                a_city_np = np.where(m, (a_city_np - vals.mean()) / (vals.std() + 1e-8), 0.0).astype(np.float32)
+        A_city = torch.tensor(a_city_np)
+        R_city = torch.tensor(r_city_np)
     # v7.2 POTENTIAL-BASED REWARD SHAPING (Ng-Harada, policy-invariant): add F_t = coef·(γ·Φ_{t+1}−Φ_t)
     # to each non-terminal step WITHIN a trajectory; the LAST step keeps only the terminal ±1 (F=0 there,
     # so the terminal reward stands alone). The F terms telescope to a constant, leaving the optimal
@@ -269,11 +385,12 @@ def _optimize_actor_critic(
             # whole-batch else-branch below, applied per K-step chunk and size-weighted (chunk_n/N) so
             # the summed .mean()s == the whole-batch .mean()s; one backward-accumulate, one opt.step().
             loss_total = pl_sum = vl_sum = ent_sum = mv_sum = 0.0
+            cpg_sum = cvl_sum = 0.0                           # v7.3 per-city construction diagnostics
             ratio_sum = clip_count = 0.0                     # v6 read-only diagnostics (off-policy health)
             for lo in range(0, n, micro_batch_steps):
                 hi = min(lo + micro_batch_steps, n)
                 w = (hi - lo) / n
-                tl, pl, cl, val = _unpack(forward_chunk_fn(lo, hi))
+                tl, pl, cl, cval, val = _unpack(forward_chunk_fn(lo, hi))
                 val = val.reshape(-1)
                 logp = _policy_logp(tl, pl, cl, lo, hi)
                 if clip_eps:
@@ -288,7 +405,13 @@ def _optimize_actor_critic(
                     policy_loss = -(adv[lo:hi] * logp).mean()
                 value_loss = F.mse_loss(val, ret[lo:hi])
                 ent = _policy_entropy(tl, pl, cl, lo, hi).mean()
-                loss_c = (policy_loss + value_coef * value_loss - entropy_coef * ent) * w
+                loss_step = policy_loss + value_coef * value_loss - entropy_coef * ent
+                if use_percity_credit:                       # v7.3 separate per-city construction objective
+                    c_pg, c_vloss, c_ent = _construction_credit_loss(cl, cval, lo, hi)
+                    loss_step = loss_step + c_pg + value_coef * c_vloss - entropy_coef * c_ent
+                    cpg_sum += float(c_pg.detach()) * w
+                    cvl_sum += float(c_vloss.detach()) * w
+                loss_c = loss_step * w
                 loss_c.backward()                           # accumulate grad; free the chunk graph
                 loss_total += float(loss_c.detach())
                 pl_sum += float(policy_loss.detach()) * w
@@ -307,10 +430,12 @@ def _optimize_actor_critic(
             safe_opt = copy.deepcopy(opt.state_dict())
             stats.update(loss=loss_total, policy_loss=pl_sum, value_loss=vl_sum, entropy=ent_sum,
                          mean_adv=float(adv.mean().item()), mean_value=mv_sum / n, grad_norm=float(gnorm))
+            if use_percity_credit:
+                stats.update(construction_pg=cpg_sum, construction_value_loss=cvl_sum)
             if clip_eps:
                 stats.update(mean_ratio=ratio_sum / n, clip_frac=clip_count / n)
         else:
-            tl, pl, cl, val = _unpack(forward_fn())
+            tl, pl, cl, cval, val = _unpack(forward_fn())
             val = val.reshape(-1)
             logp = _policy_logp(tl, pl, cl, None, None)
             if clip_eps:                                        # PPO clip (default ON; 0/None ⇒ plain A2C)
@@ -326,6 +451,11 @@ def _optimize_actor_critic(
             value_loss = F.mse_loss(val, ret)
             ent = _policy_entropy(tl, pl, cl, None, None).mean()
             loss = policy_loss + value_coef * value_loss - entropy_coef * ent
+            if use_percity_credit:                              # v7.3 separate per-city construction objective
+                c_pg, c_vloss, c_ent = _construction_credit_loss(cl, cval, None, None)
+                loss = loss + c_pg + value_coef * c_vloss - entropy_coef * c_ent
+                stats["construction_pg"] = float(c_pg.detach())
+                stats["construction_value_loss"] = float(c_vloss.detach())
 
             if not torch.isfinite(loss):                        # divergence guard (R8 + council 🔴)
                 net.load_state_dict(safe_state)                 # restore last finite weights — never export NaN
@@ -379,7 +509,7 @@ def _stack_construction(trajectories: list[TrainTrajectory], constr_w: int):
     aligned to the SAME max city count `build_rich_batch` pads own_cities to (per-step own_cities count
     == construction count == orderedOwnCities size). Pad action=−1 / logp=0 / mask=0 (inert rows → 0
     logp). Returns (a_construction[n,M] int, b_logp_construction[n] f32, m_construction[n,M,W] f32)."""
-    acts, logps, masks = [], [], []
+    acts, logps, masks, econs = [], [], [], []
     for t in trajectories:
         rich = t.rich
         for i in range(len(t.rewards)):
@@ -389,21 +519,31 @@ def _stack_construction(trajectories: list[TrainTrajectory], constr_w: int):
             mk = np.asarray(step["mask_construction"], np.float32) if step is not None and "mask_construction" in step else np.zeros((0, constr_w), np.float32)
             if mk.ndim == 1:
                 mk = mk.reshape(0, constr_w)
-            acts.append(a); logps.append(lp); masks.append(mk)
+            ec = np.asarray(step["econ_city"], np.float32).reshape(-1) if step is not None and "econ_city" in step else np.zeros(0, np.float32)
+            acts.append(a); logps.append(lp); masks.append(mk); econs.append(ec)
     n = len(acts)
     big_m = max((a.shape[0] for a in acts), default=0)
     m_dim = max(1, big_m)                                   # ≥1 so the tensors aren't degenerate
     a_c = np.full((n, m_dim), -1, np.int64)
     lp_c = np.zeros((n, m_dim), np.float32)
     mk_c = np.zeros((n, m_dim, constr_w), np.float32)
-    for i, (a, lp, mk) in enumerate(zip(acts, logps, masks)):
+    ec_c = np.zeros((n, m_dim), np.float32)                 # v7.3: per-city economy (0 in padded rows)
+    pres_c = np.zeros((n, m_dim), np.float32)               # v7.3: per-city presence (1 real, 0 padding)
+    has_econ = False
+    for i, (a, lp, mk, ec) in enumerate(zip(acts, logps, masks, econs)):
         k = a.shape[0]
         if k:
             a_c[i, :k] = a
             lp_c[i, :k] = lp
             if mk.shape[0] == k and mk.shape[1] == constr_w:
                 mk_c[i, :k] = mk
-    return torch.tensor(a_c), torch.tensor(lp_c.sum(axis=1)), torch.tensor(mk_c)
+            pres_c[i, :k] = 1.0                             # every own city is a present row (acted or not)
+            if ec.shape[0] == k:
+                ec_c[i, :k] = ec
+                has_econ = True
+    econ_t = torch.tensor(ec_c) if has_econ else None       # None ⇒ v6-era shard w/o econ_city (no per-city credit)
+    present_t = torch.tensor(pres_c) if has_econ else None
+    return torch.tensor(a_c), torch.tensor(lp_c.sum(axis=1)), torch.tensor(mk_c), econ_t, present_t
 
 
 def train_actor_critic_blind(
@@ -533,6 +673,7 @@ def train_actor_critic_structured(
     behavior_logp: bool = False,     # v6: use stored behavior logp as old_logp (off-policy replay); False ⇒ v5 recompute
     reward_shaping_coef: float = 0.0,  # v7.2: PBRS coefficient (F = coef·(γ·Φ'−Φ)); 0 ⇒ terminal-only
     construction: bool = True,       # v7: train the per-city construction head; False ⇒ pure v6 path (no-op oracle)
+    construction_credit_coef: float = 0.0,  # v7.3: per-city economy-advantage weight; >0 ⇒ per-city credit path
 ) -> tuple[object, dict, object]:
     """v4 STRUCTURED variant: same encoder-AGNOSTIC core (_optimize_actor_critic) + same rich
     batch/stacking as train_actor_critic_rich — ONLY the nn.Module is swapped for
@@ -559,9 +700,16 @@ def train_actor_critic_structured(
     # axis build_rich_batch pads own_cities to. The construction summand is part of the per-step joint
     # logp AND (for replay) the stored old_logp — the importance ratio covers all heads jointly.
     a_construction = m_construction = None
+    econ_city_t = city_present_t = None
     if construction:
-        a_construction, b_logp_construction, m_construction = _stack_construction(trajectories, net.constr_w)
-        if stored is not None:
+        a_construction, b_logp_construction, m_construction, econ_all, present_all = _stack_construction(trajectories, net.constr_w)
+        # v7.3: per-city credit is active ONLY when coef>0 AND the shards carry econ_city. Then construction
+        # trains as a SEPARATE per-city term (excluded from the joint ratio ⇒ NOT added to stored old_logp).
+        # coef==0 reproduces the legacy v7.2 shared-adv path (construction in the joint PPO ratio + stored).
+        use_pcc = construction_credit_coef > 0 and econ_all is not None
+        if use_pcc:
+            econ_city_t, city_present_t = econ_all, present_all
+        if stored is not None and not use_pcc:
             stored = stored + b_logp_construction
 
     def forward_fn():
@@ -579,5 +727,7 @@ def train_actor_critic_structured(
         clip_eps=clip_eps, norm_adv=norm_adv, stored_old_logp=stored,
         phi_np=phi_np, reward_shaping_coef=reward_shaping_coef,
         a_construction=a_construction, m_construction=m_construction,
+        econ_city=econ_city_t, city_present=city_present_t,
+        construction_credit_coef=construction_credit_coef,
     )
     return net, stats, optimizer

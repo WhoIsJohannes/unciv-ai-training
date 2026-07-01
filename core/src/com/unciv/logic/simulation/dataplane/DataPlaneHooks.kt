@@ -117,7 +117,8 @@ object DataPlaneHooks {
         val obs = state.featurizer.observe(civ)
         val turn = civ.gameInfo.turns
         val d = chooseAndApply(civ, policy, state.vocab, config, obs, turn)
-        state.recorder?.recordStep(civ, obs, d.actions, d.behaviorLogp, d.constructionActions, d.constructionLogp, turn)
+        state.recorder?.recordStep(civ, obs, d.actions, d.behaviorLogp, d.constructionActions, d.constructionLogp,
+            d.constructionEcon, turn)
     }
 
     /** The per-civ-turn decision: fixed civ-head actions + per-head behavior logp ([SampleSchema.MASK_HEADS]
@@ -125,7 +126,18 @@ object DataPlaneHooks {
     private class CivTurnDecision(
         val actions: FloatArray, val behaviorLogp: FloatArray,
         val constructionActions: FloatArray, val constructionLogp: FloatArray,
+        val constructionEcon: FloatArray,   // v7.3: per-city raw log-economy, aligned to orderedOwnCities
     )
+
+    /** v7.3: a city's raw log-economy `ln(1+max(0,prod)+max(0,food)+max(0,science))` (clamped ≥0 so ln is
+     *  finite for a starving city). The trainer's per-city value baseline + per-city GAE credit each
+     *  city's construction by its OWN economy return. */
+    private fun perCityEcon(city: City): Float {
+        val s = city.cityStats.currentCityStats
+        val e = s.production.toDouble().coerceAtLeast(0.0) + s.food.toDouble().coerceAtLeast(0.0) +
+            s.science.toDouble().coerceAtLeast(0.0)
+        return ln(1.0 + e).toFloat()
+    }
 
     /** Choose (and APPLY) the controlled actions. v1 controls tech + policy (greatPerson/diplomaticVote stay
      *  heuristic, recorded −1/0f). v7 ADDS per-city construction when [SampleConfig.controlConstruction]: for
@@ -163,6 +175,7 @@ object DataPlaneHooks {
         val cities = Featurizer.orderedOwnCities(civ, config.caps.maxOwnCities)
         val cActions = FloatArray(cities.size) { -1f }
         val cLogp = FloatArray(cities.size) { 0f }
+        val cEcon = FloatArray(cities.size) { perCityEcon(cities[it]) }   // v7.3: per-city economy, all cities
         if (config.controlConstruction) {
             val constrW = vocab.buildingCount + vocab.unitCount
             val maskFlat = obs.block("mask_construction")
@@ -188,7 +201,7 @@ object DataPlaneHooks {
                 }
             }
         }
-        return CivTurnDecision(actions, behaviorLogp, cActions, cLogp)
+        return CivTurnDecision(actions, behaviorLogp, cActions, cLogp, cEcon)
     }
 
     private fun boolMask(obs: Observation, blockName: String): BooleanArray =
@@ -274,7 +287,7 @@ class ShardRecorder(
      *  VARIABLE, one row per own city in `own_cities` order; −1/0f where the city did not decide). */
     fun recordStep(
         x: Civilization, obs: Observation, actions: FloatArray, behaviorLogp: FloatArray,
-        constructionActions: FloatArray, constructionLogp: FloatArray, turn: Int,
+        constructionActions: FloatArray, constructionLogp: FloatArray, constructionEcon: FloatArray, turn: Int,
     ) {
         val isFirst = seenCivs.add(x.civID)
         val civSlot = gameInfo.civilizations.indexOf(x)
@@ -285,6 +298,7 @@ class ShardRecorder(
             Observation.Block(SampleSchema.BLOCK_BEHAVIOR_LOGP, SampleSchema.DT_F32, BlockKind.FIXED, 0, behaviorLogp) +
             Observation.Block(SampleSchema.BLOCK_CONSTRUCTION_ACTION, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionActions) +
             Observation.Block(SampleSchema.BLOCK_CONSTRUCTION_LOGP, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionLogp) +
+            Observation.Block(SampleSchema.BLOCK_ECON_CITY, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionEcon) +
             Observation.Block(SampleSchema.BLOCK_PHI, SampleSchema.DT_F32, BlockKind.FIXED, 0, floatArrayOf(economyPotential(x)))
         if (!opened) {
             layout = blocks

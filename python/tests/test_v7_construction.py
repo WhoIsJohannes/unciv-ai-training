@@ -34,6 +34,7 @@ def _build_shard_v7(*, version, n_steps=3, n_cities=3, constr_w=5) -> bytes:
         {"name": "behavior_logp", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 4},
         {"name": "construction_action", "dtype": "<f4", "kind": "var", "perItem": 1, "len": 0},
         {"name": "construction_logp", "dtype": "<f4", "kind": "var", "perItem": 1, "len": 0},
+        {"name": "econ_city", "dtype": "<f4", "kind": "var", "perItem": 1, "len": 0},  # v7.3 per-city log-economy
         {"name": "phi", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 1},  # v7.2 economy potential
     ]
     header = {
@@ -64,13 +65,13 @@ def _build_shard_v7(*, version, n_steps=3, n_cities=3, constr_w=5) -> bytes:
     return bytes(out)
 
 
-def test_schema_version_is_6():
-    """Lockstep bump landed on the Python side (mirrors Kotlin SampleSchema.VERSION). v6 = v7.2 phi."""
-    assert SCHEMA_VERSION == 6, f"v7.2 requires SCHEMA_VERSION 6 (got {SCHEMA_VERSION})"
+def test_schema_version_is_7():
+    """Lockstep bump landed on the Python side (mirrors Kotlin SampleSchema.VERSION). v7 = v7.3 econ_city."""
+    assert SCHEMA_VERSION == 7, f"v7.3 requires SCHEMA_VERSION 7 (got {SCHEMA_VERSION})"
 
 
 def test_construction_blocks_round_trip(tmp_path):
-    """AC#4: the two new VARIABLE f32 blocks round-trip with NO reader change."""
+    """AC#4: the new VARIABLE f32 blocks (construction + v7.3 econ_city) round-trip with NO reader change."""
     n_cities, constr_w = 3, 5
     p = tmp_path / "v7.bin"
     p.write_bytes(_build_shard_v7(version=SCHEMA_VERSION, n_cities=n_cities, constr_w=constr_w))
@@ -79,6 +80,7 @@ def test_construction_blocks_round_trip(tmp_path):
     assert "construction_action" in s0.blocks and "construction_logp" in s0.blocks
     assert s0.blocks["construction_action"].shape == (n_cities, 1)
     assert s0.blocks["construction_logp"].shape == (n_cities, 1)
+    assert s0.blocks["econ_city"].shape == (n_cities, 1)          # v7.3 per-city economy
     assert s0.blocks["mask_construction"].shape == (n_cities, constr_w)
 
 
@@ -136,6 +138,8 @@ def _traj_with_construction(dims, n_steps=4, *, n_cities=2, acted=False):
             "own_cities": rng.standard_normal((n_cities, 17)).astype(np.float32),
             "opp_cities": np.zeros((0, 17), np.float32), "civ_tokens": rng.standard_normal((2, 84)).astype(np.float32),
             "mask_construction": mask, "construction_action": a, "construction_logp": lp,
+            # v7.3 per-city raw log-economy (distinct per city so the per-city advantage is non-degenerate).
+            "econ_city": np.array([2.0 + 0.5 * j + 0.1 * i for j in range(n_cities)], np.float32),
         })
     rewards = np.zeros(n_steps, np.float32); rewards[-1] = 1.0
     return TrainTrajectory(np.zeros((n_steps, dims.input_w), np.float32),
@@ -218,9 +222,9 @@ def test_construction_logits_ort_matches_torch():
         cnt = M if n == "own_cities" else 1
         inp[n] = torch.randn(1, cnt, _TS[n]); inp[n + "_mask"] = torch.ones(1, cnt)
     with torch.no_grad():
-        _t, _p, c_torch, _v = net(inp, with_construction=True)
+        _t, _p, c_torch, _cv, _v = net(inp, with_construction=True)   # v7.3: forward is a 5-tuple (+city value)
     tmp = tempfile.mktemp(suffix=".onnx")
-    export_rich(net, dims, _TS, tmp, schema_version=5, ruleset_fingerprint="fp",
+    export_rich(net, dims, _TS, tmp, schema_version=SCHEMA_VERSION, ruleset_fingerprint="fp",
                 sample_inputs={k: v.numpy() for k, v in inp.items()}, neighbors=True,
                 contract_version=C.CONTRACT_VERSION_STRUCTURED)
     sess = ort.InferenceSession(tmp)
@@ -263,3 +267,69 @@ def test_pbrs_coef_zero_and_none_phi_are_noops():
         seed=0, clip_eps=0.2, net=_copy.deepcopy(net0), construction=False, reward_shaping_coef=0.1)
     max_dw = (_weights(base) - _weights(coefpos)).abs().max().item()
     assert max_dw < 1e-6, f"PBRS not a no-op when phi is None: max|Δw|={max_dw}"
+
+
+# ---- v7.3 per-city credit assignment ---------------------------------------------------------------
+def test_per_city_gae_credits_each_city_by_its_own_return():
+    """`_per_city_gae` runs an INDEPENDENT GAE per city. A city with a high, rising economy return must
+    get a different advantage than a flat-economy city — the whole point of per-city attribution. Padded
+    (present=0) rows are zeroed."""
+    from unciv_train.train import _per_city_gae
+    # 1 trajectory, L=3, M=2. City 0 economy rises; city 1 flat. Baselines all zero.
+    econ = np.array([[1.0, 5.0], [2.0, 5.0], [3.0, 5.0]], np.float32)
+    cval = np.zeros((3, 2), np.float32)
+    present = np.array([[1, 1], [1, 1], [1, 0]], np.float32)   # city1 absent at t=2 (padding)
+    A, R = _per_city_gae(econ, cval, present, [3], gamma=0.99, lam=0.95)
+    assert A.shape == (3, 2) and R.shape == (3, 2)
+    assert A[0, 0] != A[0, 1], "distinct per-city economies must yield distinct per-city advantages"
+    assert A[2, 1] == 0.0 and R[2, 1] == 0.0, "padded/absent city row must be zeroed"
+    # At λ=1 with zero baseline, R == the Monte-Carlo discounted econ return: city0 R[0]=1+.99*2+.99^2*3.
+    A1, R1 = _per_city_gae(econ, cval, present, [3], gamma=0.99, lam=1.0)
+    assert abs(R1[0, 0] - (1.0 + 0.99 * 2.0 + 0.99 ** 2 * 3.0)) < 1e-3
+
+
+def test_per_city_credit_changes_training_vs_shared_adv():
+    """coef>0 (per-city credit: construction pulled out of the joint ratio, per-city advantage) must
+    diverge from coef=0 (legacy shared-adv, construction in the joint ratio) — the per-city economy
+    advantage actually flows into the construction head. Uses --replay-window-1-equivalent on-policy path."""
+    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    tj = _traj_with_construction(dims, acted=True)            # cities act + carry econ_city
+    torch.manual_seed(5); net0 = StructuredPolicyValueNet(dims, _TS, _VC, **RUNGS["small"])
+    shared, _, _ = train_actor_critic_structured(
+        [tj], dims, _TS, _VC, RUNGS["small"], epochs=2, lr=1e-3, seed=0, clip_eps=0.2,
+        net=_copy.deepcopy(net0), construction=True, construction_credit_coef=0.0)
+    percity, _, _ = train_actor_critic_structured(
+        [tj], dims, _TS, _VC, RUNGS["small"], epochs=2, lr=1e-3, seed=0, clip_eps=0.2,
+        net=_copy.deepcopy(net0), construction=True, construction_credit_coef=0.5)
+    assert (_weights(shared) - _weights(percity)).abs().max().item() > 1e-5, \
+        "per-city credit (coef>0) did not change training vs shared-adv (coef=0)"
+
+
+def test_per_city_credit_trains_city_value_head():
+    """The per-city value head must receive gradient under per-city credit (it's the per-city baseline).
+    Under coef=0 it is untouched (no per-city term); under coef>0 it moves."""
+    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    tj = _traj_with_construction(dims, acted=True)
+    torch.manual_seed(6); net0 = StructuredPolicyValueNet(dims, _TS, _VC, **RUNGS["small"])
+    cv0 = torch.cat([p.detach().reshape(-1) for p in net0.city_value_head.parameters()])
+    percity, _, _ = train_actor_critic_structured(
+        [tj], dims, _TS, _VC, RUNGS["small"], epochs=2, lr=1e-3, seed=0, clip_eps=0.2,
+        net=_copy.deepcopy(net0), construction=True, construction_credit_coef=0.5)
+    cv1 = torch.cat([p.detach().reshape(-1) for p in percity.city_value_head.parameters()])
+    assert (cv0 - cv1).abs().max().item() > 1e-6, "city value head received no gradient under per-city credit"
+
+
+def test_per_city_credit_offarm_still_bit_identical_noop():
+    """v7.3 must not break the OFF no-op: construction=False with the per-city coef set is still a
+    bit-identical no-op on the shared weights (the coef is inert when construction is off)."""
+    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    tj = _traj_with_construction(dims, acted=False)
+    torch.manual_seed(7); net0 = StructuredPolicyValueNet(dims, _TS, _VC, **RUNGS["small"])
+    net_off, _, _ = train_actor_critic_structured(
+        [tj], dims, _TS, _VC, RUNGS["small"], epochs=2, lr=1e-3, seed=0, clip_eps=0.2,
+        net=_copy.deepcopy(net0), construction=False, construction_credit_coef=0.5)
+    net_ref, _, _ = train_actor_critic_structured(
+        [tj], dims, _TS, _VC, RUNGS["small"], epochs=2, lr=1e-3, seed=0, clip_eps=0.2,
+        net=_copy.deepcopy(net0), construction=False, construction_credit_coef=0.0)
+    max_dw = (_weights(net_off) - _weights(net_ref)).abs().max().item()
+    assert max_dw < 1e-6, f"per-city coef leaked into the OFF path: max|Δw|={max_dw}"

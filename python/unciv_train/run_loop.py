@@ -134,6 +134,7 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
     # the (off-policy) replayed steps; else behavior_logp=False ⇒ literal v5 recompute path.
     bl = replay_active if replay_active is not None else (getattr(args, "replay_window", 1) > 1)
     rsc = getattr(args, "reward_shaping_coef", 0.0)   # v7.2: PBRS coefficient (0 ⇒ terminal-only)
+    ccc = getattr(args, "construction_credit_coef", 0.0)   # v7.3: per-city economy-advantage weight (0 ⇒ shared-adv)
     if variant == "v1-reinforce":   # v1 is not continual — ignores warm net/opt
         net, stats = tr.train_reinforce(trajectories_or_steps, dims, epochs=args.epochs,
                                         lr=args.lr, seed=seed, entropy_coef=args.entropy_coef)
@@ -163,7 +164,8 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             lr=args.lr, seed=seed, gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
             net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl, reward_shaping_coef=rsc,
-            construction=(getattr(args, "control_construction", "off") == "on"))   # v7: train the per-city head only when ON
+            construction=(getattr(args, "control_construction", "off") == "on"),   # v7: train the per-city head only when ON
+            construction_credit_coef=ccc)   # v7.3: >0 ⇒ per-city credit (separate per-city construction PG term)
         return net, stats, ("structured", token_specs), optimizer
     raise ValueError(f"unknown variant {variant!r}")
 
@@ -268,6 +270,14 @@ def main(argv=None) -> int:
                          "policy-invariant (Ng-Harada) — it shortens the credit horizon for long-payoff "
                          "decisions (construction) WITHOUT changing the optimal 'win the game' policy. "
                          "0 ⇒ terminal-only (unchanged). Try ~0.1.")
+    ap.add_argument("--construction-credit-coef", type=float, default=0.0,
+                    help="v7.3: per-city credit weight. When >0, construction is pulled OUT of the joint "
+                         "PPO ratio and trained by a SEPARATE per-city policy-gradient term whose advantage "
+                         "is shared_adv + coef·A_city, where A_city is a per-city GAE over the recorded "
+                         "per-city log-economy (baseline = a per-city value head). This credits each city's "
+                         "construction by ITS OWN economy return (the attribution fix). 0 ⇒ legacy shared-adv "
+                         "(construction in the joint ratio). Requires --control-construction on. Use "
+                         "--replay-window 1 (the per-city term is on-policy). Try ~0.5.")
     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
     args = ap.parse_args(argv)
     if args.variant == "rich-v2":   # alias for the v4 structured encoder
