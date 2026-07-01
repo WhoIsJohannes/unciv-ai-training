@@ -4,7 +4,9 @@
 #   THREADS=12 ./run_v73eff.sh
 #
 # The attribution fix for the v7 construction negative. THREE arms (small rung, Medium, 16 rounds,
-# on-policy --replay-window 1, NO PBRS):
+# --replay-window 4, NO PBRS). rw4 is the ESTABLISHED strong regime (OFF baseline ~40-47%, near the 50%
+# break-even where the question is meaningful); rw1 undertrains the baseline to ~13%. The per-city
+# construction term is valid under replay via its own per-city PPO importance ratio (b_logp_construction_pc).
 #   off        : construction OFF                      (baseline — tech+policy only, ~v5/v6)
 #   on-shared  : construction ON, credit-coef 0        (the v7 negative under MATCHED rw1 conditions:
 #                                                        construction in the joint PPO ratio, shared adv)
@@ -18,7 +20,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home}"
 PY="${PY:-python3}"; [ -x .venv/bin/python ] && PY=".venv/bin/python"
-EFF="${OUT_ROOT:-../training-runs/v73eff}"; mkdir -p "$EFF"; EFF="$(cd "$EFF" && pwd)"
+EFF="${OUT_ROOT:-../training-runs/v73eff_rw4}"; mkdir -p "$EFF"; EFF="$(cd "$EFF" && pwd)"
 TH="${THREADS:-12}"; ROUNDS="${ROUNDS:-16}"
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
@@ -28,7 +30,7 @@ arm() {  # <name> <on|off> <credit-coef>
   "$PY" -m unciv_train.run_loop --variant structured --rung small --map-size Medium --rounds "$ROUNDS" \
     --gen-games 16 --eval-games 80 --turn-cap 250 --threads "$TH" --epochs 8 --lr 1e-3 --gamma 0.99 \
     --lam 0.95 --value-coef 0.5 --entropy-coef 0.01 --clip-eps 0.2 --gen-seed 1000 --eval-seed 999000 \
-    --continual --resume --replay-window 1 --micro-batch-steps 256 --control-construction "$cc" \
+    --continual --resume --replay-window 4 --micro-batch-steps 256 --control-construction "$cc" \
     --construction-credit-coef "$coef" --out "$EFF/$name" \
   && "$PY" -m unciv_train.analyze_v5 --root "$EFF/$name" --label "$name" \
     --ceiling-games 200 --turn-cap 250 --threads "$TH" --eval-seed 4242424 --control-construction "$cc"
