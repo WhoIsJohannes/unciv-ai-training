@@ -141,7 +141,26 @@ NO PBRS, 200-game ceiling @ eval-seed 4242424:
 
 The question: does per-city credit turn the negative around — `on-pcc ≥ off` (moves the right way, per the
 ship criterion) and `on-pcc > on-shared` (proving the credit MECHANISM, not just re-running construction)?
-_Results pending — this section will be updated with the 3-way ceiling comparison + verdict._
+
+### ⚠️ MAJOR METHODOLOGY FINDING — the self-play baseline is HIGH-VARIANCE (single-seed results unreliable)
+The first `run_v73eff` attempt showed an alarming ~13% OFF baseline (vs the historical ~40%). A deep
+investigation (documented in commit history) established there is **NO regression** — instead the self-play
+ceiling swings **8.8% (seed 2000) ↔ 41.7% (seed 3000) for IDENTICAL code**. The compounding climb happens in
+**rounds 8–15** (my early diagnostics stopped at 8, seeing only the flat ~15% pre-climb). Root cause: the
+~250-turn game simulation is nondeterministic run-to-run (engine/heuristic-AI, not the policy RNG which is
+deterministic per civ+turn); the v5 RESULTS already warned "read the trajectory, not single points." Verified:
+v5-commit code reproduces ~37% on current torch 2.8.0; every v6→v7.3 changed line is byte-equivalent for the
+OFF/rw1 path; net is per-sample so micro-batch 0 ≡ 256.
+
+**Consequence:** every single-seed number in this doc (v7 47%/14%, v7.2 37%/1.5%, v5 40.7%) is ONE draw from a
+wide distribution and is individually unreliable. The v7 "construction is a robust negative" verdict is being
+**re-tested under replication.**
+
+### Replicated experiment (`python/run_v73rep.sh` + `analyze_v73rep.py`) — IN PROGRESS
+3 arms (off / on-shared coef 0 / on-pcc coef 0.5) × **4 seeds** {1000,2000,3000,4000}, small/Medium/16-round/
+mb0/rw1, 200-game ceiling @ 4242424. Reports per-arm **mean±SE** + **PAIRED per-seed differences** (same
+gen-seed controls the shared variance → tight effect estimate). _Verdict pending; this section will be updated
+with the mean ceilings + paired Δ(on-pcc − off) and Δ(on-pcc − on-shared)._
 
 ## What this does NOT rule out (explicit follow-ups — require a bigger effort, not run here)
 1. **Decision cadence** — decide at construction-completion (the natural commit point) rather than every
