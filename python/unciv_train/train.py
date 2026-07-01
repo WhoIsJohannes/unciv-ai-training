@@ -220,6 +220,8 @@ def _optimize_actor_critic(
     econ_city: torch.Tensor | None = None,        # v7.3: per-city raw log-economy [n, M] (padded); the per-city reward
     city_present: torch.Tensor | None = None,     # v7.3: per-city presence mask [n, M] (1 real city, 0 padding)
     construction_credit_coef: float = 0.0,        # v7.3: weight of the per-city economy advantage (0 ⇒ shared-adv only)
+    old_logp_construction_pc: torch.Tensor | None = None,  # v7.3: per-city construction behavior logp [n, M] for the
+                                                  # per-city PPO importance ratio (valid under replay). None ⇒ A2C (no ratio).
 ) -> tuple[object, dict]:
     import copy
     opt = optimizer                  # v5: persistent optimizer (built once in the trainer, carried by run_loop)
@@ -274,9 +276,20 @@ def _optimize_actor_critic(
         # stays comparable to a single civ head. Summing over ~6 cities was the v7 objective-domination bug:
         # grad clipping would then shrink the civ (tech/policy) gradient too. Per-step denom = #present cities.
         denom = pres.sum(dim=1).clamp(min=1.0)              # [chunk]
+        acted = (ac >= 0).float()                            # [chunk, M] — only deciding cities contribute
         logp_pc = _construction_logp_percity(cl, ac, mc)    # [chunk, M], 0 for non-acting cities
-        constr_adv = adv[lo:hi].unsqueeze(1) + construction_credit_coef * A_city[lo:hi]   # [chunk, M]
-        pg = -((logp_pc * constr_adv.detach()).sum(dim=1) / denom).mean()   # per-city mean, then mean steps
+        constr_adv = (adv[lo:hi].unsqueeze(1) + construction_credit_coef * A_city[lo:hi]).detach()  # [chunk, M]
+        if clip_eps and old_logp_construction_pc is not None:
+            # v7.3 per-city PPO clip: importance ratio vs the recorded per-city behavior policy makes the
+            # per-city term correct under REPLAY (off-policy). On-policy the behavior logp ≈ round-start logp
+            # so the ratio starts ≈1 and drifts across epochs — standard PPO. Mask to acting cities: a
+            # non-acting city has 0 logp-diff ⇒ ratio 1, which would otherwise leak constr_adv into the sum.
+            logratio = (logp_pc - old_logp_construction_pc[lo:hi]).clamp(-20.0, 20.0)
+            ratio = torch.exp(logratio)
+            surr = torch.min(ratio * constr_adv, torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * constr_adv)
+            pg = -((surr * acted).sum(dim=1) / denom).mean()
+        else:
+            pg = -((logp_pc * constr_adv).sum(dim=1) / denom).mean()   # A2C fallback (no ratio)
         ent = (_construction_entropy_percity(cl, ac, mc).sum(dim=1) / denom).mean()
         cval = cval.reshape(pres.shape)
         se = (cval - R_city[lo:hi]).pow(2) * pres           # mask padded/absent cities
@@ -543,7 +556,9 @@ def _stack_construction(trajectories: list[TrainTrajectory], constr_w: int):
                 has_econ = True
     econ_t = torch.tensor(ec_c) if has_econ else None       # None ⇒ v6-era shard w/o econ_city (no per-city credit)
     present_t = torch.tensor(pres_c) if has_econ else None
-    return torch.tensor(a_c), torch.tensor(lp_c.sum(axis=1)), torch.tensor(mk_c), econ_t, present_t
+    # Return BOTH the per-step SUM (for the legacy joint-ratio stored old_logp) and the PER-CITY behavior
+    # logp [n,M] (for the v7.3 per-city PPO importance ratio — makes the per-city term valid under replay).
+    return torch.tensor(a_c), torch.tensor(lp_c.sum(axis=1)), torch.tensor(mk_c), econ_t, present_t, torch.tensor(lp_c)
 
 
 def train_actor_critic_blind(
@@ -700,15 +715,18 @@ def train_actor_critic_structured(
     # axis build_rich_batch pads own_cities to. The construction summand is part of the per-step joint
     # logp AND (for replay) the stored old_logp — the importance ratio covers all heads jointly.
     a_construction = m_construction = None
-    econ_city_t = city_present_t = None
+    econ_city_t = city_present_t = old_logp_construction_pc = None
     if construction:
-        a_construction, b_logp_construction, m_construction, econ_all, present_all = _stack_construction(trajectories, net.constr_w)
+        a_construction, b_logp_construction, m_construction, econ_all, present_all, b_logp_construction_pc = \
+            _stack_construction(trajectories, net.constr_w)
         # v7.3: per-city credit is active ONLY when coef>0 AND the shards carry econ_city. Then construction
-        # trains as a SEPARATE per-city term (excluded from the joint ratio ⇒ NOT added to stored old_logp).
+        # trains as a SEPARATE per-city term (excluded from the joint ratio ⇒ NOT added to stored old_logp),
+        # with its OWN per-city PPO importance ratio (b_logp_construction_pc) so it is valid under replay.
         # coef==0 reproduces the legacy v7.2 shared-adv path (construction in the joint PPO ratio + stored).
         use_pcc = construction_credit_coef > 0 and econ_all is not None
         if use_pcc:
             econ_city_t, city_present_t = econ_all, present_all
+            old_logp_construction_pc = b_logp_construction_pc
         if stored is not None and not use_pcc:
             stored = stored + b_logp_construction
 
@@ -729,5 +747,6 @@ def train_actor_critic_structured(
         a_construction=a_construction, m_construction=m_construction,
         econ_city=econ_city_t, city_present=city_present_t,
         construction_credit_coef=construction_credit_coef,
+        old_logp_construction_pc=old_logp_construction_pc,
     )
     return net, stats, optimizer

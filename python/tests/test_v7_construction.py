@@ -319,6 +319,21 @@ def test_per_city_credit_trains_city_value_head():
     assert (cv0 - cv1).abs().max().item() > 1e-6, "city value head received no gradient under per-city credit"
 
 
+def test_per_city_credit_trains_under_replay():
+    """v7.3 per-city PPO ratio: with behavior_logp=True (off-policy replay), the per-city construction term
+    uses its own importance ratio and must train FINITE without divergence — the guarantee that lets the
+    experiment run at replay-window>1 (the strong ~40% baseline regime), not just on-policy rw1."""
+    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    tj = _traj_with_construction(dims, acted=True)
+    torch.manual_seed(8); net0 = StructuredPolicyValueNet(dims, _TS, _VC, **RUNGS["small"])
+    net, stats, _ = train_actor_critic_structured(
+        [tj], dims, _TS, _VC, RUNGS["small"], epochs=3, lr=1e-3, seed=0, clip_eps=0.2,
+        net=_copy.deepcopy(net0), construction=True, construction_credit_coef=0.5, behavior_logp=True)
+    assert not stats.get("diverged", False), "per-city credit diverged under replay"
+    assert torch.isfinite(_weights(net)).all(), "non-finite weights under replay per-city credit"
+    assert (_weights(net0) - _weights(net)).abs().max().item() > 1e-6, "no training happened under replay"
+
+
 def test_per_city_credit_offarm_still_bit_identical_noop():
     """v7.3 must not break the OFF no-op: construction=False with the per-city coef set is still a
     bit-identical no-op on the shared weights (the coef is inert when construction is off)."""
