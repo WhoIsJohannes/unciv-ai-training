@@ -550,6 +550,9 @@ def _stack_construction(trajectories: list[TrainTrajectory], constr_w: int):
             lp_c[i, :k] = lp
             if mk.shape[0] == k and mk.shape[1] == constr_w:
                 mk_c[i, :k] = mk
+            elif mk.size and mk.shape[1] != constr_w:       # fail loud (was: silently zero → dead construction grad)
+                raise ValueError(f"construction mask width {mk.shape[1]} != net.constr_w {constr_w} — shard "
+                                 "ruleset/vocab differs from the training net (warm-start arch mismatch)")
             pres_c[i, :k] = 1.0                             # every own city is a present row (acted or not)
             if ec.shape[0] == k:
                 ec_c[i, :k] = ec
@@ -587,6 +590,9 @@ def _stack_bc_targets(trajectories: list[TrainTrajectory], constr_w: int):
             tg[i, :k] = cc
             if mk.shape[0] == k and mk.shape[1] == constr_w:
                 mk_c[i, :k] = mk
+            elif mk.size and mk.shape[1] != constr_w:                # fail loud on a genuine width mismatch
+                raise ValueError(f"BC mask width {mk.shape[1]} != net.constr_w {constr_w} — BC dataset "
+                                 "ruleset/vocab differs from the training net (cross-ruleset BC is invalid)")
     tg[(tg < 0) | (tg >= constr_w)] = -1                        # drop out-of-range / idle targets
     return torch.tensor(tg), torch.tensor(mk_c)
 

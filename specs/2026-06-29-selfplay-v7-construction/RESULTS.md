@@ -187,6 +187,38 @@ validated (14 tests green), and correct — the durable deliverable, default OFF
 per-entity machinery remains reusable for the next heads (promotion / great-person / diplomatic-vote), which
 have FAR smaller action spaces than construction's ~250-wide per-city space and may work where it doesn't.
 
+## v7.4 — behavior-cloning warm-start: the COLLAPSE is solved, construction is NEUTRAL (not a win)
+Root-caused the construction failure with DATA (not the old single-seed hypothesis): the on-arm net builds
+**99% units / 2 types, ~1.6 cities** (vs the heuristic's 7) — mode collapse under sparse terminal reward (loses
+~every game → all-negative advantages → collapses below random, with no positive-signal foothold). Also
+MEASURED the lever's value (gen random + control-on): **random construction 41.7% ≈ heuristic 36.9%** (both
+random tech/policy) — the sophisticated 403-line heuristic is only ~random-level at *winning*, so there's
+plausible headroom above it, and the net's job is to not-collapse then exceed a beatable target.
+
+**BC fix:** record the heuristic's per-city picks (`construction_current`, schema 7→8), supervised-clone the
+construction head to them (`bc_pretrain_construction`, legal-masked CE, civ heads untouched), then RL-finetune
+with an entropy leash (`run_loop --bc-pretrain-dir`). Gives a non-collapsed ~heuristic start + a
+positive-advantage foothold.
+
+**Replicated 3-arm × 4-seed result** (off / on=collapse / bc; small/Medium/16-round/mb0/rw1/ent 0.02):
+
+| arm | s1000 | s2000 | s3000 | s4000 | mean±SE |
+|---|---|---|---|---|---|
+| **off** | 55.4 | 39.2 | 30.9 | 44.1 | **42.4% ± 5.1** |
+| **on** (no BC) | 7.4 | 5.4 | 0.0 | 0.0 | **3.2% ± 1.9** |
+| **bc** (BC warm-start) | 50.5 | 21.6 | 6.4 | 73.5 | **38.0% ± 15.0** |
+
+Paired: **bc − on = +34.8pp** (t=+2.31, **significant → BC escapes the collapse**); **bc − off = −4.4pp**
+(t=−0.37, **within noise → parity, inconclusive**); on − off = −39.2pp (t=−9.6, raw control collapses robustly).
+
+**Verdict:** BC **solves the collapse** and makes construction control **safe (≈ the no-construction baseline)**
+— but it does **NOT beat** the baseline. Two caveats point the same way: (1) bc is **wildly variable**
+(6.4%→73.5%!, SE 15 vs off's 5.1) — at seed 4000 it hit 73.5% (**+29pp above off** = real headroom captured),
+so bc−off is genuinely underpowered; (2) the clone is **weak** — `bc_acc` stalled at **0.27** on Medium (vs 0.54
+Tiny), so bc is a noisy heuristic copy RL finetunes from a shaky start. **Untested lever:** a tighter clone
+(more BC epochs / lower LR → higher acc) should cut the variance + give RL a stronger launchpad — the decisive
+test of whether the seed-4000 upside is real+repeatable. Infra shipped (schema-8, BC pretrain, `--bc-pretrain-dir`).
+
 ## What this does NOT rule out (explicit follow-ups — require a bigger effort, not run here)
 1. **Decision cadence** — decide at construction-completion (the natural commit point) rather than every
    turn, to remove churning. (The plan's perpetual-only gate was inert because the heuristic keeps cities

@@ -35,7 +35,7 @@ run_job() {  # <arm> <seed> <control on|off> <bc 0|1>
     --gen-games 16 --eval-games 80 --turn-cap 250 --threads "$TH" --epochs 8 --lr 1e-3 --gamma 0.99 \
     --lam 0.95 --value-coef 0.5 --entropy-coef "$ENT" --clip-eps 0.2 --gen-seed "$seed" --eval-seed 999000 \
     --continual --resume --replay-window 1 --rung small --micro-batch-steps 0 \
-    --control-construction "$ctrl" --construction-credit-coef 0.0 "${bcflag[@]}" --out "$out" > "$out.log" 2>&1 \
+    --control-construction "$ctrl" --construction-credit-coef 0.0 "${bcflag[@]+"${bcflag[@]}"}" --out "$out" > "$out.log" 2>&1 \
   && python3 -m unciv_train.analyze_v5 --root "$out" --label "${arm}_s${seed}" \
     --ceiling-games 200 --turn-cap 250 --threads "$TH" --eval-seed 4242424 --control-construction "$ctrl" >> "$out.log" 2>&1 \
   && log "DONE ${arm}_s${seed}" || log "FAIL ${arm}_s${seed} (see $out.log; re-run to --resume)"
