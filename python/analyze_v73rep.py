@@ -10,7 +10,9 @@ import math
 import sys
 from pathlib import Path
 
+# arms + the paired comparisons to print; override via argv[3] (comma-sep arms) + argv[4] (a-b;c-d pairs)
 ARMS = ["off", "on-shared", "on-pcc"]
+PAIRS = [("on-pcc", "off"), ("on-shared", "off"), ("on-pcc", "on-shared")]
 
 
 def _ceiling(root: Path, arm: str, seed: str):
@@ -50,8 +52,13 @@ def _paired(root, a, b, seeds):
 
 
 def main():
+    global ARMS, PAIRS
     root = Path(sys.argv[1])
     seeds = (sys.argv[2].split() if len(sys.argv) > 2 else ["1000", "2000", "3000", "4000"])
+    if len(sys.argv) > 3 and sys.argv[3]:
+        ARMS = sys.argv[3].split(",")
+    if len(sys.argv) > 4 and sys.argv[4]:
+        PAIRS = [tuple(p.split("-", 1)) for p in sys.argv[4].split(";")]
     print(f"\n=== v7.3 REPLICATED EFFICACY  (root={root}, seeds={seeds}) ===\n")
     print(f"{'arm':<12} " + " ".join(f"s{s:<6}" for s in seeds) + "   mean±SE (n)")
     per_arm = {}
@@ -65,36 +72,24 @@ def main():
         print(f"{arm:<12} {cells}   {ms}")
 
     print("\n--- PAIRED per-seed differences (same seed ⇒ controls gen-variance) ---")
-    for a, b in (("on-pcc", "off"), ("on-shared", "off"), ("on-pcc", "on-shared")):
+    for a, b in PAIRS:
         diffs, m, se, n = _paired(root, a, b, seeds)
         if m is None:
             print(f"  {a} − {b}: no paired data"); continue
         dd = " ".join(f"{d*100:+.1f}" for d in diffs)
         if se and n >= 2:
             t = m / se if se > 0 else float("inf")
-            print(f"  {a:<10} − {b:<10}: mean Δ={m*100:+.1f}pp ±{se*100:.1f} (n={n})  per-seed[{dd}]  t≈{t:+.2f}")
+            verdict = ("A>B (Δ>2·SE)" if m > 2 * se else "B>A (Δ<−2·SE)" if m < -2 * se else "within noise")
+            print(f"  {a:<10} − {b:<10}: mean Δ={m*100:+.1f}pp ±{se*100:.1f} (n={n})  per-seed[{dd}]  t≈{t:+.2f}  [{verdict}]")
         else:
             print(f"  {a:<10} − {b:<10}: Δ={m*100:+.1f}pp (n={n})  per-seed[{dd}]")
 
-    # Verdict
-    moff = _mean_se(per_arm["off"])[0]; mpcc = _mean_se(per_arm["on-pcc"])[0]; msh = _mean_se(per_arm["on-shared"])[0]
     print("\n--- VERDICT ---")
-    if None in (moff, mpcc, msh):
+    means = {a: _mean_se(per_arm[a])[0] for a in ARMS}
+    if any(v is None for v in means.values()):
         print("  incomplete — some arms have no completed runs yet")
     else:
-        print(f"  mean ceilings: off={moff*100:.1f}%  on-shared={msh*100:.1f}%  on-pcc={mpcc*100:.1f}%")
-        _, dpo, spo, npo = _paired(root, "on-pcc", "off", seeds)
-        if dpo is not None:
-            moves_right = dpo >= 0
-            sig = (spo and npo >= 2 and abs(dpo) > 2 * spo)
-            print(f"  per-city credit vs OFF: Δ={dpo*100:+.1f}pp{' (>2·SE)' if sig else ''} — "
-                  f"{'MOVES THE RIGHT WAY (construction no longer hurts)' if moves_right else 'still below OFF'}")
-        _, dps, sps, nps = _paired(root, "on-pcc", "on-shared", seeds)
-        if dps is not None:
-            helps = (sps is not None and nps >= 2 and dps > 2 * sps)   # real only if Δ > 2·SE
-            print(f"  per-city credit vs shared-adv: Δ={dps*100:+.1f}pp"
-                  f"{f' ±{sps*100:.1f}' if sps is not None else ''} — "
-                  f"{'the credit MECHANISM helps (Δ>2·SE)' if helps else 'NO mechanism gain over shared-adv (within noise)'}")
+        print("  mean ceilings: " + "  ".join(f"{a}={means[a]*100:.1f}%" for a in ARMS))
 
 
 if __name__ == "__main__":
