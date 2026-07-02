@@ -561,6 +561,87 @@ def _stack_construction(trajectories: list[TrainTrajectory], constr_w: int):
     return torch.tensor(a_c), torch.tensor(lp_c.sum(axis=1)), torch.tensor(mk_c), econ_t, present_t, torch.tensor(lp_c)
 
 
+def _stack_bc_targets(trajectories: list[TrainTrajectory], constr_w: int):
+    """v7.4: per-step per-city BC target = the heuristic's currently-building construction (`construction_current`,
+    0-indexed mask idx; −1 = idle/no-target), padded to the batch max city count M. Returns (targets[n,M] int,
+    mask[n,M,W] f32). Rows with target −1 (or an out-of-range idx) are excluded from the BC loss."""
+    tgts, masks = [], []
+    for t in trajectories:
+        rich = t.rich
+        for i in range(len(t.rewards)):
+            step = rich[i] if rich is not None else None
+            cc = (np.asarray(step["construction_current"], np.int64).reshape(-1)
+                  if step is not None and "construction_current" in step else np.zeros(0, np.int64))
+            mk = np.asarray(step["mask_construction"], np.float32) if step is not None and "mask_construction" in step else np.zeros((0, constr_w), np.float32)
+            if mk.ndim == 1:
+                mk = mk.reshape(0, constr_w)
+            tgts.append(cc); masks.append(mk)
+    n = len(tgts)
+    big_m = max((a.shape[0] for a in tgts), default=0)
+    m_dim = max(1, big_m)
+    tg = np.full((n, m_dim), -1, np.int64)
+    mk_c = np.zeros((n, m_dim, constr_w), np.float32)
+    for i, (cc, mk) in enumerate(zip(tgts, masks)):
+        k = cc.shape[0]
+        if k:
+            tg[i, :k] = cc
+            if mk.shape[0] == k and mk.shape[1] == constr_w:
+                mk_c[i, :k] = mk
+    tg[(tg < 0) | (tg >= constr_w)] = -1                        # drop out-of-range / idle targets
+    return torch.tensor(tg), torch.tensor(mk_c)
+
+
+def bc_pretrain_construction(net, trajectories, dims, token_specs, *, epochs=8, lr=1e-3,
+                             seed=0, micro_batch_steps=512):
+    """v7.4 BEHAVIOR CLONING: supervised-pretrain the construction head to mimic the heuristic's per-city
+    picks (`construction_current`, gen'd with construction OFF). Cross-entropy over the legal-masked
+    construction logits vs the target idx, for cities with a valid target. Only the construction-loss path
+    (construction_head + shared trunk/encoder) gets gradient — tech/policy/value heads are untouched (not in
+    the loss). Gives the head a non-collapsed ~heuristic start so RL has a positive-advantage foothold to
+    climb from. Returns (net, stats)."""
+    from .features import build_rich_batch
+    torch.manual_seed(seed)
+    if not trajectories:
+        return net, {"bc_loss": 0.0, "bc_acc": 0.0, "n": 0}
+    tgt, m_c = _stack_bc_targets(trajectories, net.constr_w)
+    if tgt.shape[1] != 1 and (tgt >= 0).sum() == 0:
+        return net, {"bc_loss": 0.0, "bc_acc": 0.0, "n": 0, "note": "no BC targets"}
+    inputs = build_rich_batch(trajectories, dims, token_specs)
+    n = tgt.shape[0]
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    mb = micro_batch_steps if (micro_batch_steps and 0 < micro_batch_steps < n) else n
+    last = {"bc_loss": 0.0, "bc_acc": 0.0, "n": n}
+    for ep in range(epochs):
+        opt.zero_grad()
+        tot_loss = tot_correct = tot_valid = 0.0
+        for lo in range(0, n, mb):
+            hi = min(lo + mb, n)
+            w = (hi - lo) / n
+            out = net({k: v[lo:hi] for k, v in inputs.items()}, with_construction=True)
+            cl = out[2]                                         # [chunk, M, W] construction logits
+            mk, tg = m_c[lo:hi], tgt[lo:hi]
+            neg = torch.where(mk > 0, cl, torch.full_like(cl, -1e9))
+            logp = F.log_softmax(neg, dim=2)
+            idx = tg.clamp(min=0).unsqueeze(2)
+            # Require the target to be LEGAL in the mask — a mid-build item may not be re-choosable, and its
+            # −1e9 masked logit would otherwise blow up the loss (a handful poison the whole gradient).
+            legal_at_tgt = (mk.gather(2, idx).squeeze(2) > 0)
+            valid = (tg >= 0) & legal_at_tgt                   # [chunk, M] cities with a LEGAL heuristic target
+            chosen = logp.gather(2, idx).squeeze(2)            # [chunk, M]
+            vsum = valid.float().sum().clamp(min=1.0)
+            loss = -(chosen * valid.float()).sum() / vsum
+            (loss * w).backward()
+            with torch.no_grad():
+                pred = neg.argmax(dim=2)                        # masked argmax
+                tot_correct += float(((pred == tg) & valid).float().sum())
+                tot_valid += float(valid.float().sum())
+                tot_loss += float(loss.detach()) * w
+        torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=10.0)
+        opt.step()
+        last = {"bc_loss": tot_loss, "bc_acc": (tot_correct / tot_valid if tot_valid else 0.0), "n": n}
+    return net, last
+
+
 def train_actor_critic_blind(
     trajectories: list[TrainTrajectory],
     dims: Dims,

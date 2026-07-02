@@ -164,6 +164,10 @@ def _rich_step_blocks(blocks: dict, n_channels: int) -> dict:
     ec = blocks.get("econ_city")
     out["econ_city"] = (np.asarray(ec, dtype=np.float32).reshape(-1)
                         if ec is not None else np.zeros(0, np.float32))
+    # v7.4: per-city current construction mask idx (heuristic pick when gen'd with control off) — BC target.
+    cc = blocks.get("construction_current")
+    out["construction_current"] = (np.asarray(cc, dtype=np.float32).reshape(-1)
+                                   if cc is not None else np.zeros(0, np.float32))
     return out
 
 

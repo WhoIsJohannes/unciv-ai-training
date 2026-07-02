@@ -13,6 +13,14 @@ package com.unciv.logic.simulation.dataplane
  */
 object SampleSchema {
     /**
+     * VERSION 8 (was 7): v7.4 behavior-cloning warm-start. Adds a per-step VARIABLE scalar block
+     * [BLOCK_CONSTRUCTION_CURRENT] (perItem=1, aligned to `own_cities`/`construction_*`): the 0-indexed
+     * construction-mask idx each own city is CURRENTLY building (−1 if idle / on a PerpetualConstruction /
+     * not a building-or-unit). Recorded ALWAYS (independent of control). Generated with construction OFF,
+     * it captures the HEURISTIC's per-city choice — the supervised target for behavior-cloning the
+     * construction head (so it starts at ~heuristic instead of collapsing below random). A v7 shard lacks
+     * the block ⇒ regenerate.
+     *
      * VERSION 7 (was 6): v7.3 per-city credit assignment. Adds a per-step VARIABLE scalar block
      * [BLOCK_ECON_CITY] (perItem=1, aligned to `own_cities`/`construction_*`): each own city's raw
      * log-economy `ln(1+max(0,prod)+max(0,food)+max(0,science))`. The trainer builds a PER-CITY value
@@ -43,7 +51,7 @@ object SampleSchema {
      * is not layout-compatible. (VERSION 2 was: real terminal reward + applied civ-level action.)
      * The Python reader REFUSES a VERSION mismatch ⇒ regenerate; datasets are perishable by design.
      */
-    const val VERSION = 7
+    const val VERSION = 8
 
     /** 8 ASCII bytes at the head of every shard. */
     const val MAGIC = "UNCVSMP1"
@@ -168,6 +176,9 @@ object SampleSchema {
      */
     const val BLOCK_CONSTRUCTION_ACTION = "construction_action"
     const val BLOCK_CONSTRUCTION_LOGP = "construction_logp"
+    /** v7.4 BC target: the 0-indexed construction-mask idx each own city is currently building (−1 if
+     *  idle/perpetual/non-building-or-unit). Gen'd with construction OFF ⇒ the heuristic's picks. */
+    const val BLOCK_CONSTRUCTION_CURRENT = "construction_current"
 
     /**
      * v7.2 (VERSION 6): the deciding civ's log-stabilized ECONOMY POTENTIAL Φ(s), one FIXED f32 scalar

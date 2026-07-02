@@ -118,7 +118,7 @@ object DataPlaneHooks {
         val turn = civ.gameInfo.turns
         val d = chooseAndApply(civ, policy, state.vocab, config, obs, turn)
         state.recorder?.recordStep(civ, obs, d.actions, d.behaviorLogp, d.constructionActions, d.constructionLogp,
-            d.constructionEcon, turn)
+            d.constructionEcon, d.constructionCurrent, turn)
     }
 
     /** The per-civ-turn decision: fixed civ-head actions + per-head behavior logp ([SampleSchema.MASK_HEADS]
@@ -127,7 +127,17 @@ object DataPlaneHooks {
         val actions: FloatArray, val behaviorLogp: FloatArray,
         val constructionActions: FloatArray, val constructionLogp: FloatArray,
         val constructionEcon: FloatArray,   // v7.3: per-city raw log-economy, aligned to orderedOwnCities
+        val constructionCurrent: FloatArray, // v7.4: per-city current construction mask idx (BC target; heuristic pick when control off)
     )
+
+    /** v7.4: 0-indexed construction-mask idx of a city's currently-building item, or −1 if it's idle /
+     *  on a PerpetualConstruction / not a building-or-unit. Inverse of [Vocab.constructionId]. */
+    private fun constructionMaskIdx(vocab: Vocab, name: String): Float {
+        if (name.isEmpty()) return -1f
+        val b = vocab.building(name); if (b >= 0) return b.toFloat()
+        val u = vocab.unit(name); if (u >= 0) return (vocab.buildingCount + u).toFloat()
+        return -1f
+    }
 
     /** v7.3: a city's raw log-economy `ln(1+max(0,prod)+max(0,food)+max(0,science))` (clamped ≥0 so ln is
      *  finite for a starving city). The trainer's per-city value baseline + per-city GAE credit each
@@ -176,6 +186,9 @@ object DataPlaneHooks {
         val cActions = FloatArray(cities.size) { -1f }
         val cLogp = FloatArray(cities.size) { 0f }
         val cEcon = FloatArray(cities.size) { perCityEcon(cities[it]) }   // v7.3: per-city economy, all cities
+        // v7.4 BC target: each city's CURRENT construction (mask idx) BEFORE this turn's control runs → with
+        // construction OFF this is the heuristic's standing pick; the supervised label for behavior-cloning.
+        val cCurrent = FloatArray(cities.size) { constructionMaskIdx(vocab, cities[it].cityConstructions.currentConstructionName()) }
         if (config.controlConstruction) {
             val constrW = vocab.buildingCount + vocab.unitCount
             val maskFlat = obs.block("mask_construction")
@@ -201,7 +214,7 @@ object DataPlaneHooks {
                 }
             }
         }
-        return CivTurnDecision(actions, behaviorLogp, cActions, cLogp, cEcon)
+        return CivTurnDecision(actions, behaviorLogp, cActions, cLogp, cEcon, cCurrent)
     }
 
     private fun boolMask(obs: Observation, blockName: String): BooleanArray =
@@ -287,7 +300,8 @@ class ShardRecorder(
      *  VARIABLE, one row per own city in `own_cities` order; −1/0f where the city did not decide). */
     fun recordStep(
         x: Civilization, obs: Observation, actions: FloatArray, behaviorLogp: FloatArray,
-        constructionActions: FloatArray, constructionLogp: FloatArray, constructionEcon: FloatArray, turn: Int,
+        constructionActions: FloatArray, constructionLogp: FloatArray, constructionEcon: FloatArray,
+        constructionCurrent: FloatArray, turn: Int,
     ) {
         val isFirst = seenCivs.add(x.civID)
         val civSlot = gameInfo.civilizations.indexOf(x)
@@ -299,6 +313,7 @@ class ShardRecorder(
             Observation.Block(SampleSchema.BLOCK_CONSTRUCTION_ACTION, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionActions) +
             Observation.Block(SampleSchema.BLOCK_CONSTRUCTION_LOGP, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionLogp) +
             Observation.Block(SampleSchema.BLOCK_ECON_CITY, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionEcon) +
+            Observation.Block(SampleSchema.BLOCK_CONSTRUCTION_CURRENT, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionCurrent) +
             Observation.Block(SampleSchema.BLOCK_PHI, SampleSchema.DT_F32, BlockKind.FIXED, 0, floatArrayOf(economyPotential(x)))
         if (!opened) {
             layout = blocks

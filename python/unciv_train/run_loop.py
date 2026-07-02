@@ -278,6 +278,13 @@ def main(argv=None) -> int:
                          "construction by ITS OWN economy return (the attribution fix). 0 ⇒ legacy shared-adv "
                          "(construction in the joint ratio). Requires --control-construction on. Use "
                          "--replay-window 1 (the per-city term is on-policy). Try ~0.5.")
+    ap.add_argument("--bc-pretrain-dir", type=str, default=None,
+                    help="v7.4: directory of HEURISTIC-gen shards (control-construction OFF, schema 8 with "
+                         "construction_current). Before RL round 0, supervised behavior-clone the construction "
+                         "head to the heuristic's per-city picks, so it starts ~heuristic instead of collapsing "
+                         "below random. Requires --continual --control-construction on. Raise --entropy-coef to "
+                         "leash the finetune against re-collapse.")
+    ap.add_argument("--bc-epochs", type=int, default=8, help="v7.4: behavior-cloning epochs.")
     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
     args = ap.parse_args(argv)
     if args.variant == "rich-v2":   # alias for the v4 structured encoder
@@ -306,6 +313,34 @@ def main(argv=None) -> int:
             csv.writer(f).writerow(CURVE_COLS)
 
     warm_net = warm_opt = None       # v5: the persistent continual (net, optimizer) pair
+    # v7.4 BEHAVIOR-CLONING WARM-START: before RL, supervised-pretrain the construction head to mimic the
+    # heuristic's picks (recorded in the --bc-pretrain-dir shards, gen'd with construction OFF). Gives the
+    # head a non-collapsed ~heuristic start so RL has a positive-advantage foothold instead of collapsing
+    # below random. Only on a fresh run (start_round==0), structured variant. The BC net becomes round 0's
+    # warm net; RL then finetunes it (raise --entropy-coef to leash against re-collapse).
+    bc_dir = getattr(args, "bc_pretrain_dir", None)
+    if bc_dir and start_round == 0 and args.variant == "structured":
+        import torch
+        from .model import RUNGS, StructuredPolicyValueNet
+        bc_dir = Path(bc_dir)
+        bc_schema = bc_dir / "schema.json"
+        bc_dims = contract.dims_from_schema(bc_schema)
+        bc_ts = contract.token_specs_from_schema(bc_schema)
+        bc_vc = contract.vocab_counts_from_schema(bc_schema)
+        bc_ver = contract.schema_version_from_schema(bc_schema)
+        bc_fp = contract.fingerprint_from_schema(bc_schema)
+        bc_ch = contract.spatial_channels_from_schema(bc_schema)
+        bc_shards = glob.glob(str(bc_dir / "*.bin"))
+        bc_trajs = ds.load_trajectories(bc_shards, expected_version=bc_ver, expected_fingerprint=bc_fp,
+                                        rich=True, expected_spatial_channels=bc_ch)
+        torch.manual_seed(0)
+        bc_net = StructuredPolicyValueNet(bc_dims, bc_ts, bc_vc, **RUNGS[args.rung])
+        bc_net, bc_stats = tr.bc_pretrain_construction(
+            bc_net, bc_trajs, bc_dims, bc_ts, epochs=getattr(args, "bc_epochs", 8), lr=args.lr,
+            micro_batch_steps=(args.micro_batch_steps or 512))
+        print(f"[bc] pretrained construction head on {len(bc_trajs)} heuristic trajectories "
+              f"({bc_stats['n']} steps): bc_loss={bc_stats['bc_loss']:.4f} bc_acc={bc_stats['bc_acc']:.3f}")
+        warm_net = bc_net                # round 0 RL starts from the BC-warm net
     # v6: recent-round replay window. The deque's maxlen gives the sliding window for free (appending the
     # (K+1)-th round evicts the oldest). K=1 ⇒ maxlen 1 ⇒ degenerates to the single-round batch (== v5).
     from collections import deque

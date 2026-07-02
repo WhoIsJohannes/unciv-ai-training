@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 # Mirror of com.unciv.logic.simulation.dataplane.SampleSchema.VERSION — keep in lockstep.
+# v8 (v7.4 BC warm-start): adds a per-step VARIABLE f32 scalar `construction_current` (perItem=1, aligned
+# to own_cities/construction) = each own city's currently-building construction as a 0-indexed mask idx
+# (−1 idle/perpetual). Gen'd with construction OFF ⇒ the HEURISTIC's picks = the supervised behavior-cloning
+# target. v7 lacks it ⇒ regen.
 # v7 (v7.3 per-city credit): adds a per-step VARIABLE f32 scalar `econ_city` (perItem=1, aligned to
 # own_cities/construction) = each city's raw log-economy. The trainer builds a per-city value baseline +
 # per-city GAE advantage so each city's construction is credited by its OWN economy return. v6 lacks it ⇒ regen.
@@ -28,7 +32,7 @@ from typing import Any
 # recorded at sampling time). A v3 shard lacks the block ⇒ not layout-compatible ⇒ reader refuses.
 # v3 (v4 structured encoder): adds the per-tile spatial_coords (f32 x,y) block, map dims in global,
 # per-entity tile-index, and the construction-namespace fix. v2/v1 shards are not layout-compatible.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class SchemaError(Exception):

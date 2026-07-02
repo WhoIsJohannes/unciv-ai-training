@@ -35,6 +35,7 @@ def _build_shard_v7(*, version, n_steps=3, n_cities=3, constr_w=5) -> bytes:
         {"name": "construction_action", "dtype": "<f4", "kind": "var", "perItem": 1, "len": 0},
         {"name": "construction_logp", "dtype": "<f4", "kind": "var", "perItem": 1, "len": 0},
         {"name": "econ_city", "dtype": "<f4", "kind": "var", "perItem": 1, "len": 0},  # v7.3 per-city log-economy
+        {"name": "construction_current", "dtype": "<f4", "kind": "var", "perItem": 1, "len": 0},  # v7.4 BC target
         {"name": "phi", "dtype": "<f4", "kind": "fixed", "perItem": 0, "len": 1},  # v7.2 economy potential
     ]
     header = {
@@ -65,9 +66,9 @@ def _build_shard_v7(*, version, n_steps=3, n_cities=3, constr_w=5) -> bytes:
     return bytes(out)
 
 
-def test_schema_version_is_7():
-    """Lockstep bump landed on the Python side (mirrors Kotlin SampleSchema.VERSION). v7 = v7.3 econ_city."""
-    assert SCHEMA_VERSION == 7, f"v7.3 requires SCHEMA_VERSION 7 (got {SCHEMA_VERSION})"
+def test_schema_version_is_8():
+    """Lockstep bump landed on the Python side (mirrors Kotlin SampleSchema.VERSION). v8 = v7.4 BC target."""
+    assert SCHEMA_VERSION == 8, f"v7.4 requires SCHEMA_VERSION 8 (got {SCHEMA_VERSION})"
 
 
 def test_construction_blocks_round_trip(tmp_path):
@@ -81,6 +82,7 @@ def test_construction_blocks_round_trip(tmp_path):
     assert s0.blocks["construction_action"].shape == (n_cities, 1)
     assert s0.blocks["construction_logp"].shape == (n_cities, 1)
     assert s0.blocks["econ_city"].shape == (n_cities, 1)          # v7.3 per-city economy
+    assert s0.blocks["construction_current"].shape == (n_cities, 1)  # v7.4 BC target
     assert s0.blocks["mask_construction"].shape == (n_cities, constr_w)
 
 
@@ -140,6 +142,8 @@ def _traj_with_construction(dims, n_steps=4, *, n_cities=2, acted=False):
             "mask_construction": mask, "construction_action": a, "construction_logp": lp,
             # v7.3 per-city raw log-economy (distinct per city so the per-city advantage is non-degenerate).
             "econ_city": np.array([2.0 + 0.5 * j + 0.1 * i for j in range(n_cities)], np.float32),
+            # v7.4 BC target: a legal per-city construction (idx in [0,4) legal per the mask) to clone.
+            "construction_current": np.array([1 + (j % 3) for j in range(n_cities)], np.float32),
         })
     rewards = np.zeros(n_steps, np.float32); rewards[-1] = 1.0
     return TrainTrajectory(np.zeros((n_steps, dims.input_w), np.float32),
@@ -317,6 +321,31 @@ def test_per_city_credit_trains_city_value_head():
         net=_copy.deepcopy(net0), construction=True, construction_credit_coef=0.5)
     cv1 = torch.cat([p.detach().reshape(-1) for p in percity.city_value_head.parameters()])
     assert (cv0 - cv1).abs().max().item() > 1e-6, "city value head received no gradient under per-city credit"
+
+
+def test_bc_pretrain_learns_heuristic_picks():
+    """v7.4: behavior-cloning the construction head raises its accuracy at predicting the recorded target
+    (construction_current) from ~random toward the target — the non-collapsed ~heuristic start for RL."""
+    from unciv_train.train import bc_pretrain_construction
+    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    tj = _traj_with_construction(dims, n_steps=6, n_cities=2, acted=True)   # carries construction_current
+    torch.manual_seed(4); net = StructuredPolicyValueNet(dims, _TS, _VC, **RUNGS["small"])
+    _, s0 = bc_pretrain_construction(net, [tj], dims, _TS, epochs=0, lr=1e-2)   # measure init acc (0 epochs)
+    net2, s1 = bc_pretrain_construction(net, [tj], dims, _TS, epochs=40, lr=1e-2, micro_batch_steps=0)
+    assert s1["n"] > 0, "no BC targets found"
+    assert s1["bc_acc"] > 0.9, f"BC did not learn the heuristic picks (acc={s1['bc_acc']:.2f})"
+
+
+def test_bc_pretrain_leaves_civ_heads_untouched():
+    """BC's construction-only loss must NOT move the tech/policy/value heads (they're not in the loss path)."""
+    from unciv_train.train import bc_pretrain_construction
+    dims = Dims(global_w=8, acting_w=6, tech_w=5, policy_w=4)
+    tj = _traj_with_construction(dims, n_steps=6, n_cities=2, acted=True)
+    torch.manual_seed(4); net = StructuredPolicyValueNet(dims, _TS, _VC, **RUNGS["small"])
+    tech0 = torch.cat([p.detach().reshape(-1) for p in net.tech_head.parameters()])
+    bc_pretrain_construction(net, [tj], dims, _TS, epochs=20, lr=1e-2, micro_batch_steps=0)
+    tech1 = torch.cat([p.detach().reshape(-1) for p in net.tech_head.parameters()])
+    assert (tech0 - tech1).abs().max().item() < 1e-7, "BC leaked gradient into the tech head"
 
 
 def test_per_city_credit_trains_under_replay():
