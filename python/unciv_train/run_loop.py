@@ -123,7 +123,7 @@ def _replay_refill_rounds(start_round: int, replay_window: int) -> list[int]:
 
 
 def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, seed: int,
-                *, net=None, optimizer=None, replay_active: bool | None = None):
+                *, net=None, optimizer=None, replay_active: bool | None = None, bc_ref=None):
     """Dispatch to the right trainer by variant. Returns (net, stats, exporter_callable, optimizer).
     v5: `net`/`optimizer` are the warm continual pair (None ⇒ fresh round); the trainer returns the
     optimizer so run_loop can carry it forward. micro_batch_steps is threaded from args.
@@ -165,7 +165,8 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
             net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl, reward_shaping_coef=rsc,
             construction=(getattr(args, "control_construction", "off") == "on"),   # v7: train the per-city head only when ON
-            construction_credit_coef=ccc)   # v7.3: >0 ⇒ per-city credit (separate per-city construction PG term)
+            construction_credit_coef=ccc,   # v7.3: >0 ⇒ per-city credit (separate per-city construction PG term)
+            bc_ref=bc_ref, construction_kl_coef=getattr(args, "construction_kl_coef", 0.0))  # v7.4 KL-to-clone leash
         return net, stats, ("structured", token_specs), optimizer
     raise ValueError(f"unknown variant {variant!r}")
 
@@ -285,6 +286,10 @@ def main(argv=None) -> int:
                          "below random. Requires --continual --control-construction on. Raise --entropy-coef to "
                          "leash the finetune against re-collapse.")
     ap.add_argument("--bc-epochs", type=int, default=8, help="v7.4: behavior-cloning epochs.")
+    ap.add_argument("--construction-kl-coef", type=float, default=0.0,
+                    help="v7.4: KL-to-clone leash weight. When >0 (with --bc-pretrain-dir), penalize "
+                         "KL(current construction || frozen BC clone) each RL epoch, anchoring the head "
+                         "near the clone so finetune can't drift it back into the collapse basin. Try ~0.5.")
     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
     args = ap.parse_args(argv)
     if args.variant == "rich-v2":   # alias for the v4 structured encoder
@@ -313,6 +318,7 @@ def main(argv=None) -> int:
             csv.writer(f).writerow(CURVE_COLS)
 
     warm_net = warm_opt = None       # v5: the persistent continual (net, optimizer) pair
+    bc_ref = None                    # v7.4: frozen BC-clone KL-leash reference (set in the BC block)
     # v7.4 BEHAVIOR-CLONING WARM-START: before RL, supervised-pretrain the construction head to mimic the
     # heuristic's picks (recorded in the --bc-pretrain-dir shards, gen'd with construction OFF). Gives the
     # head a non-collapsed ~heuristic start so RL has a positive-advantage foothold instead of collapsing
@@ -341,6 +347,13 @@ def main(argv=None) -> int:
         print(f"[bc] pretrained construction head on {len(bc_trajs)} heuristic trajectories "
               f"({bc_stats['n']} steps): bc_loss={bc_stats['bc_loss']:.4f} bc_acc={bc_stats['bc_acc']:.3f}")
         warm_net = bc_net                # round 0 RL starts from the BC-warm net
+        # v7.4 KL leash: freeze a copy of the clone as the KL reference (anti-drift during RL finetune).
+        if getattr(args, "construction_kl_coef", 0.0) > 0:
+            import copy
+            bc_ref = copy.deepcopy(bc_net).eval()
+            for p in bc_ref.parameters():
+                p.requires_grad_(False)
+            print(f"[bc] KL-to-clone leash active (coef={args.construction_kl_coef})")
     # v6: recent-round replay window. The deque's maxlen gives the sliding window for free (appending the
     # (K+1)-th round evicts the oldest). K=1 ⇒ maxlen 1 ⇒ degenerates to the single-round batch (== v5).
     from collections import deque
@@ -408,7 +421,7 @@ def main(argv=None) -> int:
             args.variant, train_data, dims, schema, args, seed=r,
             net=(warm_net if args.continual else None),
             optimizer=(warm_opt if args.continual else None),
-            replay_active=replay_active)
+            replay_active=replay_active, bc_ref=bc_ref)
         if args.continual:
             warm_net, warm_opt = net, opt                   # carry the persistent pair to next round
 

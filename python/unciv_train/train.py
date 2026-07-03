@@ -222,6 +222,8 @@ def _optimize_actor_critic(
     construction_credit_coef: float = 0.0,        # v7.3: weight of the per-city economy advantage (0 ⇒ shared-adv only)
     old_logp_construction_pc: torch.Tensor | None = None,  # v7.3: per-city construction behavior logp [n, M] for the
                                                   # per-city PPO importance ratio (valid under replay). None ⇒ A2C (no ratio).
+    ref_construction_logp: torch.Tensor | None = None,  # v7.4: frozen BC-clone construction log-probs [n, M, W] (masked)
+    construction_kl_coef: float = 0.0,            # v7.4: KL-to-clone leash weight; >0 anchors construction near the clone
 ) -> tuple[object, dict]:
     import copy
     opt = optimizer                  # v5: persistent optimizer (built once in the trainer, carried by run_loop)
@@ -233,6 +235,7 @@ def _optimize_actor_critic(
     # econ_city is None (OFF arm, or the legacy v7.2 shared-adv mode) construction stays in the joint logp.
     use_percity_credit = use_construction and econ_city is not None
     constr_in_joint = use_construction and not use_percity_credit
+    use_kl_leash = use_construction and ref_construction_logp is not None and construction_kl_coef > 0
 
     def _unpack(out):
         """forward_fn / forward_chunk_fn return (tl, pl, val) normally; (tl, pl, cl, cval, val) when the
@@ -295,6 +298,19 @@ def _optimize_actor_critic(
         se = (cval - R_city[lo:hi]).pow(2) * pres           # mask padded/absent cities
         vloss = se.sum() / pres.sum().clamp(min=1.0)
         return pg, vloss, ent
+
+    def _construction_kl_loss(cl, lo, hi):
+        """v7.4 KL-to-clone leash: KL(current construction || frozen BC clone) averaged over deciding cities,
+        then over steps. Anchors the head near the clone so RL can't drift it back into the collapse basin
+        (the residual variance). Works in BOTH the joint (coef 0) and per-city credit modes."""
+        mc = m_construction[lo:hi]
+        neg = torch.where(mc > 0, cl, torch.full_like(cl, -1e9))
+        cur = F.log_softmax(neg, dim=2)                     # [chunk, M, W]
+        ref = ref_construction_logp[lo:hi]                  # [chunk, M, W] frozen clone log-probs (masked)
+        kl = (cur.exp() * (cur - ref)).sum(dim=2)           # [chunk, M] KL(cur||ref) per city
+        has_legal = (mc.sum(dim=2) > 0).float()             # only cities with legal constructions (deciders)
+        denom = has_legal.sum(dim=1).clamp(min=1.0)
+        return ((kl * has_legal).sum(dim=1) / denom).mean()
     use_micro = (micro_batch_steps is not None and micro_batch_steps > 0
                  and forward_chunk_fn is not None and micro_batch_steps < n)  # <=0 ⇒ whole-batch no-op
     # v6 GUARD: with stored behavior logp (off-policy replay), clip_eps MUST be truthy — the
@@ -424,6 +440,8 @@ def _optimize_actor_critic(
                     loss_step = loss_step + c_pg + value_coef * c_vloss - entropy_coef * c_ent
                     cpg_sum += float(c_pg.detach()) * w
                     cvl_sum += float(c_vloss.detach()) * w
+                if use_kl_leash and cl is not None:          # v7.4 KL-to-clone leash (anti-drift)
+                    loss_step = loss_step + construction_kl_coef * _construction_kl_loss(cl, lo, hi)
                 loss_c = loss_step * w
                 loss_c.backward()                           # accumulate grad; free the chunk graph
                 loss_total += float(loss_c.detach())
@@ -469,6 +487,10 @@ def _optimize_actor_critic(
                 loss = loss + c_pg + value_coef * c_vloss - entropy_coef * c_ent
                 stats["construction_pg"] = float(c_pg.detach())
                 stats["construction_value_loss"] = float(c_vloss.detach())
+            if use_kl_leash and cl is not None:                 # v7.4 KL-to-clone leash (anti-drift)
+                kl_term = _construction_kl_loss(cl, None, None)
+                loss = loss + construction_kl_coef * kl_term
+                stats["construction_kl"] = float(kl_term.detach())
 
             if not torch.isfinite(loss):                        # divergence guard (R8 + council 🔴)
                 net.load_state_dict(safe_state)                 # restore last finite weights — never export NaN
@@ -776,6 +798,8 @@ def train_actor_critic_structured(
     reward_shaping_coef: float = 0.0,  # v7.2: PBRS coefficient (F = coef·(γ·Φ'−Φ)); 0 ⇒ terminal-only
     construction: bool = True,       # v7: train the per-city construction head; False ⇒ pure v6 path (no-op oracle)
     construction_credit_coef: float = 0.0,  # v7.3: per-city economy-advantage weight; >0 ⇒ per-city credit path
+    bc_ref=None,                     # v7.4: frozen BC-clone net (KL-leash reference); None ⇒ no leash
+    construction_kl_coef: float = 0.0,  # v7.4: KL-to-clone leash weight
 ) -> tuple[object, dict, object]:
     """v4 STRUCTURED variant: same encoder-AGNOSTIC core (_optimize_actor_critic) + same rich
     batch/stacking as train_actor_critic_rich — ONLY the nn.Module is swapped for
@@ -823,6 +847,23 @@ def train_actor_critic_structured(
     def forward_chunk_fn(lo, hi):    # slice every [B,...] tensor on axis 0 (per-row independent forward)
         return net({k: v[lo:hi] for k, v in inputs.items()}, with_construction=construction)
 
+    # v7.4 KL-to-clone leash: forward the FROZEN BC clone ONCE (no_grad, chunked) → reference construction
+    # log-probs [n,M,W] (masked). The trainer penalizes KL(current || ref) each epoch so RL can't drift the
+    # head back into the collapse basin. Chunk to bound memory; concat is math-identical.
+    ref_construction_logp = None
+    if construction and bc_ref is not None and construction_kl_coef > 0 and m_construction is not None:
+        bc_ref.eval()
+        with torch.no_grad():
+            n_all = a_tech.shape[0]
+            step = micro_batch_steps if (micro_batch_steps and 0 < micro_batch_steps < n_all) else n_all
+            parts = []
+            for lo in range(0, n_all, step):
+                hi = min(lo + step, n_all)
+                rcl = bc_ref({k: v[lo:hi] for k, v in inputs.items()}, with_construction=True)[2]  # [chunk,M,W]
+                mc = m_construction[lo:hi]
+                parts.append(F.log_softmax(torch.where(mc > 0, rcl, torch.full_like(rcl, -1e9)), dim=2))
+            ref_construction_logp = torch.cat(parts).detach()
+
     net, stats = _optimize_actor_critic(
         net, forward_fn, optimizer=optimizer, forward_chunk_fn=forward_chunk_fn,
         micro_batch_steps=micro_batch_steps,
@@ -835,5 +876,7 @@ def train_actor_critic_structured(
         econ_city=econ_city_t, city_present=city_present_t,
         construction_credit_coef=construction_credit_coef,
         old_logp_construction_pc=old_logp_construction_pc,
+        ref_construction_logp=ref_construction_logp,
+        construction_kl_coef=construction_kl_coef,
     )
     return net, stats, optimizer
