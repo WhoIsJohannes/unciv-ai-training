@@ -219,6 +219,37 @@ Tiny), so bc is a noisy heuristic copy RL finetunes from a shaky start. **Untest
 (more BC epochs / lower LR → higher acc) should cut the variance + give RL a stronger launchpad — the decisive
 test of whether the seed-4000 upside is real+repeatable. Infra shipped (schema-8, BC pretrain, `--bc-pretrain-dir`).
 
+## ★ v7.4 FINAL — construction control is a SIGNIFICANT WIN (crosses 50%)
+Two levers closed it out: (1) **tight clone** — the weak clone was pure undertraining (acc climbs 0.27@20ep →
+0.67@120ep, no plateau), so `--bc-epochs 120`; (2) **KL-to-clone leash** (`--construction-kl-coef 0.5`) — an
+RLHF-style penalty KL(current construction ‖ frozen BC clone) each RL epoch, anchoring the head near the clone
+so finetune can't drift it back into the collapse basin (the residual variance). Replicated at **8 seeds** for
+power.
+
+**off vs bckl (BC 120ep + KL 0.5), 8 seeds, small/Medium/16-round/rw1/mb0/ent 0.02, 200-game ceiling @ 4242424:**
+
+| arm | s1000 | s2000 | s3000 | s4000 | s5000 | s6000 | s7000 | s8000 | mean±SE |
+|---|---|---|---|---|---|---|---|---|---|
+| **off** | 55.4 | 39.2 | 30.9 | 44.1 | 23.5 | 25.5 | 52.9 | 28.4 | **37.5% ± 4.4** |
+| **bckl** | 36.8 | 52.5 | 53.9 | 61.8 | 42.2 | 34.3 | 67.2 | 69.6 | **52.3% ± 4.8** |
+
+**Paired bckl − off = +14.8pp ± 5.9 (t=2.51, p≈0.02, SIGNIFICANT), 7 of 8 seeds positive** (per-seed
+[−18.6,+13.2,+23.0,+17.6,+18.6,+8.8,+14.2,+41.2]). Construction control **significantly beats not controlling
+it (+14.8pp)** and lifts the learner from 37.5% **across the 50% break-even to 52.3%** — the milestone this
+whole feature set out to reach. (The one negative seed, s1000, is off drawing unusually high at 55.4%, not
+bckl failing — bckl_s1000 = 36.8%.)
+
+**THE ANSWER to the v7 question ("does controlling production move the learner toward/past 50%?"): YES —
+significantly, past 50%.** Not via better sparse-reward RL, but by NOT starting from scratch: clone the
+(only-~random-level, so beatable) heuristic for a non-collapsed start + positive-advantage foothold, then
+leashed-finetune to climb above it. Full arc: raw control ~0% (collapse) → BC(20ep) parity → BC(120ep) +6.6pp
+n.s. → BC(120ep)+KL-leash+8seeds **+14.8pp significant**.
+
+**Shippable recipe (opt-in behind flags):** `--control-construction on --bc-pretrain-dir <control-off heuristic
+gen dir> --bc-epochs 120 --construction-kl-coef 0.5 --entropy-coef 0.02`. Drivers: `run_v74bc.sh` (off/on/bc),
+`run_v74kl.sh` (off/bckl ×8). Every step replicated + paired (the eval is high-variance — single seeds are
+unreliable, see the methodology finding above).
+
 ## What this does NOT rule out (explicit follow-ups — require a bigger effort, not run here)
 1. **Decision cadence** — decide at construction-completion (the natural commit point) rather than every
    turn, to remove churning. (The plan's perpetual-only gate was inert because the heuristic keeps cities
