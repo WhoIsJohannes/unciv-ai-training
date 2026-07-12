@@ -6,15 +6,15 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
+        <meta name="description" content="How to push the Unciv AI-training work to the fork: remote `fork` = WhoIsJohannes/unciv-ai-training, but the active gh account is J-Mentiora (pull-only) so plain `git push` 403s — push with the WhoIsJohannes token via an inline credential helper.">
       
       
-        <link rel="canonical" href="https://yairm210.github.io/Unciv/Modders/Type-checking/">
+      
+        <link rel="canonical" href="https://yairm210.github.io/Unciv/ai-training-memory/unciv-fork-push-credential/">
       
       
-        <link rel="prev" href="../uniques/">
+        <link rel="prev" href="../selfplay-v7-construction-negative/">
       
-      
-        <link rel="next" href="../Scenarios/">
       
       
         
@@ -25,7 +25,7 @@
     
     
       
-        <title>Type Checking - Unciv</title>
+        <title>Unciv fork push credential - Unciv</title>
       
     
     
@@ -75,11 +75,6 @@
     <label class="md-overlay" for="__drawer"></label>
     <div data-md-component="skip">
       
-        
-        <a href="#type-checking" class="md-skip">
-          Skip to content
-        </a>
-      
     </div>
     <div data-md-component="announce">
       
@@ -111,7 +106,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Type Checking
+              Unciv fork push credential
             
           </span>
         </div>
@@ -445,20 +440,18 @@
       
   
   
-    
   
   
-  
     
     
     
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
         
           
           <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
@@ -479,7 +472,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_4">
             <span class="md-nav__icon md-icon"></span>
             
@@ -497,7 +490,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Mods/" class="md-nav__link">
+      <a href="../../Modders/Mods/" class="md-nav__link">
         
   
   
@@ -525,7 +518,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Making-a-new-Civilization/" class="md-nav__link">
+      <a href="../../Modders/Making-a-new-Civilization/" class="md-nav__link">
         
   
   
@@ -553,7 +546,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Images-and-Audio/" class="md-nav__link">
+      <a href="../../Modders/Images-and-Audio/" class="md-nav__link">
         
   
   
@@ -628,7 +621,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Mod-file-structure/1-Overview/" class="md-nav__link">
+      <a href="../../Modders/Mod-file-structure/1-Overview/" class="md-nav__link">
         
   
   
@@ -656,7 +649,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Mod-file-structure/2-Civilization-related-JSON-files/" class="md-nav__link">
+      <a href="../../Modders/Mod-file-structure/2-Civilization-related-JSON-files/" class="md-nav__link">
         
   
   
@@ -684,7 +677,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Mod-file-structure/3-Map-related-JSON-files/" class="md-nav__link">
+      <a href="../../Modders/Mod-file-structure/3-Map-related-JSON-files/" class="md-nav__link">
         
   
   
@@ -712,7 +705,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Mod-file-structure/4-Unit-related-JSON-files/" class="md-nav__link">
+      <a href="../../Modders/Mod-file-structure/4-Unit-related-JSON-files/" class="md-nav__link">
         
   
   
@@ -740,7 +733,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Mod-file-structure/5-Miscellaneous-JSON-files/" class="md-nav__link">
+      <a href="../../Modders/Mod-file-structure/5-Miscellaneous-JSON-files/" class="md-nav__link">
         
   
   
@@ -823,7 +816,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Creating-a-custom-tileset/" class="md-nav__link">
+      <a href="../../Modders/Creating-a-custom-tileset/" class="md-nav__link">
         
   
   
@@ -851,7 +844,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Creating-a-UI-skin/" class="md-nav__link">
+      <a href="../../Modders/Creating-a-UI-skin/" class="md-nav__link">
         
   
   
@@ -887,7 +880,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Unique-parameters/" class="md-nav__link">
+      <a href="../../Modders/Unique-parameters/" class="md-nav__link">
         
   
   
@@ -915,7 +908,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../uniques/" class="md-nav__link">
+      <a href="../../Modders/uniques/" class="md-nav__link">
         
   
   
@@ -940,37 +933,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Type Checking
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../../Modders/Type-checking/" class="md-nav__link">
         
   
   
@@ -986,87 +952,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#android-studio" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Android Studio
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#vscode-or-similar" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        VSCode or Similar
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="VSCode or Similar">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#extension" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Extension
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#manually" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Manually
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#online-tool" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Online Tool
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -1079,7 +964,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Scenarios/" class="md-nav__link">
+      <a href="../../Modders/Scenarios/" class="md-nav__link">
         
   
   
@@ -1107,7 +992,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../Autoupdates/" class="md-nav__link">
+      <a href="../../Modders/Autoupdates/" class="md-nav__link">
         
   
   
@@ -1832,18 +1717,20 @@
       
   
   
+    
   
   
+  
     
     
     
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_10" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_10" checked>
         
           
           <label class="md-nav__link" for="__nav_10" id="__nav_10_label" tabindex="0">
@@ -1864,7 +1751,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_10_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_10_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_10">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1882,7 +1769,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../ai-training-memory/MEMORY/" class="md-nav__link">
+      <a href="../MEMORY/" class="md-nav__link">
         
   
   
@@ -1910,7 +1797,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../ai-training-memory/selfplay-baseline-variance/" class="md-nav__link">
+      <a href="../selfplay-baseline-variance/" class="md-nav__link">
         
   
   
@@ -1938,7 +1825,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../ai-training-memory/selfplay-roadmap-bottleneck/" class="md-nav__link">
+      <a href="../selfplay-roadmap-bottleneck/" class="md-nav__link">
         
   
   
@@ -1966,7 +1853,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../ai-training-memory/selfplay-v7-construction-negative/" class="md-nav__link">
+      <a href="../selfplay-v7-construction-negative/" class="md-nav__link">
         
   
   
@@ -1991,10 +1878,17 @@
                 
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../../ai-training-memory/unciv-fork-push-credential/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
@@ -2010,6 +1904,7 @@
   
 
       </a>
+      
     </li>
   
 
@@ -2039,77 +1934,6 @@
   
   
   
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#android-studio" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Android Studio
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#vscode-or-similar" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        VSCode or Similar
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="VSCode or Similar">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#extension" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Extension
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#manually" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Manually
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#online-tool" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Online Tool
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
   
 </nav>
                   </div>
@@ -2129,160 +1953,26 @@
   
 
 
-<h1 id="type-checking">Type Checking</h1>
-<p>Mistakes happen. Misnamed fields, things we forgot to add, or even stuff we didn't know existed. Computers can handle a lot of that themselves, so we can let them do the work to ensure that our json files are correct, by using <em>JSON Schemas</em>.</p>
-<p>The JSON Schema files also enable autocomplete, warnings, and some intellisense directly within your editor.</p>
-<h2 id="android-studio">Android Studio</h2>
-<ol>
-<li>Double-click space, search "json schema mappings", enter</li>
-<li>Click the small '+' (top, under 'language &amp; frameworks' text)</li>
-<li>Put the URL as <code>https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Buildings.schema.json</code></li>
-<li>Click the '+' under the 'Schema version' text, add 'File pattern', put pattern as <code>*/Buildings.json</code></li>
-</ol>
-<p>Android Studio will now recognize all Buildings.json files as belonging to that schema, and will warn you of inconsistencies.</p>
-<h2 id="vscode-or-similar">VSCode or Similar</h2>
-<p>There are two ways to enable the JSON schemas in VSCode: By either installing the <a href="https://github.com/robloach/vscode-unciv">VSCode Unciv Extension</a>, or adding them manually. It's easier to use the extension.</p>
-<h3 id="extension">Extension</h3>
-<p>The <a href="https://github.com/robloach/vscode-unciv">VSCode Unciv Extension</a> enables the JSON Schemas, sets the correct file associations, along with a few other features.</p>
-<ol>
-<li>Open VSCode</li>
-<li>Press <em>CTRL+P</em> to open the command palette</li>
-<li>Write the following, and press enter:
-    <div class="highlight"><pre><span></span><code>ext install robloach.unciv
-</code></pre></div></li>
-<li>Congratulations, you now have the Unciv JSON Schema files installed, with autocomplete, intellisense, and file checking.</li>
-</ol>
-<h3 id="manually">Manually</h3>
-<p>If you'd rather not use the VSCode extension, it is possible enable the schemas manually...</p>
-<ol>
-<li>Press <em>CTRL+SHIFT+P</em> to open up the command palette</li>
-<li>Search "Open User Settings (JSON)", enter</li>
-<li>Copy the following into your settings:
-<div class="highlight"><pre><span></span><code><span class="nt">&quot;json.schemas&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Beliefs.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Beliefs.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Buildings.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Buildings.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/CityStateTypes.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/CityStateTypes.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Difficulties.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Difficulties.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Eras.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Eras.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Units.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Units.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Nations.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Nations.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Personalities.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Personalities.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Policies.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Policies.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Quests.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Quests.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Religions.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Religions.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Ruins.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Ruins.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Specialists.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Specialists.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Speeds.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Speeds.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/TileImprovements.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/TileImprovements.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/TileSets/*.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/TileSetConfig.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Techs.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Techs.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/UnitTypes.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/UnitTypes.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/UnitPromotions.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/UnitPromotions.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/TileResources.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/TileResources.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Events.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Events.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/GlobalUniques.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/GlobalUniques.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/ModOptions.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/ModOptions.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Terrains.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Terrains.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/Tutorials.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Tutorials.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/UnitNameGroups.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/UnitNameGroups.schema.json&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;fileMatch&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;jsons/VictoryTypes.json&quot;</span><span class="p">],</span>
-<span class="w">        </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/VictoryTypes.schema.json&quot;</span>
-<span class="w">    </span><span class="p">}</span>
-<span class="p">]</span>
-</code></pre></div></li>
-</ol>
-<h2 id="online-tool">Online Tool</h2>
-<p>If you don't use any of these editors, you can check your file online using <a href="https://www.jsonschemavalidator.net/">this tool</a>. However, it can't handle the missing commas that VSCode and Android Studio handle, so you may need to get your json up to spec to use it.</p>
-<p>The schema you want to validate against is:
-<div class="highlight"><pre><span></span><code><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;$ref&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://raw.githubusercontent.com/yairm210/Unciv/master/docs/Modders/schemas/Buildings.schema.json&quot;</span>
-<span class="p">}</span>
-</code></pre></div></p>
+  <h1>Unciv fork push credential</h1>
+
+<p>The self-play AI work lives on <code>master</code> at <code>/Users/j/Unciv</code> (worktrees were collapsed to a single master on 2026-06-25; the data-plane + ONNX-loop branches were merged in and deleted). Remotes: <code>fork</code> = https://github.com/WhoIsJohannes/unciv-ai-training (the AI-training repo — "everything on main" means this fork's <code>master</code>); <code>origin</code> = upstream https://github.com/yairm210/Unciv (we never push there; a chronic "behind 1 vs origin/master" is just upstream moving).</p>
+<p><strong>Gotcha:</strong> the machine's active gh account is <strong>J-Mentiora</strong>, which has only <strong>pull</strong> access to <code>WhoIsJohannes/unciv-ai-training</code>, so a plain <code>git push fork master</code> (and IDE auto-push) fails <code>403 denied to J-Mentiora</code>. Both accounts are logged into gh (<code>gh auth status</code> shows J-Mentiora active + WhoIsJohannes available).</p>
+<p><strong>How to apply</strong> — push as WhoIsJohannes WITHOUT switching the global gh active account (keeps the other agent's env untouched), token never in argv:
+<div class="highlight"><pre><span></span><code>cd /Users/j/Unciv
+export WIJ_TOKEN=$(gh auth token --user WhoIsJohannes)
+git -c credential.helper= -c credential.helper=&#39;!f(){ echo username=WhoIsJohannes; echo &quot;password=$WIJ_TOKEN&quot;; }; f&#39; push fork master
+unset WIJ_TOKEN
+</code></pre></div>
+The leading empty <code>credential.helper=</code> resets the chain so the osxkeychain/J-Mentiora helper isn't consulted. Pushes to the fork have all been clean fast-forwards. Confirm with <code>git ls-remote --heads fork master</code>. Reads (<code>gh api repos/WhoIsJohannes/...</code>) work fine as J-Mentiora. See [[selfplay-roadmap-bottleneck]].</p>
 
 
 
 
 
 
+
+  
+  
 
 
 
