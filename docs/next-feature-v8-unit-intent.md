@@ -13,7 +13,7 @@ tuning) are load-bearing, and acceptance #4 treats a negative-then-recovered arc
 If you want the maximally-grounded version, ask Claude to "use a workflow" to deep-scan it first.
 
 ```
-/feature Unit control via a per-unit INTENT head (v8). Unciv self-play RL. Repo /Users/j/Unciv, branch master (construction win is now merged in: per-entity heads + BC-clone + KL-leash all present).
+/feature Unit control via a per-unit INTENT head (v8). Unciv self-play RL. Repo /home/johannes/projects/unciv-ai-training, branch master (construction win is now merged in: per-entity heads + BC-clone + KL-leash all present).
 
 == CONTEXT / GOAL ==
 The learned policy controls tech + policy + construction and beats random (v7: construction-control 52.3% vs 37.5% off, +14.8pp, n=8, crosses 50%). The last big high-leverage frontier is UNITS — combat/expansion, the core of Civ, currently 100% heuristic for both learner and opponent. v8 gives the net a per-unit INTENT head: for each of a controlled civ's units, choose WHICH existing automation behavior to run — NOT raw tile movement. The chosen behavior's sub-routine executes (pathfinding stays heuristic → throughput preserved). This is another per-entity categorical head (per UNIT, like construction is per CITY) and MUST use the v7 recipe (BC-clone the heuristic + KL-leash), because a bigger action space mode-collapses from scratch even worse than construction did.
