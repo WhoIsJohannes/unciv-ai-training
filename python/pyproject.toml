@@ -9,7 +9,10 @@ description = "Self-play data plane reader (unciv_dataplane) + REINFORCE trainin
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.24",
-    "torch>=2.0",
+    # <2.9: newer torch drops the TorchScript ONNX exporter; export_onnx.py's
+    # opset-17 dynamic_axes export fails under the dynamo exporter (2.8.x is the
+    # verified-good version — v5 results reproduce on it).
+    "torch>=2.0,<2.9",
     "onnx>=1.15",
     "onnxruntime>=1.17",
     "matplotlib>=3.7",
