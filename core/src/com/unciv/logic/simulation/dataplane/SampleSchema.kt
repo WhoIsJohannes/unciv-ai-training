@@ -13,6 +13,19 @@ package com.unciv.logic.simulation.dataplane
  */
 object SampleSchema {
     /**
+     * VERSION 9 (was 8): v8 per-unit INTENT control head. Adds three per-step VARIABLE scalar blocks
+     * (perItem=1, one row per own unit in the `own_units` / `mask_unit_intent` order — the canonical
+     * [Featurizer.orderedOwnUnits] `sortedBy{it.id}`-capped order): [BLOCK_UNIT_INTENT_ACTION] the
+     * REALIZED executed intent idx (−1 = not a controlled land-military unit / no decision),
+     * [BLOCK_UNIT_INTENT_LOGP] its masked-softmax behavior log-prob (0f where no decision), and
+     * [BLOCK_UNIT_INTENT_CURRENT] the heuristic's first-firing ladder rung (the BC target; −1 if none).
+     * Also adds the per-unit legality mask [mask_unit_intent] (u8, perItem=[UnitIntent.COUNT]) to the
+     * observation. The `own_units` token ORDER changes to `sortedBy{it.id}` (was `currentTile` index) so a
+     * unit's row is stable as it moves — own_units feeds permutation-invariant aggregation, so the civ
+     * heads are unchanged. A v8 shard lacks the blocks ⇒ not layout-compatible ⇒ the Python reader
+     * refuses it ⇒ regenerate. The intent vocabulary also enters the ruleset fingerprint (Vocab
+     * `enum:UnitIntent`), so an intent-enum change perishes shards independently of VERSION.
+     *
      * VERSION 8 (was 7): v7.4 behavior-cloning warm-start. Adds a per-step VARIABLE scalar block
      * [BLOCK_CONSTRUCTION_CURRENT] (perItem=1, aligned to `own_cities`/`construction_*`): the 0-indexed
      * construction-mask idx each own city is CURRENTLY building (−1 if idle / on a PerpetualConstruction /
@@ -51,7 +64,7 @@ object SampleSchema {
      * is not layout-compatible. (VERSION 2 was: real terminal reward + applied civ-level action.)
      * The Python reader REFUSES a VERSION mismatch ⇒ regenerate; datasets are perishable by design.
      */
-    const val VERSION = 8
+    const val VERSION = 9
 
     /** 8 ASCII bytes at the head of every shard. */
     const val MAGIC = "UNCVSMP1"
@@ -96,11 +109,18 @@ object SampleSchema {
          *  [B, n_cities(dynamic), constrW] where constrW = vocab.buildingCount + vocab.unitCount.
          *  A model without this output ⇒ OnnxPolicy falls back to the heuristic (no construction control). */
         const val OUTPUT_CONSTRUCTION = "construction_logits"
-        /** The civ-level heads the net controls, in `actions`-block order. Construction is per-ENTITY
-         *  (one decision per own city), recorded in its own VARIABLE blocks — NOT a MASK_HEADS slot. */
+        /** v8 per-unit INTENT head: OPTIONAL extra output on the structured path, shaped
+         *  [B, n_units(dynamic), intentW] where intentW = [UnitIntent.COUNT]. A model without this output
+         *  ⇒ OnnxPolicy falls back to the heuristic (no unit-intent control), exactly like construction. */
+        const val OUTPUT_UNIT_INTENT = "unit_intent_logits"
+        /** The civ-level heads the net controls, in `actions`-block order. Construction + unit-intent are
+         *  per-ENTITY (one decision per own city / unit), recorded in their own VARIABLE blocks — NOT a
+         *  MASK_HEADS slot. */
         val MODELED_HEADS = listOf("tech", "policy")
         /** ONNX metadata: the construction head's per-city width (constrW), for the load-time dim cross-check. */
         const val META_CONSTRUCTION_WIDTH = "construction_width"
+        /** ONNX metadata: the unit-intent head's per-unit width (intentW = UnitIntent.COUNT), load-time cross-check. */
+        const val META_UNIT_INTENT_WIDTH = "unit_intent_width"
         // ONNX metadata_props keys (provenance gate — read on the JVM via session.getMetadata()).
         const val META_SCHEMA_VERSION = "schema_version"
         const val META_RULESET_FINGERPRINT = "ruleset_fingerprint"
@@ -197,6 +217,23 @@ object SampleSchema {
      * city's construction decision is credited by ITS OWN economy return (attribution fix). SHARD-ONLY.
      */
     const val BLOCK_ECON_CITY = "econ_city"
+
+    /**
+     * v8 (VERSION 9): the per-unit INTENT decision, recorded as three VARIABLE f32 blocks (perItem=1, one
+     * row per own unit in the `own_units` / [BLOCK_MASK_UNIT_INTENT] order). [BLOCK_UNIT_INTENT_ACTION] is
+     * the REALIZED executed intent idx (−1 = the unit is not a controlled land-military unit / no decision);
+     * [BLOCK_UNIT_INTENT_LOGP] is its masked-softmax behavior log-prob (0f where no decision);
+     * [BLOCK_UNIT_INTENT_CURRENT] is the heuristic ladder's first-firing rung for each land-military unit
+     * (−1 if none), the BC-clone target (meaningful when generated with unit-intent control OFF). SHARD-ONLY
+     * — the trainer sums log π_b(unit_intent) over deciding units into the per-step off-policy old_logp and
+     * clones the head to `unit_intent_current`. Because the realized intent (incl. heuristic fallback) is only
+     * known AFTER `automateUnits` runs, the whole per-civ-turn frame is emitted at turn-END when control is ON.
+     */
+    const val BLOCK_UNIT_INTENT_ACTION = "unit_intent_action"
+    const val BLOCK_UNIT_INTENT_LOGP = "unit_intent_logp"
+    const val BLOCK_UNIT_INTENT_CURRENT = "unit_intent_current"
+    /** v8 per-unit legality mask (u8, perItem=[UnitIntent.COUNT]), aligned to `own_units`. */
+    const val BLOCK_MASK_UNIT_INTENT = "mask_unit_intent"
 
     /** Factored legal-action mask heads (boolean per candidate). Unit-intent + per-city
      *  construction are emitted per-entity in the UNIT/CITY tokens, not as global heads. */

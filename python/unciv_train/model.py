@@ -461,6 +461,19 @@ class StructuredPolicyValueNet(nn.Module):
         nn.init.zeros_(self.city_value_head[-1].weight)
         nn.init.zeros_(self.city_value_head[-1].bias)
 
+        # v8 per-unit INTENT head: reads each own_units token's embedding (gnn_channels Phase-A / attn_dim
+        # Phase-B) ⊕ the broadcast trunk body → per-unit logits over the UnitIntent space. The width comes
+        # from the schema's vocabCounts.unitIntent (mirrors Kotlin UnitIntent.COUNT — a FIXED code vocabulary,
+        # 14 for GnK); synthetic fixtures without the key fall back to that constant. Per-unit, NOT pooled.
+        # SHARED-advantage only (no per-unit value head — the winning v7.4 recipe used credit-coef 0). Inert
+        # for OFF arms (no unit actions → 0 logp), exactly like the construction head.
+        self.intent_w = int(vocab_counts.get("unitIntent", 14))
+        own_unit_emb_w = gnn_channels if not self.use_attn else attn_dim
+        self.unit_intent_head = nn.Sequential(
+            nn.Linear(own_unit_emb_w + trunk_w, trunk_w), nn.ReLU(),
+            nn.Linear(trunk_w, self.intent_w),
+        )
+
     def _construction_logits(self, own_city_emb: torch.Tensor, body: torch.Tensor) -> torch.Tensor:
         """Per-city construction logits [B, M, constr_w] from each own_city embedding ⊕ broadcast trunk."""
         m = own_city_emb.shape[1]
@@ -472,6 +485,12 @@ class StructuredPolicyValueNet(nn.Module):
         m = own_city_emb.shape[1]
         body_b = body.unsqueeze(1).expand(-1, m, -1)
         return self.city_value_head(torch.cat([own_city_emb, body_b], dim=-1)).squeeze(-1)
+
+    def _unit_intent_logits(self, own_unit_emb: torch.Tensor, body: torch.Tensor) -> torch.Tensor:
+        """Per-unit intent logits [B, U, intent_w] from each own_unit embedding ⊕ broadcast trunk."""
+        u = own_unit_emb.shape[1]
+        body_b = body.unsqueeze(1).expand(-1, u, -1)                  # [B, U, trunk_w]
+        return self.unit_intent_head(torch.cat([own_unit_emb, body_b], dim=-1))
 
     def _gather_node_by_tile(self, h_pad: torch.Tensor, tile_idx: torch.Tensor,
                              N: int) -> torch.Tensor:
@@ -488,9 +507,10 @@ class StructuredPolicyValueNet(nn.Module):
         return gathered
 
     def forward(self, inputs: dict[str, torch.Tensor], with_construction: bool = False):
-        """FROZEN seam: returns (tech, policy, tanh(value)). v7: when [with_construction], returns
-        (tech, policy, construction[B,M,constr_w], value) — the trainer + ONNX export opt in; every
-        existing 3-tuple caller is unchanged."""
+        """FROZEN seam: returns (tech, policy, tanh(value)). When [with_construction], returns the 6-tuple
+        (tech, policy, construction[B,M,constr_w], city_value[B,M], unit_intent[B,U,intent_w], value) — v7
+        added construction/city_value; v8 inserts the per-unit intent logits BEFORE value. The trainer + ONNX
+        export opt in; every existing 3-tuple caller is unchanged. `value` stays LAST so tail-indexing holds."""
         g = inputs[self.INPUT_GLOBAL]
         a = inputs[self.INPUT_ACTING]
         spatial = inputs[self.SPATIAL]                       # [B,N,13] float
@@ -508,11 +528,15 @@ class StructuredPolicyValueNet(nn.Module):
             board = _masked_mean(h, spatial_mask)            # [B,C] board vector
             parts = [board]
             own_city_emb = None
+            own_unit_emb = None
             for name in self.ENTITY_NAMES:
                 enc = self.entity_enc[name]
                 if with_construction and name == "own_cities":
                     own_city_emb = enc.proj(inputs[name])    # [B,M,gnn_channels] per-city (pre-pool)
                     parts.append(_masked_mean(own_city_emb, inputs[name + "_mask"]))
+                elif with_construction and name == "own_units":
+                    own_unit_emb = enc.proj(inputs[name])    # [B,U,gnn_channels] per-unit (pre-pool)
+                    parts.append(_masked_mean(own_unit_emb, inputs[name + "_mask"]))
                 else:
                     parts.append(enc(inputs[name], inputs[name + "_mask"]))
             parts += [g, a]
@@ -522,7 +546,8 @@ class StructuredPolicyValueNet(nn.Module):
             tech, policy, value = self.tech_head(ph), self.policy_head(ph), torch.tanh(self.value_head(vh))
             if with_construction:
                 return (tech, policy, self._construction_logits(own_city_emb, body),
-                        self._city_value(own_city_emb, body), value)
+                        self._city_value(own_city_emb, body),
+                        self._unit_intent_logits(own_unit_emb, body), value)
             return tech, policy, value
 
         # ---- Phase B path (attention). ----
@@ -535,6 +560,7 @@ class StructuredPolicyValueNet(nn.Module):
         # exists). Refined tokens + masks are kept for the cross-attention union.
         ent_tok, ent_mask = [], []
         own_city_emb = None
+        own_unit_emb = None
         for name in self.ENTITY_NAMES:
             tok = inputs[name]                               # [B,M,raw_width]
             m = inputs[name + "_mask"]                       # [B,M]
@@ -555,6 +581,8 @@ class StructuredPolicyValueNet(nn.Module):
                 t = blk(t, t, m)                             # self-attn: q=kv=t, presence mask
             if with_construction and name == "own_cities":
                 own_city_emb = t                             # [B,M,attn_dim] refined per-city (pre-zero)
+            elif with_construction and name == "own_units":
+                own_unit_emb = t                             # [B,U,attn_dim] refined per-unit (pre-zero)
             # zero out padded tokens so they contribute nothing as cross-attn keys/values.
             t = t * m.unsqueeze(-1)
             ent_tok.append(t)
@@ -576,5 +604,6 @@ class StructuredPolicyValueNet(nn.Module):
         tech, policy, value = self.tech_head(ph), self.policy_head(ph), torch.tanh(self.value_head(vh))
         if with_construction:
             return (tech, policy, self._construction_logits(own_city_emb, body),
-                    self._city_value(own_city_emb, body), value)
+                    self._city_value(own_city_emb, body),
+                    self._unit_intent_logits(own_unit_emb, body), value)
         return tech, policy, value

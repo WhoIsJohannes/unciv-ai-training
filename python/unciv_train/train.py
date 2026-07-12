@@ -68,6 +68,14 @@ def _construction_entropy_sum(logits: torch.Tensor, actions: torch.Tensor,
     return ent.sum(dim=1)                                  # [n]
 
 
+# v8: per-unit INTENT logp/entropy sums are the SAME masked-softmax-over-the-W-axis math as construction
+# ([n, M-or-U, W] → [n], entity-agnostic); aliased for readability at the unit-intent joint-PG call sites.
+# Units have no per-unit economy signal, so they ALWAYS take the joint shared-advantage path (no per-unit
+# credit term); this is the direct analog of the construction shared-adv (credit-coef 0) behaviour.
+_unit_intent_logp_sum = _construction_logp_sum
+_unit_intent_entropy_sum = _construction_entropy_sum
+
+
 def _construction_logp_percity(logits: torch.Tensor, actions: torch.Tensor,
                                mask: torch.Tensor) -> torch.Tensor:
     """v7.3: PER-CITY construction logp (NOT summed over cities) → [n, M], 0 where the city did not act.
@@ -224,6 +232,10 @@ def _optimize_actor_critic(
                                                   # per-city PPO importance ratio (valid under replay). None ⇒ A2C (no ratio).
     ref_construction_logp: torch.Tensor | None = None,  # v7.4: frozen BC-clone construction log-probs [n, M, W] (masked)
     construction_kl_coef: float = 0.0,            # v7.4: KL-to-clone leash weight; >0 anchors construction near the clone
+    a_unit_intent: torch.Tensor | None = None,    # v8: per-step per-unit intent action [n, U] (−1 = no decision)
+    m_unit_intent: torch.Tensor | None = None,    # v8: per-unit intent legal mask [n, U, W]
+    ref_unit_intent_logp: torch.Tensor | None = None,  # v8: frozen BC-clone unit-intent log-probs [n, U, W] (masked)
+    unit_kl_coef: float = 0.0,                    # v8: KL-to-clone leash weight for the unit-intent head
 ) -> tuple[object, dict]:
     import copy
     opt = optimizer                  # v5: persistent optimizer (built once in the trainer, carried by run_loop)
@@ -236,20 +248,28 @@ def _optimize_actor_critic(
     use_percity_credit = use_construction and econ_city is not None
     constr_in_joint = use_construction and not use_percity_credit
     use_kl_leash = use_construction and ref_construction_logp is not None and construction_kl_coef > 0
+    # v8: per-unit intent. No per-unit economy signal ⇒ ALWAYS the joint shared-advantage path (unit logp
+    # summed into the joint PPO ratio, credited by the same civ GAE advantage). The forward returns the
+    # EXTENDED tuple whenever EITHER head is wired (so unit-intent works even if construction is off).
+    use_unit_intent = a_unit_intent is not None
+    unit_in_joint = use_unit_intent
+    use_unit_kl_leash = use_unit_intent and ref_unit_intent_logp is not None and unit_kl_coef > 0
+    extended = use_construction or use_unit_intent
 
     def _unpack(out):
-        """forward_fn / forward_chunk_fn return (tl, pl, val) normally; (tl, pl, cl, cval, val) when the
-        construction head is wired. Normalize to (tl, pl, cl|None, cval|None, val)."""
-        if use_construction:
-            tl, pl, cl, cval, val = out
-            return tl, pl, cl, cval, val
+        """forward_fn / forward_chunk_fn return (tl, pl, val) normally; the 6-tuple
+        (tl, pl, cl, cval, ul, val) when the construction/unit-intent heads are wired. Normalize to
+        (tl, pl, cl|None, cval|None, ul|None, val)."""
+        if extended:
+            tl, pl, cl, cval, ul, val = out
+            return tl, pl, cl, cval, ul, val
         tl, pl, val = out
-        return tl, pl, None, None, val
+        return tl, pl, None, None, None, val
 
-    def _policy_logp(tl, pl, cl, lo, hi):
-        """Per-step joint logp = tech + policy (+ Σ_cities construction ONLY in the legacy shared-adv mode).
-        In v7.3 per-city-credit mode construction is a SEPARATE term (see the epoch loop) and is excluded
-        here. Slices to [lo:hi] (None ⇒ whole batch)."""
+    def _policy_logp(tl, pl, cl, ul, lo, hi):
+        """Per-step joint logp = tech + policy (+ Σ_cities construction in the legacy shared-adv mode)
+        (+ Σ_units unit-intent). In v7.3 per-city-credit mode construction is a SEPARATE term (see the epoch
+        loop) and is excluded here; unit-intent is always joint. Slices to [lo:hi] (None ⇒ whole batch)."""
         s = _masked_logp(tl, a_tech[lo:hi], m_tech[lo:hi]) + _masked_logp(pl, a_policy[lo:hi], m_policy[lo:hi])
         if constr_in_joint and cl is not None:
             ac, mc = a_construction[lo:hi], m_construction[lo:hi]
@@ -257,12 +277,20 @@ def _optimize_actor_critic(
                 raise ValueError(f"construction city-axis mismatch: net {cl.shape[1]} != actions {ac.shape[1]} "
                                  "(own_cities padding must equal construction padding — same orderedOwnCities count)")
             s = s + _construction_logp_sum(cl, ac, mc)
+        if unit_in_joint and ul is not None:
+            au, mu = a_unit_intent[lo:hi], m_unit_intent[lo:hi]
+            if ul.shape[1] != au.shape[1]:
+                raise ValueError(f"unit-intent unit-axis mismatch: net {ul.shape[1]} != actions {au.shape[1]} "
+                                 "(own_units padding must equal unit_intent padding — same orderedOwnUnits count)")
+            s = s + _unit_intent_logp_sum(ul, au, mu)
         return s
 
-    def _policy_entropy(tl, pl, cl, lo, hi):
+    def _policy_entropy(tl, pl, cl, ul, lo, hi):
         e = _entropy(tl, m_tech[lo:hi]) + _entropy(pl, m_policy[lo:hi])
         if constr_in_joint and cl is not None:
             e = e + _construction_entropy_sum(cl, a_construction[lo:hi], m_construction[lo:hi])
+        if unit_in_joint and ul is not None:
+            e = e + _unit_intent_entropy_sum(ul, a_unit_intent[lo:hi], m_unit_intent[lo:hi])
         return e
 
     def _construction_credit_loss(cl, cval, lo, hi):
@@ -311,6 +339,19 @@ def _optimize_actor_critic(
         has_legal = (mc.sum(dim=2) > 0).float()             # only cities with legal constructions (deciders)
         denom = has_legal.sum(dim=1).clamp(min=1.0)
         return ((kl * has_legal).sum(dim=1) / denom).mean()
+
+    def _unit_intent_kl_loss(ul, lo, hi):
+        """v8 KL-to-clone leash for the unit-intent head: KL(current unit-intent || frozen BC clone) averaged
+        over deciding units, then over steps — the direct analog of `_construction_kl_loss`, anchoring the
+        intent head near the clone so RL can't drift it back into the collapse basin."""
+        mu = m_unit_intent[lo:hi]
+        neg = torch.where(mu > 0, ul, torch.full_like(ul, -1e9))
+        cur = F.log_softmax(neg, dim=2)                     # [chunk, U, W]
+        ref = ref_unit_intent_logp[lo:hi]                   # [chunk, U, W] frozen clone log-probs (masked)
+        kl = (cur.exp() * (cur - ref)).sum(dim=2)           # [chunk, U] KL(cur||ref) per unit
+        has_legal = (mu.sum(dim=2) > 0).float()             # only units with legal intents (deciders)
+        denom = has_legal.sum(dim=1).clamp(min=1.0)
+        return ((kl * has_legal).sum(dim=1) / denom).mean()
     use_micro = (micro_batch_steps is not None and micro_batch_steps > 0
                  and forward_chunk_fn is not None and micro_batch_steps < n)  # <=0 ⇒ whole-batch no-op
     # v6 GUARD: with stored behavior logp (off-policy replay), clip_eps MUST be truthy — the
@@ -337,21 +378,21 @@ def _optimize_actor_critic(
             v_parts, lp_parts = [], []
             for lo in range(0, n, micro_batch_steps):
                 hi = min(lo + micro_batch_steps, n)
-                tl0, pl0, cl0, cv0, v0 = _unpack(forward_chunk_fn(lo, hi))
+                tl0, pl0, cl0, cv0, ul0, v0 = _unpack(forward_chunk_fn(lo, hi))
                 v_parts.append(v0.reshape(-1))
                 if use_percity_credit:
                     cval0_parts.append(cv0)
                 if stored_old_logp is None:                 # only recompute when on-policy
-                    lp_parts.append(_policy_logp(tl0, pl0, cl0, lo, hi))
+                    lp_parts.append(_policy_logp(tl0, pl0, cl0, ul0, lo, hi))
             val0 = torch.cat(v_parts)
             old_logp = stored_old_logp.detach() if stored_old_logp is not None else torch.cat(lp_parts).detach()
         else:
-            tl0, pl0, cl0, cv0, val0 = _unpack(forward_fn())
+            tl0, pl0, cl0, cv0, ul0, val0 = _unpack(forward_fn())
             val0 = val0.reshape(-1)
             if use_percity_credit:
                 cval0_parts.append(cv0)
             old_logp = (stored_old_logp.detach() if stored_old_logp is not None
-                        else _policy_logp(tl0, pl0, cl0, None, None).detach())
+                        else _policy_logp(tl0, pl0, cl0, ul0, None, None).detach())
     v_np = val0.cpu().numpy()
     # v7.3: per-city GAE off the value snapshot — A_city[t,i] credits city i's construction by ITS OWN
     # discounted economy return (baseline V_city). Computed ONCE per round (like the civ adv/ret).
@@ -419,9 +460,9 @@ def _optimize_actor_critic(
             for lo in range(0, n, micro_batch_steps):
                 hi = min(lo + micro_batch_steps, n)
                 w = (hi - lo) / n
-                tl, pl, cl, cval, val = _unpack(forward_chunk_fn(lo, hi))
+                tl, pl, cl, cval, ul, val = _unpack(forward_chunk_fn(lo, hi))
                 val = val.reshape(-1)
-                logp = _policy_logp(tl, pl, cl, lo, hi)
+                logp = _policy_logp(tl, pl, cl, ul, lo, hi)
                 if clip_eps:
                     logratio = (logp - old_logp[lo:hi]).clamp(-20.0, 20.0)
                     ratio = torch.exp(logratio)
@@ -433,7 +474,7 @@ def _optimize_actor_critic(
                 else:
                     policy_loss = -(adv[lo:hi] * logp).mean()
                 value_loss = F.mse_loss(val, ret[lo:hi])
-                ent = _policy_entropy(tl, pl, cl, lo, hi).mean()
+                ent = _policy_entropy(tl, pl, cl, ul, lo, hi).mean()
                 loss_step = policy_loss + value_coef * value_loss - entropy_coef * ent
                 if use_percity_credit:                       # v7.3 separate per-city construction objective
                     c_pg, c_vloss, c_ent = _construction_credit_loss(cl, cval, lo, hi)
@@ -442,6 +483,8 @@ def _optimize_actor_critic(
                     cvl_sum += float(c_vloss.detach()) * w
                 if use_kl_leash and cl is not None:          # v7.4 KL-to-clone leash (anti-drift)
                     loss_step = loss_step + construction_kl_coef * _construction_kl_loss(cl, lo, hi)
+                if use_unit_kl_leash and ul is not None:     # v8 KL-to-clone leash for the unit-intent head
+                    loss_step = loss_step + unit_kl_coef * _unit_intent_kl_loss(ul, lo, hi)
                 loss_c = loss_step * w
                 loss_c.backward()                           # accumulate grad; free the chunk graph
                 loss_total += float(loss_c.detach())
@@ -466,9 +509,9 @@ def _optimize_actor_critic(
             if clip_eps:
                 stats.update(mean_ratio=ratio_sum / n, clip_frac=clip_count / n)
         else:
-            tl, pl, cl, cval, val = _unpack(forward_fn())
+            tl, pl, cl, cval, ul, val = _unpack(forward_fn())
             val = val.reshape(-1)
-            logp = _policy_logp(tl, pl, cl, None, None)
+            logp = _policy_logp(tl, pl, cl, ul, None, None)
             if clip_eps:                                        # PPO clip (default ON; 0/None ⇒ plain A2C)
                 logratio = (logp - old_logp).clamp(-20.0, 20.0)  # guard exp() overflow on big policy shifts
                 ratio = torch.exp(logratio)
@@ -480,7 +523,7 @@ def _optimize_actor_critic(
             else:                                               # plain A2C (single-epoch use)
                 policy_loss = -(adv * logp).mean()
             value_loss = F.mse_loss(val, ret)
-            ent = _policy_entropy(tl, pl, cl, None, None).mean()
+            ent = _policy_entropy(tl, pl, cl, ul, None, None).mean()
             loss = policy_loss + value_coef * value_loss - entropy_coef * ent
             if use_percity_credit:                              # v7.3 separate per-city construction objective
                 c_pg, c_vloss, c_ent = _construction_credit_loss(cl, cval, None, None)
@@ -491,6 +534,10 @@ def _optimize_actor_critic(
                 kl_term = _construction_kl_loss(cl, None, None)
                 loss = loss + construction_kl_coef * kl_term
                 stats["construction_kl"] = float(kl_term.detach())
+            if use_unit_kl_leash and ul is not None:            # v8 KL-to-clone leash for the unit-intent head
+                ukl_term = _unit_intent_kl_loss(ul, None, None)
+                loss = loss + unit_kl_coef * ukl_term
+                stats["unit_intent_kl"] = float(ukl_term.detach())
 
             if not torch.isfinite(loss):                        # divergence guard (R8 + council 🔴)
                 net.load_state_dict(safe_state)                 # restore last finite weights — never export NaN
@@ -586,6 +633,42 @@ def _stack_construction(trajectories: list[TrainTrajectory], constr_w: int):
     return torch.tensor(a_c), torch.tensor(lp_c.sum(axis=1)), torch.tensor(mk_c), econ_t, present_t, torch.tensor(lp_c)
 
 
+def _stack_unit_intent(trajectories: list[TrainTrajectory], intent_w: int):
+    """v8: per-step ragged unit-intent (action / logp / mask, in `rich` dicts) → dense padded tensors aligned
+    to the SAME max unit count `build_rich_batch` pads own_units to (per-step own_units == unit_intent count
+    == orderedOwnUnits size). Pad action=−1 / logp=0 / mask=0 (inert rows → 0 logp). Units use the SHARED civ
+    advantage (no per-unit econ/credit), so this returns just (a_unit_intent[n,U] int, b_logp[n] f32 sum,
+    m_unit_intent[n,U,W] f32) — the direct analog of the construction joint path."""
+    acts, logps, masks = [], [], []
+    for t in trajectories:
+        rich = t.rich
+        for i in range(len(t.rewards)):
+            step = rich[i] if rich is not None else None
+            a = np.asarray(step["unit_intent_action"], np.int64).reshape(-1) if step is not None and "unit_intent_action" in step else np.zeros(0, np.int64)
+            lp = np.asarray(step["unit_intent_logp"], np.float32).reshape(-1) if step is not None and "unit_intent_logp" in step else np.zeros(0, np.float32)
+            mk = np.asarray(step["mask_unit_intent"], np.float32) if step is not None and "mask_unit_intent" in step else np.zeros((0, intent_w), np.float32)
+            if mk.ndim == 1:
+                mk = mk.reshape(0, intent_w)
+            acts.append(a); logps.append(lp); masks.append(mk)
+    n = len(acts)
+    big_u = max((a.shape[0] for a in acts), default=0)
+    u_dim = max(1, big_u)
+    a_u = np.full((n, u_dim), -1, np.int64)
+    lp_u = np.zeros((n, u_dim), np.float32)
+    mk_u = np.zeros((n, u_dim, intent_w), np.float32)
+    for i, (a, lp, mk) in enumerate(zip(acts, logps, masks)):
+        k = a.shape[0]
+        if k:
+            a_u[i, :k] = a
+            lp_u[i, :k] = lp
+            if mk.shape[0] == k and mk.shape[1] == intent_w:
+                mk_u[i, :k] = mk
+            elif mk.size and mk.shape[1] != intent_w:            # fail loud (never silently zero the grad)
+                raise ValueError(f"unit-intent mask width {mk.shape[1]} != net.intent_w {intent_w} — shard "
+                                 "intent enum differs from the training net (warm-start arch mismatch)")
+    return torch.tensor(a_u), torch.tensor(lp_u.sum(axis=1)), torch.tensor(mk_u)
+
+
 def _stack_bc_targets(trajectories: list[TrainTrajectory], constr_w: int):
     """v7.4: per-step per-city BC target = the heuristic's currently-building construction (`construction_current`,
     0-indexed mask idx; −1 = idle/no-target), padded to the batch max city count M. Returns (targets[n,M] int,
@@ -619,20 +702,78 @@ def _stack_bc_targets(trajectories: list[TrainTrajectory], constr_w: int):
     return torch.tensor(tg), torch.tensor(mk_c)
 
 
+def _stack_bc_targets_unit(trajectories: list[TrainTrajectory], intent_w: int):
+    """v8: per-step per-unit BC target = the heuristic's first-firing ladder rung (`unit_intent_current`,
+    0-indexed intent idx; −1 = none/non-land-military), padded to the batch max unit count U. Returns
+    (targets[n,U] int, mask[n,U,W] f32). Rows with target −1 (or out-of-range) are excluded from the BC loss.
+    The direct analog of [_stack_bc_targets] for the unit-intent head."""
+    tgts, masks = [], []
+    for t in trajectories:
+        rich = t.rich
+        for i in range(len(t.rewards)):
+            step = rich[i] if rich is not None else None
+            uc = (np.asarray(step["unit_intent_current"], np.int64).reshape(-1)
+                  if step is not None and "unit_intent_current" in step else np.zeros(0, np.int64))
+            mk = np.asarray(step["mask_unit_intent"], np.float32) if step is not None and "mask_unit_intent" in step else np.zeros((0, intent_w), np.float32)
+            if mk.ndim == 1:
+                mk = mk.reshape(0, intent_w)
+            tgts.append(uc); masks.append(mk)
+    n = len(tgts)
+    big_u = max((a.shape[0] for a in tgts), default=0)
+    u_dim = max(1, big_u)
+    tg = np.full((n, u_dim), -1, np.int64)
+    mk_u = np.zeros((n, u_dim, intent_w), np.float32)
+    for i, (uc, mk) in enumerate(zip(tgts, masks)):
+        k = uc.shape[0]
+        if k:
+            tg[i, :k] = uc
+            if mk.shape[0] == k and mk.shape[1] == intent_w:
+                mk_u[i, :k] = mk
+            elif mk.size and mk.shape[1] != intent_w:
+                raise ValueError(f"BC unit-intent mask width {mk.shape[1]} != net.intent_w {intent_w}")
+    tg[(tg < 0) | (tg >= intent_w)] = -1
+    return torch.tensor(tg), torch.tensor(mk_u)
+
+
+def _bc_masked_ce(logits: torch.Tensor, mk: torch.Tensor, tg: torch.Tensor):
+    """Masked-softmax cross-entropy of a per-entity head chunk vs the heuristic target idx, + (correct, valid)
+    counts. Targets must be LEGAL in the mask — a mid-build/stale target's −1e9 masked logit would otherwise
+    blow up the loss (a handful poison the whole gradient). Returns (loss, correct, valid)."""
+    neg = torch.where(mk > 0, logits, torch.full_like(logits, -1e9))
+    logp = F.log_softmax(neg, dim=2)
+    idx = tg.clamp(min=0).unsqueeze(2)
+    legal_at_tgt = (mk.gather(2, idx).squeeze(2) > 0)
+    valid = (tg >= 0) & legal_at_tgt                           # entities with a LEGAL heuristic target
+    chosen = logp.gather(2, idx).squeeze(2)
+    vsum = valid.float().sum().clamp(min=1.0)
+    loss = -(chosen * valid.float()).sum() / vsum
+    with torch.no_grad():
+        pred = neg.argmax(dim=2)                                # masked argmax
+        corr = float(((pred == tg) & valid).float().sum())
+        val = float(valid.float().sum())
+    return loss, corr, val
+
+
 def bc_pretrain_construction(net, trajectories, dims, token_specs, *, epochs=8, lr=1e-3,
-                             seed=0, micro_batch_steps=512):
-    """v7.4 BEHAVIOR CLONING: supervised-pretrain the construction head to mimic the heuristic's per-city
-    picks (`construction_current`, gen'd with construction OFF). Cross-entropy over the legal-masked
-    construction logits vs the target idx, for cities with a valid target. Only the construction-loss path
-    (construction_head + shared trunk/encoder) gets gradient — tech/policy/value heads are untouched (not in
-    the loss). Gives the head a non-collapsed ~heuristic start so RL has a positive-advantage foothold to
-    climb from. Returns (net, stats)."""
+                             seed=0, micro_batch_steps=512, clone_unit_intent=True):
+    """v7.4/v8 BEHAVIOR CLONING: supervised-pretrain the per-entity head(s) to mimic the heuristic's picks
+    (`construction_current` / `unit_intent_current`, gen'd with control OFF). Cross-entropy over the
+    legal-masked head logits vs the target idx, for entities with a valid legal target. Only the head-loss
+    path (head + shared trunk/encoder) gets gradient — tech/policy/value heads are untouched (not in the loss).
+    v8: when the net carries a unit-intent head AND [clone_unit_intent], the unit-intent head is cloned in the
+    SAME optimizer pass (one warm-start serves both heads + both KL leashes). Returns (net, stats)."""
     from .features import build_rich_batch
     torch.manual_seed(seed)
     if not trajectories:
         return net, {"bc_loss": 0.0, "bc_acc": 0.0, "n": 0}
     tgt, m_c = _stack_bc_targets(trajectories, net.constr_w)
-    if tgt.shape[1] != 1 and (tgt >= 0).sum() == 0:
+    clone_u = clone_unit_intent and hasattr(net, "unit_intent_head")
+    tgt_u = m_u = None
+    if clone_u:
+        tgt_u, m_u = _stack_bc_targets_unit(trajectories, net.intent_w)
+    have_c = (tgt >= 0).sum() > 0
+    have_u = clone_u and (tgt_u >= 0).sum() > 0
+    if not have_c and not have_u:
         return net, {"bc_loss": 0.0, "bc_acc": 0.0, "n": 0, "note": "no BC targets"}
     inputs = build_rich_batch(trajectories, dims, token_specs)
     n = tgt.shape[0]
@@ -642,31 +783,25 @@ def bc_pretrain_construction(net, trajectories, dims, token_specs, *, epochs=8, 
     for ep in range(epochs):
         opt.zero_grad()
         tot_loss = tot_correct = tot_valid = 0.0
+        tot_u_correct = tot_u_valid = 0.0
         for lo in range(0, n, mb):
             hi = min(lo + mb, n)
             w = (hi - lo) / n
             out = net({k: v[lo:hi] for k, v in inputs.items()}, with_construction=True)
-            cl = out[2]                                         # [chunk, M, W] construction logits
-            mk, tg = m_c[lo:hi], tgt[lo:hi]
-            neg = torch.where(mk > 0, cl, torch.full_like(cl, -1e9))
-            logp = F.log_softmax(neg, dim=2)
-            idx = tg.clamp(min=0).unsqueeze(2)
-            # Require the target to be LEGAL in the mask — a mid-build item may not be re-choosable, and its
-            # −1e9 masked logit would otherwise blow up the loss (a handful poison the whole gradient).
-            legal_at_tgt = (mk.gather(2, idx).squeeze(2) > 0)
-            valid = (tg >= 0) & legal_at_tgt                   # [chunk, M] cities with a LEGAL heuristic target
-            chosen = logp.gather(2, idx).squeeze(2)            # [chunk, M]
-            vsum = valid.float().sum().clamp(min=1.0)
-            loss = -(chosen * valid.float()).sum() / vsum
+            c_loss, c_corr, c_val = _bc_masked_ce(out[2], m_c[lo:hi], tgt[lo:hi])   # construction logits @ out[2]
+            loss = c_loss
+            if clone_u:
+                u_loss, u_corr, u_val = _bc_masked_ce(out[4], m_u[lo:hi], tgt_u[lo:hi])  # unit-intent logits @ out[4]
+                loss = loss + u_loss
+                tot_u_correct += u_corr; tot_u_valid += u_val
             (loss * w).backward()
-            with torch.no_grad():
-                pred = neg.argmax(dim=2)                        # masked argmax
-                tot_correct += float(((pred == tg) & valid).float().sum())
-                tot_valid += float(valid.float().sum())
-                tot_loss += float(loss.detach()) * w
+            tot_correct += c_corr; tot_valid += c_val
+            tot_loss += float(loss.detach()) * w
         torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=10.0)
         opt.step()
         last = {"bc_loss": tot_loss, "bc_acc": (tot_correct / tot_valid if tot_valid else 0.0), "n": n}
+        if clone_u:
+            last["bc_unit_acc"] = (tot_u_correct / tot_u_valid if tot_u_valid else 0.0)
     return net, last
 
 
@@ -800,6 +935,8 @@ def train_actor_critic_structured(
     construction_credit_coef: float = 0.0,  # v7.3: per-city economy-advantage weight; >0 ⇒ per-city credit path
     bc_ref=None,                     # v7.4: frozen BC-clone net (KL-leash reference); None ⇒ no leash
     construction_kl_coef: float = 0.0,  # v7.4: KL-to-clone leash weight
+    unit_intent: bool = False,       # v8: train the per-unit intent head; False ⇒ head inert (no-op oracle)
+    unit_kl_coef: float = 0.0,       # v8: KL-to-clone leash weight for the unit-intent head
 ) -> tuple[object, dict, object]:
     """v4 STRUCTURED variant: same encoder-AGNOSTIC core (_optimize_actor_critic) + same rich
     batch/stacking as train_actor_critic_rich — ONLY the nn.Module is swapped for
@@ -841,28 +978,52 @@ def train_actor_critic_structured(
         if stored is not None and not use_pcc:
             stored = stored + b_logp_construction
 
+    # v8: per-unit intent tensors (action / behavior-logp-sum / mask), padded to the SAME unit axis
+    # build_rich_batch pads own_units to. Units always ride in the joint PPO ratio (shared civ advantage,
+    # no per-unit credit) ⇒ their behavior-logp sum is added to the stored old_logp under replay.
+    a_unit_intent = m_unit_intent = None
+    if unit_intent:
+        a_unit_intent, b_logp_unit_intent, m_unit_intent = _stack_unit_intent(trajectories, net.intent_w)
+        if stored is not None:
+            stored = stored + b_logp_unit_intent
+
+    # v8: the forward returns the EXTENDED 6-tuple whenever EITHER head is trained, so unit-intent works even
+    # if construction is off (and vice versa).
+    extended_fwd = construction or unit_intent
+
     def forward_fn():
-        return net(inputs, with_construction=construction)
+        return net(inputs, with_construction=extended_fwd)
 
     def forward_chunk_fn(lo, hi):    # slice every [B,...] tensor on axis 0 (per-row independent forward)
-        return net({k: v[lo:hi] for k, v in inputs.items()}, with_construction=construction)
+        return net({k: v[lo:hi] for k, v in inputs.items()}, with_construction=extended_fwd)
 
     # v7.4 KL-to-clone leash: forward the FROZEN BC clone ONCE (no_grad, chunked) → reference construction
     # log-probs [n,M,W] (masked). The trainer penalizes KL(current || ref) each epoch so RL can't drift the
     # head back into the collapse basin. Chunk to bound memory; concat is math-identical.
+    # v8: compute BOTH reference log-prob tensors in ONE bc_ref forward loop (the 6-tuple carries both heads).
     ref_construction_logp = None
-    if construction and bc_ref is not None and construction_kl_coef > 0 and m_construction is not None:
+    ref_unit_intent_logp = None
+    need_cref = construction and bc_ref is not None and construction_kl_coef > 0 and m_construction is not None
+    need_uref = unit_intent and bc_ref is not None and unit_kl_coef > 0 and m_unit_intent is not None
+    if need_cref or need_uref:
         bc_ref.eval()
         with torch.no_grad():
             n_all = a_tech.shape[0]
             step = micro_batch_steps if (micro_batch_steps and 0 < micro_batch_steps < n_all) else n_all
-            parts = []
+            cparts, uparts = [], []
             for lo in range(0, n_all, step):
                 hi = min(lo + step, n_all)
-                rcl = bc_ref({k: v[lo:hi] for k, v in inputs.items()}, with_construction=True)[2]  # [chunk,M,W]
-                mc = m_construction[lo:hi]
-                parts.append(F.log_softmax(torch.where(mc > 0, rcl, torch.full_like(rcl, -1e9)), dim=2))
-            ref_construction_logp = torch.cat(parts).detach()
+                out = bc_ref({k: v[lo:hi] for k, v in inputs.items()}, with_construction=True)
+                if need_cref:
+                    rcl, mc = out[2], m_construction[lo:hi]                                 # [chunk,M,W]
+                    cparts.append(F.log_softmax(torch.where(mc > 0, rcl, torch.full_like(rcl, -1e9)), dim=2))
+                if need_uref:
+                    rul, mu = out[4], m_unit_intent[lo:hi]                                  # [chunk,U,W]
+                    uparts.append(F.log_softmax(torch.where(mu > 0, rul, torch.full_like(rul, -1e9)), dim=2))
+            if need_cref:
+                ref_construction_logp = torch.cat(cparts).detach()
+            if need_uref:
+                ref_unit_intent_logp = torch.cat(uparts).detach()
 
     net, stats = _optimize_actor_critic(
         net, forward_fn, optimizer=optimizer, forward_chunk_fn=forward_chunk_fn,
@@ -878,5 +1039,7 @@ def train_actor_critic_structured(
         old_logp_construction_pc=old_logp_construction_pc,
         ref_construction_logp=ref_construction_logp,
         construction_kl_coef=construction_kl_coef,
+        a_unit_intent=a_unit_intent, m_unit_intent=m_unit_intent,
+        ref_unit_intent_logp=ref_unit_intent_logp, unit_kl_coef=unit_kl_coef,
     )
     return net, stats, optimizer

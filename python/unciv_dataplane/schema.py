@@ -13,6 +13,14 @@ from pathlib import Path
 from typing import Any
 
 # Mirror of com.unciv.logic.simulation.dataplane.SampleSchema.VERSION — keep in lockstep.
+# v9 (v8 per-unit INTENT head): adds three per-step VARIABLE f32 scalars (perItem=1, aligned to
+# own_units/mask_unit_intent — the canonical orderedOwnUnits sortedBy{id} order): `unit_intent_action`
+# (REALIZED executed intent idx; −1 = not a controlled land-military unit / no decision), `unit_intent_logp`
+# (its masked-softmax behavior log-prob; 0 where no decision), `unit_intent_current` (the heuristic's
+# first-firing ladder rung = the BC target; −1 if none). Also adds the per-unit legality mask
+# `mask_unit_intent` (u8, perItem=UnitIntent.COUNT). The own_units token ORDER changes to sortedBy{id}
+# (was currentTile idx). A v8 shard lacks the blocks ⇒ reader refuses ⇒ regen. The descriptor-generic reader
+# decodes the new VARIABLE blocks with no code change.
 # v8 (v7.4 BC warm-start): adds a per-step VARIABLE f32 scalar `construction_current` (perItem=1, aligned
 # to own_cities/construction) = each own city's currently-building construction as a 0-indexed mask idx
 # (−1 idle/perpetual). Gen'd with construction OFF ⇒ the HEURISTIC's picks = the supervised behavior-cloning
@@ -32,7 +40,7 @@ from typing import Any
 # recorded at sampling time). A v3 shard lacks the block ⇒ not layout-compatible ⇒ reader refuses.
 # v3 (v4 structured encoder): adds the per-tile spatial_coords (f32 x,y) block, map dims in global,
 # per-entity tile-index, and the construction-namespace fix. v2/v1 shards are not layout-compatible.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class SchemaError(Exception):

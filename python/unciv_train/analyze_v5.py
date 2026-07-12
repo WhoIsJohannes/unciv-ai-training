@@ -61,6 +61,9 @@ def main(argv=None) -> int:
     ap.add_argument("--control-construction", choices=["on", "off"], default="off",
                     help="v7: run the ceiling eval WITH per-city construction control (REQUIRED for an "
                          "ON arm — else the ceiling measures tech/policy only, not the construction lever)")
+    ap.add_argument("--control-unit-intent", choices=["on", "off"], default="off",
+                    help="v8: run the ceiling eval WITH per-unit intent control (REQUIRED for a unit-intent "
+                         "ON arm — else the ceiling measures the construction/tech/policy levers only)")
     ap.add_argument("--skip-ceiling-eval", action="store_true",
                     help="report from the last curve.csv round instead of a fresh high-N eval")
     args = ap.parse_args(argv)
@@ -83,7 +86,8 @@ def main(argv=None) -> int:
     else:
         ev = run_loop.evaluate(onnx, args.ceiling_games, args.turn_cap, args.threads,
                                args.eval_seed, args.gradle_timeout, "Medium",
-                               control_construction=(args.control_construction == "on"))
+                               control_construction=(args.control_construction == "on"),
+                               control_unit_intent=(args.control_unit_intent == "on"))
         w, n = int(ev["wins"]), int(ev["games"])
         z_v4, p_v4 = _two_proportion_z(w, n, *V4_STRUCTURED)    # AC1: continual vs v4-from-scratch
         z_bl, p_bl = _two_proportion_z(w, n, *V2_BLIND)         # AC2: vs blind baseline

@@ -51,6 +51,10 @@ class OnnxPolicy(
     private val hasConstructionOutput: Boolean
     /** v7: the construction-mask / per-city-head width (buildings+units), for the PR3 dim cross-check. */
     private val constrW: Int = vocab.buildingCount + vocab.unitCount
+    /** v8: true when the model exposes the per-unit `unit_intent_logits` output. */
+    private val hasUnitIntentOutput: Boolean
+    /** v8: the per-unit intent-head width ([Vocab.unitIntentCount] = UnitIntent.COUNT), dim cross-check. */
+    private val intentW: Int = vocab.unitIntentCount
 
     init {
         val f = java.io.File(modelPath)
@@ -92,6 +96,13 @@ class OnnxPolicy(
             "OnnxPolicy: controlConstruction=ON but model lacks output '${SampleSchema.OnnxContract.OUTPUT_CONSTRUCTION}' " +
                 "(export the net with the v7 per-city construction head)"
         }
+        // v8: discover the per-unit intent output — same fail-loud discipline as construction (an "ON" arm
+        // silently falling back to the heuristic would contaminate the ON-vs-OFF comparison).
+        hasUnitIntentOutput = SampleSchema.OnnxContract.OUTPUT_UNIT_INTENT in session.outputNames
+        check(!config.controlUnitIntent || hasUnitIntentOutput) {
+            "OnnxPolicy: controlUnitIntent=ON but model lacks output '${SampleSchema.OnnxContract.OUTPUT_UNIT_INTENT}' " +
+                "(export the net with the v8 per-unit intent head)"
+        }
     }
 
     /** One forward pass per (game, civ, turn), reused across the two head calls of that turn.
@@ -101,6 +112,8 @@ class OnnxPolicy(
         val key: String, val techLogits: FloatArray, val policyLogits: FloatArray,
         /** v7: per-city construction logits [ncities][constrW], or null if the model has no construction head. */
         val constructionLogits: Array<FloatArray>?,
+        /** v8: per-unit intent logits [nunits][intentW], or null if the model has no unit-intent head. */
+        val unitIntentLogits: Array<FloatArray>?,
     )
     private val memo = ThreadLocal<Memo?>()
 
@@ -113,6 +126,10 @@ class OnnxPolicy(
      *  reports ≈0; a large count means the net rarely controlled construction (comparison contaminated). */
     private val constructionFallbacks = java.util.concurrent.atomic.AtomicLong(0)
     fun constructionFallbackCount(): Long = constructionFallbacks.get()
+
+    /** v8: per-unit intent fallbacks (missing head / out-of-range row). A healthy ON arm reports ≈0. */
+    private val unitIntentFallbacks = java.util.concurrent.atomic.AtomicLong(0)
+    fun unitIntentFallbackCount(): Long = unitIntentFallbacks.get()
 
     /** Public single-input inference for the blind PARITY test (no masking/sampling). */
     fun infer(input: FloatArray): Pair<FloatArray, FloatArray> = forward("parity", input).let { it.techLogits to it.policyLogits }
@@ -147,6 +164,24 @@ class OnnxPolicy(
         return idx to logp
     }
 
+    /** v8 — per-unit intent from the SAME memoized forward (ONE inference per civ-turn). Index the net's
+     *  per-unit intent logits at [unitRow] (the unit's position in [Featurizer.orderedOwnUnits] = the
+     *  own_units token order), masked-softmax-SAMPLE for the dispatched intent (single rng draw, same stream
+     *  as the other heads), and return the full masked log-softmax VECTOR so the recorder can score
+     *  `log π_b(realized)` even when dispatch falls back to a different rung. Missing head / out-of-range row
+     *  → abstain (−1) + a fallback (the unit stays heuristic). */
+    override fun chooseUnitIntentWithLogp(
+        civ: Civilization, unit: MapUnit, unitRow: Int, legalMask: BooleanArray, turn: Int,
+    ): Pair<Int, FloatArray> {
+        val logits = forwardCached(civ, turn).unitIntentLogits
+        if (logits == null || unitRow < 0 || unitRow >= logits.size) { unitIntentFallbacks.incrementAndGet(); return -1 to FloatArray(0) }
+        val row = logits[unitRow]
+        val (idx, _) = com.unciv.logic.simulation.dataplane.MaskedChoice.chooseWithLogp(row, legalMask, eval, rngFor(civ, turn))
+        if (idx < 0) { unitIntentFallbacks.incrementAndGet(); return -1 to FloatArray(0) }
+        decisions.incrementAndGet()
+        return idx to com.unciv.logic.simulation.dataplane.MaskedChoice.maskedLogSoftmax(row, legalMask)
+    }
+
     /** The ONE memoized forward per (game, civ, turn), reused by tech/policy/construction calls. */
     private fun forwardCached(civ: Civilization, turn: Int): Memo {
         val key = "${civ.gameInfo.gameId}|${civ.civID}|$turn"
@@ -169,7 +204,7 @@ class OnnxPolicy(
             session.run(mapOf(SampleSchema.OnnxContract.INPUT_NAME to t)).use { res ->
                 val tech = row(res.get(SampleSchema.OnnxContract.OUTPUT_TECH).get() as OnnxTensor)
                 val policy = row(res.get(SampleSchema.OnnxContract.OUTPUT_POLICY).get() as OnnxTensor)
-                return Memo(key, tech, policy, null)   // blind models never expose construction
+                return Memo(key, tech, policy, null, null)   // blind models never expose construction / unit-intent
             }
         }
     }
@@ -193,7 +228,11 @@ class OnnxPolicy(
                         rows2d(res.get(SampleSchema.OnnxContract.OUTPUT_CONSTRUCTION).get() as OnnxTensor) else null
                     if (construction != null && construction.isNotEmpty() && construction[0].size != constrW)
                         error("OnnxPolicy: construction_logits width=${construction[0].size} != live constrW=$constrW (regenerate vs the live ruleset)")  // PR3
-                    Memo(key, tech, policy, construction)
+                    val unitIntent = if (hasUnitIntentOutput)
+                        rows2d(res.get(SampleSchema.OnnxContract.OUTPUT_UNIT_INTENT).get() as OnnxTensor) else null
+                    if (unitIntent != null && unitIntent.isNotEmpty() && unitIntent[0].size != intentW)
+                        error("OnnxPolicy: unit_intent_logits width=${unitIntent[0].size} != live intentW=$intentW (regenerate vs the live intent enum)")
+                    Memo(key, tech, policy, construction, unitIntent)
                 }
             }
         } finally {
@@ -310,6 +349,9 @@ class OnnxPolicy(
         val fb = constructionFallbacks.get()
         if (config.controlConstruction && fb > 0)
             com.unciv.utils.Log.error("WARN: OnnxPolicy construction fallbacks=%d (ON arm should be ~0; net rarely controlled construction)", fb)
+        val ufb = unitIntentFallbacks.get()
+        if (config.controlUnitIntent && ufb > 0)
+            com.unciv.utils.Log.error("WARN: OnnxPolicy unit-intent fallbacks=%d (ON arm should be ~0; net rarely controlled unit intent)", ufb)
         try { session.close() } catch (_: Exception) {}
     }
 }

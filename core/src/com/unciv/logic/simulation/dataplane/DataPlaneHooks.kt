@@ -5,6 +5,7 @@ import com.unciv.logic.GameInfo
 import com.unciv.logic.automation.civilization.NextTurnAutomation
 import com.unciv.logic.city.City
 import com.unciv.logic.civilization.Civilization
+import com.unciv.logic.map.mapunit.MapUnit
 import com.unciv.models.ruleset.PerpetualConstruction
 import com.unciv.models.ruleset.unique.GameContext
 import com.unciv.utils.Log
@@ -62,7 +63,12 @@ object DataPlaneHooks {
         { civ, turn -> GameContext(civInfo = civ).stateBasedRandom("dataplane-policy-$turn") }
 
     // ---- per-game state: a Featurizer (always, for control masks + emit obs) + an optional recorder ----
-    private class GameState(val featurizer: Featurizer, val vocab: Vocab, val recorder: ShardRecorder?)
+    // v8: `pending` holds the CURRENT civ-turn's snapshot (obs + turn-start decisions) whose frame is emitted
+    // at turn-END (once the unit realized-intents are known). One game's turns are sequential on one thread, so
+    // a plain field is safe; the frame is flushed at the next handleCivTurn (or finalizeGame) for that game.
+    private class GameState(val featurizer: Featurizer, val vocab: Vocab, val recorder: ShardRecorder?) {
+        var pending: PendingCivTurn? = null
+    }
     private val games = ConcurrentHashMap<GameInfo, GameState>()
     @Volatile private var installedPolicy: PolicyProvider? = null
 
@@ -87,6 +93,7 @@ object DataPlaneHooks {
      *  unregister. [winnerCivId] is the winning civ's id, or null for a draw. */
     fun finalizeGame(gameInfo: GameInfo, winnerCivId: String?): File? {
         val state = games.remove(gameInfo) ?: return null
+        flushPending(state)   // v8: emit the LAST civ-turn's step frame (its automateUnits has completed)
         val rec = state.recorder ?: return null
         rec.recordTerminal(winnerCivId)
         return rec.close()
@@ -110,15 +117,143 @@ object DataPlaneHooks {
     fun controlsConstruction(civ: Civilization): Boolean =
         controls(civ) && games[civ.gameInfo]?.featurizer?.config?.controlConstruction == true
 
+    /** v8 — true iff per-unit INTENT control is ACTIVE for [civ] (a controlled civ in a game whose config
+     *  has `controlUnitIntent`). Read by `UnitAutomation.automateUnitMoves` to intercept land-military units.
+     *  A CHEAP no-op (`installedPolicy` null) in normal play, so the game AI is byte-identical when off. */
+    fun controlsUnitIntent(civ: Civilization): Boolean =
+        controls(civ) && games[civ.gameInfo]?.featurizer?.config?.controlUnitIntent == true
+
+    /** v8 — the net's decided INTENT for [unit] this civ-turn (or null: not controlled / not a modeled
+     *  land-military unit / created mid-turn). Read by `automateUnitMoves` to DISPATCH the chosen intent. */
+    fun decidedUnitIntent(unit: MapUnit): UnitIntent? {
+        val p = games[unit.civ.gameInfo]?.pending ?: return null
+        if (p.civ !== unit.civ) return null
+        return p.units.decided[unit.id]?.let { UnitIntent.fromIndex(it) }
+    }
+
+    /** v8 — record the EXECUTED [intent] for [unit] (called by `automateUnitMoves` when a ladder rung fires
+     *  or the net's dispatch succeeds). Captures the heuristic first-firing rung (`unit_intent_current`, the
+     *  BC target — for EVERY land-military unit) and, for a net-controlled unit, the REALIZED action
+     *  (`unit_intent_action`). A pure side-effect: a cheap no-op unless a policy is recording this unit's civ,
+     *  and it NEVER touches unit/game state. Gated to LAND-military (v1 scope); other units record −1. */
+    fun noteUnitIntent(unit: MapUnit, intent: UnitIntent) {
+        if (installedPolicy == null) return
+        if (!(unit.baseUnit.isLandUnit && unit.isMilitary())) return
+        val p = games[unit.civ.gameInfo]?.pending ?: return
+        if (p.civ !== unit.civ) return
+        val id = unit.id
+        p.units.heuristic[id] = intent.ordinal                                  // BC label (first-firing rung)
+        if (p.units.decided.containsKey(id)) p.units.realized[id] = intent.ordinal   // RL realized (controlled)
+    }
+
+    /** v7.2 economy potential Φ(s), snapshotted at TURN-START (v8: the frame is emitted at turn-end, so Φ
+     *  MUST be captured before the civ's cities process production — else the recorded Φ would drift and break
+     *  the PBRS no-op). Mirrors [ShardRecorder]'s prior inline formula exactly. */
+    private fun economyPotential(x: Civilization): Float {
+        var prod = 0.0; var food = 0.0; var sci = 0.0
+        for (c in x.cities) {
+            val s = c.cityStats.currentCityStats
+            prod += s.production.toDouble(); food += s.food.toDouble(); sci += s.science.toDouble()
+        }
+        return (ln(1.0 + prod.coerceAtLeast(0.0)) + ln(1.0 + food.coerceAtLeast(0.0)) + ln(1.0 + sci.coerceAtLeast(0.0))
+            + ln(1.0 + x.tech.getNumberOfTechsResearched())).toFloat()
+    }
+
+    /**
+     * v8 per-unit intent decisions for a civ-turn, aligned to [Featurizer.orderedOwnUnits] ([snapshot]).
+     * [decided]/[logpVec]/[mask] are populated at TURN-START (only for controlled land-military units);
+     * [realized]/[heuristic] are filled at ACT-TIME by [noteUnitIntent] during `automateUnits`.
+     */
+    private class UnitDecisions(
+        val snapshot: List<MapUnit>,
+        val decided: Map<Int, Int>,          // unitId → sampled intent ordinal (net choice) to DISPATCH
+        val logpVec: Map<Int, FloatArray>,   // unitId → masked log-softmax over the intent space [intentW]
+        val mask: Map<Int, BooleanArray>,    // unitId → turn-start legal mask (to check realized legality)
+        val realized: HashMap<Int, Int> = HashMap(),   // unitId → realized executed intent ordinal
+        val heuristic: HashMap<Int, Int> = HashMap(),  // unitId → heuristic first-firing rung (BC target)
+    )
+
+    /** v8: a civ-turn snapshot whose frame is emitted at turn-END (once realized intents are known). */
+    private class PendingCivTurn(
+        val civ: Civilization, val obs: Observation, val decision: CivTurnDecision,
+        val phi: Float, val turn: Int, val units: UnitDecisions,
+    )
+
     private fun handleCivTurn(civ: Civilization, state: GameState) {
+        // v8: emit the PREVIOUS civ-turn's frame — its automateUnits has now completed (sequential per game),
+        // so its realized unit-intents are captured. No-op when there is no pending.
+        flushPending(state)
         val policy = installedPolicy ?: return
         if (!civ.isMajorCiv() || civ.isSpectator()) return
         val config = state.featurizer.config
         val obs = state.featurizer.observe(civ)
         val turn = civ.gameInfo.turns
         val d = chooseAndApply(civ, policy, state.vocab, config, obs, turn)
-        state.recorder?.recordStep(civ, obs, d.actions, d.behaviorLogp, d.constructionActions, d.constructionLogp,
-            d.constructionEcon, d.constructionCurrent, turn)
+        // v8: decide per-unit intents at turn-start (for dispatch during automateUnits) and DEFER the frame
+        // emission to turn-end so the recorded intent equals the realized executed intent.
+        val units = decideUnitIntents(civ, policy, state.vocab, config, obs, turn)
+        val phi = if (state.recorder != null) economyPotential(civ) else 0f
+        state.pending = PendingCivTurn(civ, obs, d, phi, turn, units)
+    }
+
+    /**
+     * v8: sample the per-unit INTENT for each controlled land-military unit (turn-start), storing the choice
+     * for dispatch + the full masked log-prob vector for turn-end recording. Aligned to
+     * [Featurizer.orderedOwnUnits] (the SAME order as the obs `own_units` / `mask_unit_intent`). Nothing is
+     * APPLIED here — dispatch happens later inside `automateUnitMoves`. When [SampleConfig.controlUnitIntent]
+     * is off, returns an empty-decision set (units stay heuristic; only the heuristic BC label is captured).
+     */
+    private fun decideUnitIntents(
+        civ: Civilization, policy: PolicyProvider, vocab: Vocab, config: SampleConfig, obs: Observation, turn: Int,
+    ): UnitDecisions {
+        val snapshot = Featurizer.orderedOwnUnits(civ, config.caps.maxOwnUnits)
+        val decided = HashMap<Int, Int>(); val logpVec = HashMap<Int, FloatArray>(); val mask = HashMap<Int, BooleanArray>()
+        if (config.controlUnitIntent) {
+            val intentW = vocab.unitIntentCount
+            val maskFlat = obs.block(SampleSchema.BLOCK_MASK_UNIT_INTENT)
+            if (maskFlat.size == snapshot.size * intentW) {   // alignment guard (must always hold)
+                snapshot.forEachIndexed { i, unit ->
+                    if (!(unit.baseUnit.isLandUnit && unit.isMilitary())) return@forEachIndexed
+                    val row = BooleanArray(intentW) { k -> maskFlat[i * intentW + k] != 0f }
+                    if (row.none { it }) return@forEachIndexed   // no legal intent (unconditional-include ⇒ never)
+                    val (idx, vec) = policy.chooseUnitIntentWithLogp(civ, unit, i, row, turn)
+                    if (idx < 0) return@forEachIndexed
+                    decided[unit.id] = idx; logpVec[unit.id] = vec; mask[unit.id] = row
+                }
+            }
+        }
+        return UnitDecisions(snapshot, decided, logpVec, mask)
+    }
+
+    /**
+     * v8: emit the pending civ-turn frame (obs + turn-start decisions + the now-known realized unit intents),
+     * then clear it. Builds the three per-unit VARIABLE blocks aligned to the turn-start `own_units` snapshot,
+     * matched by the STABLE [MapUnit.id]. `unit_intent_action` = the REALIZED executed intent if it is legal in
+     * the turn-start mask, else −1 (fallback fired a non-offered rung); its logp = `log π_b(realized)`.
+     * `unit_intent_current` = the heuristic first-firing rung (BC target). No-op when there is no pending; when
+     * the game has no recorder (EVAL), the pending is just cleared (it existed only to drive dispatch).
+     */
+    private fun flushPending(state: GameState) {
+        val p = state.pending ?: return
+        state.pending = null
+        val rec = state.recorder ?: return
+        val u = p.units
+        val n = u.snapshot.size
+        val action = FloatArray(n) { -1f }
+        val logp = FloatArray(n) { 0f }
+        val current = FloatArray(n) { -1f }
+        u.snapshot.forEachIndexed { i, unit ->
+            val id = unit.id
+            u.heuristic[id]?.let { current[i] = it.toFloat() }
+            val realized = u.realized[id]
+            if (realized != null && u.mask[id]?.getOrNull(realized) == true) {
+                action[i] = realized.toFloat()
+                logp[i] = u.logpVec[id]?.getOrNull(realized) ?: 0f
+            }
+        }
+        rec.recordStep(p.civ, p.obs, p.decision.actions, p.decision.behaviorLogp,
+            p.decision.constructionActions, p.decision.constructionLogp, p.decision.constructionEcon,
+            p.decision.constructionCurrent, action, logp, current, p.phi, p.turn)
     }
 
     /** The per-civ-turn decision: fixed civ-head actions + per-head behavior logp ([SampleSchema.MASK_HEADS]
@@ -241,7 +376,7 @@ object DataPlaneHooks {
             """"units":${vocab.unitCount},"religions":${vocab.size(Vocab.RELIGIONS)},""" +
             """"eras":${vocab.size(Vocab.ERAS)},"policies":${vocab.policyCount},""" +
             """"policyBranches":${vocab.policyBranchCount},"promotions":${vocab.promotionCount},""" +
-            """"nations":${vocab.nationCount}""" +
+            """"nations":${vocab.nationCount},"unitIntents":${vocab.unitIntentCount}""" +
             """}"""
         // slot↔civId for the major civs (agnostic provenance) — lets the trainer filter to its
         // learner's steps even though turn-order shuffle varies civ_slot per game.
@@ -301,7 +436,9 @@ class ShardRecorder(
     fun recordStep(
         x: Civilization, obs: Observation, actions: FloatArray, behaviorLogp: FloatArray,
         constructionActions: FloatArray, constructionLogp: FloatArray, constructionEcon: FloatArray,
-        constructionCurrent: FloatArray, turn: Int,
+        constructionCurrent: FloatArray,
+        unitIntentAction: FloatArray, unitIntentLogp: FloatArray, unitIntentCurrent: FloatArray,
+        phi: Float, turn: Int,
     ) {
         val isFirst = seenCivs.add(x.civID)
         val civSlot = gameInfo.civilizations.indexOf(x)
@@ -314,7 +451,10 @@ class ShardRecorder(
             Observation.Block(SampleSchema.BLOCK_CONSTRUCTION_LOGP, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionLogp) +
             Observation.Block(SampleSchema.BLOCK_ECON_CITY, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionEcon) +
             Observation.Block(SampleSchema.BLOCK_CONSTRUCTION_CURRENT, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, constructionCurrent) +
-            Observation.Block(SampleSchema.BLOCK_PHI, SampleSchema.DT_F32, BlockKind.FIXED, 0, floatArrayOf(economyPotential(x)))
+            Observation.Block(SampleSchema.BLOCK_UNIT_INTENT_ACTION, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, unitIntentAction) +
+            Observation.Block(SampleSchema.BLOCK_UNIT_INTENT_LOGP, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, unitIntentLogp) +
+            Observation.Block(SampleSchema.BLOCK_UNIT_INTENT_CURRENT, SampleSchema.DT_F32, BlockKind.VARIABLE, 1, unitIntentCurrent) +
+            Observation.Block(SampleSchema.BLOCK_PHI, SampleSchema.DT_F32, BlockKind.FIXED, 0, floatArrayOf(phi))
         if (!opened) {
             layout = blocks
             val header = DataPlaneHooks.buildHeaderJson(gameInfo, fingerprint, gameId, seed, config.caps, blocks, vocab)
@@ -324,23 +464,6 @@ class ShardRecorder(
         }
         emitter.record(framePayload(turn, civSlot, isFirst = isFirst, isLast = false, isTerminal = false,
             overflow = obs.overflow, reward = 0f, blocks = blocks))
-    }
-
-    /** v7.2: the civ's log-stabilized ECONOMY POTENTIAL Φ(s) — ln(1+Σprod)+ln(1+Σfood)+ln(1+Σscience)
-     *  over its cities + ln(1+#techs). The ln keeps Φ bounded so the potential-based shaping reward
-     *  F = γ·Φ(s')−Φ(s) the trainer forms cannot drift-dominate the terminal ±1. Reads the cached
-     *  per-city currentCityStats (good enough — PBRS is policy-invariant for any Φ that tracks strength). */
-    private fun economyPotential(x: Civilization): Float {
-        var prod = 0.0; var food = 0.0; var sci = 0.0
-        for (c in x.cities) {
-            val s = c.cityStats.currentCityStats
-            prod += s.production.toDouble(); food += s.food.toDouble(); sci += s.science.toDouble()
-        }
-        // Clamp the yield sums to ≥0 before ln: a starving city has NEGATIVE food, so a net-negative sum
-        // would make ln(1+Σ) = NaN → NaN shaping reward → non-finite loss → the divergence guard skips the
-        // round. coerceAtLeast(0) keeps Φ finite (low = weak economy, the correct potential semantics).
-        return (ln(1.0 + prod.coerceAtLeast(0.0)) + ln(1.0 + food.coerceAtLeast(0.0)) + ln(1.0 + sci.coerceAtLeast(0.0))
-            + ln(1.0 + x.tech.getNumberOfTechsResearched())).toFloat()
     }
 
     /** Emit one terminal reward-carrier per recorded civ: isTerminal=1, reward=±1 (winner/loser) or

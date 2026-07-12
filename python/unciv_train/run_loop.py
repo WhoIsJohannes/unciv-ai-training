@@ -45,10 +45,12 @@ def gradle_selfplay(args: list[str], timeout: float) -> str:
 
 
 def generate(model: str, out_dir: Path, n: int, max_turns: int, threads: int, seed: int,
-             timeout: float, map_size: str = "Tiny", control_construction: bool = False) -> int:
+             timeout: float, map_size: str = "Tiny", control_construction: bool = False,
+             control_unit_intent: bool = False) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     out = gradle_selfplay(["gen", model, str(out_dir), str(n), str(max_turns), str(threads),
-                           str(seed), map_size, str(control_construction).lower()], timeout)
+                           str(seed), map_size, str(control_construction).lower(),
+                           str(control_unit_intent).lower()], timeout)
     m = GEN_RE.search(out)
     if not m:
         sys.stderr.write(out[-4000:])
@@ -57,9 +59,11 @@ def generate(model: str, out_dir: Path, n: int, max_turns: int, threads: int, se
 
 
 def evaluate(model: Path, m_games: int, max_turns: int, threads: int, seed: int,
-             timeout: float, map_size: str = "Tiny", control_construction: bool = False) -> dict:
+             timeout: float, map_size: str = "Tiny", control_construction: bool = False,
+             control_unit_intent: bool = False) -> dict:
     out = gradle_selfplay(["eval", str(model), str(m_games), str(max_turns), str(threads),
-                           str(seed), map_size, str(control_construction).lower()], timeout)
+                           str(seed), map_size, str(control_construction).lower(),
+                           str(control_unit_intent).lower()], timeout)
     m = EVAL_RE.search(out)
     if not m:
         sys.stderr.write(out[-4000:])
@@ -166,7 +170,9 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl, reward_shaping_coef=rsc,
             construction=(getattr(args, "control_construction", "off") == "on"),   # v7: train the per-city head only when ON
             construction_credit_coef=ccc,   # v7.3: >0 ⇒ per-city credit (separate per-city construction PG term)
-            bc_ref=bc_ref, construction_kl_coef=getattr(args, "construction_kl_coef", 0.0))  # v7.4 KL-to-clone leash
+            bc_ref=bc_ref, construction_kl_coef=getattr(args, "construction_kl_coef", 0.0),  # v7.4 KL-to-clone leash
+            unit_intent=(getattr(args, "control_unit_intent", "off") == "on"),   # v8: train the per-unit intent head only when ON
+            unit_kl_coef=getattr(args, "unit_kl_coef", 0.0))  # v8 KL-to-clone leash for the unit-intent head
         return net, stats, ("structured", token_specs), optimizer
     raise ValueError(f"unknown variant {variant!r}")
 
@@ -265,6 +271,11 @@ def main(argv=None) -> int:
                          "construction head) in gen+eval AND the trainer sums the construction logp into "
                          "the joint PPO ratio. 'off' ⇒ construction stays heuristic (the v6 / no-op path). "
                          "Only the STRUCTURED variant carries the head.")
+    ap.add_argument("--control-unit-intent", choices=["on", "off"], default="off",
+                    help="v8: when 'on', the policy DRIVES each controlled land-military unit's INTENT (which "
+                         "existing UnitAutomation behaviour to run; pathfinding stays heuristic) in gen+eval "
+                         "AND the trainer sums the unit-intent logp into the joint PPO ratio (shared advantage). "
+                         "'off' ⇒ units stay fully heuristic (the v7 / no-op path). Only STRUCTURED carries the head.")
     ap.add_argument("--reward-shaping-coef", type=float, default=0.0,
                     help="v7.2: potential-based reward shaping coefficient. Adds F = coef·(γ·Φ(s')−Φ(s)) "
                          "to each step, where Φ is the recorded log-stabilized economy potential. PBRS is "
@@ -290,6 +301,10 @@ def main(argv=None) -> int:
                     help="v7.4: KL-to-clone leash weight. When >0 (with --bc-pretrain-dir), penalize "
                          "KL(current construction || frozen BC clone) each RL epoch, anchoring the head "
                          "near the clone so finetune can't drift it back into the collapse basin. Try ~0.5.")
+    ap.add_argument("--unit-kl-coef", type=float, default=0.0,
+                    help="v8: KL-to-clone leash weight for the per-unit intent head. When >0 (with "
+                         "--bc-pretrain-dir), penalize KL(current unit-intent || frozen BC clone) each RL "
+                         "epoch — the direct analog of --construction-kl-coef for units. Try ~0.5.")
     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
     args = ap.parse_args(argv)
     if args.variant == "rich-v2":   # alias for the v4 structured encoder
@@ -341,19 +356,24 @@ def main(argv=None) -> int:
                                         rich=True, expected_spatial_channels=bc_ch)
         torch.manual_seed(0)
         bc_net = StructuredPolicyValueNet(bc_dims, bc_ts, bc_vc, **RUNGS[args.rung])
+        # v8: bc_pretrain_construction clones BOTH the construction AND unit-intent heads in one pass (when the
+        # net carries the unit-intent head) — one warm-start serves both heads + both KL leashes.
         bc_net, bc_stats = tr.bc_pretrain_construction(
             bc_net, bc_trajs, bc_dims, bc_ts, epochs=getattr(args, "bc_epochs", 8), lr=args.lr,
             micro_batch_steps=(args.micro_batch_steps or 512))
-        print(f"[bc] pretrained construction head on {len(bc_trajs)} heuristic trajectories "
-              f"({bc_stats['n']} steps): bc_loss={bc_stats['bc_loss']:.4f} bc_acc={bc_stats['bc_acc']:.3f}")
+        _uacc = bc_stats.get("bc_unit_acc")
+        print(f"[bc] pretrained per-entity heads on {len(bc_trajs)} heuristic trajectories "
+              f"({bc_stats['n']} steps): bc_loss={bc_stats['bc_loss']:.4f} bc_acc={bc_stats['bc_acc']:.3f}"
+              + (f" bc_unit_acc={_uacc:.3f}" if _uacc is not None else ""))
         warm_net = bc_net                # round 0 RL starts from the BC-warm net
-        # v7.4 KL leash: freeze a copy of the clone as the KL reference (anti-drift during RL finetune).
-        if getattr(args, "construction_kl_coef", 0.0) > 0:
+        # v7.4/v8 KL leash: freeze a copy of the clone as the KL reference (anti-drift during RL finetune).
+        if getattr(args, "construction_kl_coef", 0.0) > 0 or getattr(args, "unit_kl_coef", 0.0) > 0:
             import copy
             bc_ref = copy.deepcopy(bc_net).eval()
             for p in bc_ref.parameters():
                 p.requires_grad_(False)
-            print(f"[bc] KL-to-clone leash active (coef={args.construction_kl_coef})")
+            print(f"[bc] KL-to-clone leash active (construction_kl={getattr(args, 'construction_kl_coef', 0.0)} "
+                  f"unit_kl={getattr(args, 'unit_kl_coef', 0.0)})")
     # v6: recent-round replay window. The deque's maxlen gives the sliding window for free (appending the
     # (K+1)-th round evicts the oldest). K=1 ⇒ maxlen 1 ⇒ degenerates to the single-round batch (== v5).
     from collections import deque
@@ -382,7 +402,8 @@ def main(argv=None) -> int:
         gen_model = str(model_path) if model_path is not None else "random"
         n_games = generate(gen_model, round_dir, args.gen_games, args.turn_cap, args.threads,
                            args.gen_seed + r * 1000, args.gradle_timeout, args.map_size,
-                           control_construction=(args.control_construction == "on"))
+                           control_construction=(args.control_construction == "on"),
+                           control_unit_intent=(args.control_unit_intent == "on"))
 
         schema = round_dir / "schema.json"
         dims = contract.dims_from_schema(schema)
@@ -450,7 +471,8 @@ def main(argv=None) -> int:
 
         ev = evaluate(model_path, args.eval_games, args.turn_cap, args.threads, args.eval_seed,
                       args.gradle_timeout, args.map_size,
-                      control_construction=(args.control_construction == "on"))
+                      control_construction=(args.control_construction == "on"),
+                      control_unit_intent=(args.control_unit_intent == "on"))
         row = {"round": r, "games": ev["games"], "winrate": ev["winrate"], "pval": ev["pval"],
                "n_steps": stats.get("n", 0), "loss": stats.get("loss", 0.0),
                "value_loss": stats.get("value_loss", 0.0), "entropy": stats.get("entropy", 0.0),

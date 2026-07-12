@@ -41,6 +41,11 @@ data class SampleConfig(
     /** v7: when true, the installed policy DRIVES each deciding city's production (per-city construction
      *  head); off ⇒ construction stays heuristic (the no-op / v6 path). MUST default off. */
     val controlConstruction: Boolean = false,
+    /** v8: when true, the installed policy DRIVES each controlled land-military unit's INTENT (which
+     *  existing `UnitAutomation` behaviour to run; pathfinding stays heuristic); off ⇒ units stay fully
+     *  heuristic (the no-op / v7 path). MUST default off. When ON, the per-civ-turn frame is emitted at
+     *  turn-END (after `automateUnits`) so the recorded intent == the realized executed intent. */
+    val controlUnitIntent: Boolean = false,
     /** v7.1b (default OFF — rejected as a standalone fix): restrict the policy's construction choice to
      *  BUILDINGS (mask out units in `mask_construction` when [controlConstruction]); units fall back to
      *  the heuristic. Dodges the credit problem rather than solving it — superseded by v7.2 PBRS, which

@@ -33,5 +33,10 @@ class RoutingPolicy(
     override fun chooseConstructionWithLogp(civ: Civilization, city: City, cityRow: Int, legalMask: BooleanArray, turn: Int): Pair<Int, Float> =
         forCiv(civ).chooseConstructionWithLogp(civ, city, cityRow, legalMask, turn)
 
+    /** v8 — route per-unit intent to the civ's policy (learner net vs opponent uniform), so the recorded
+     *  intent log-prob is the routed policy's TRUE sampling logp, not the abstain default. */
+    override fun chooseUnitIntentWithLogp(civ: Civilization, unit: MapUnit, unitRow: Int, legalMask: BooleanArray, turn: Int): Pair<Int, FloatArray> =
+        forCiv(civ).chooseUnitIntentWithLogp(civ, unit, unitRow, legalMask, turn)
+
     override fun actUnit(unit: MapUnit) = forCiv(unit.civ).actUnit(unit)
 }

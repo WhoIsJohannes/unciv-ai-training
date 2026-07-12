@@ -128,9 +128,10 @@ def test_ac6_warm_net_matches_exported_onnx(tmp_path):
     # the value head is train-only and dropped at export, so it is NOT part of the parity surface.
     sess = ort.InferenceSession(str(onnx_path))
     out_names = [o.name for o in sess.get_outputs()]
-    # v7: the STRUCTURED export emits tech + policy + the per-city construction head; value still dropped.
-    assert set(out_names) == {C.OUTPUT_TECH, C.OUTPUT_POLICY, C.OUTPUT_CONSTRUCTION}, \
-        f"structured export must expose tech+policy+construction (value dropped); got {out_names}"
+    # v7/v8: the STRUCTURED export emits tech + policy + the per-city construction head + the per-unit intent
+    # head; both value heads are train-only and dropped.
+    assert set(out_names) == {C.OUTPUT_TECH, C.OUTPUT_POLICY, C.OUTPUT_CONSTRUCTION, C.OUTPUT_UNIT_INTENT}, \
+        f"structured export must expose tech+policy+construction+unit_intent (values dropped); got {out_names}"
 
     inputs = build_rich_batch([traj], dims, _TS)            # the SAME inputs for both forwards
     net.eval()

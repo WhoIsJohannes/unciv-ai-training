@@ -43,6 +43,19 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
             val sorted = civ.cities.sortedBy { it.id }
             return if (sorted.size > maxOwnCities) sorted.take(maxOwnCities) else sorted
         }
+
+        /**
+         * v8: the canonical `own_units` order — `civ.units.getCivUnits().sortedBy{it.id}`, truncated at
+         * [maxOwnUnits]. The SINGLE source of this ordering, reused by the featurizer (`own_units` tokens +
+         * `mask_unit_intent`), the control decision loop ([DataPlaneHooks.chooseAndApply]), and the recorder,
+         * so the per-unit intent decision at row `i` aligns row-for-row with `mask_unit_intent[i]` /
+         * `own_units[i]`. Sorted by the STABLE [MapUnit.id] (NOT `currentTile.zeroBasedIndex`, which moves as
+         * the unit moves) so a unit maps to the same row at turn-start featurization and at act-time dispatch.
+         */
+        fun orderedOwnUnits(civ: Civilization, maxOwnUnits: Int): List<MapUnit> {
+            val sorted = civ.units.getCivUnits().sortedBy { it.id }.toList()
+            return if (sorted.size > maxOwnUnits) sorted.take(maxOwnUnits) else sorted
+        }
     }
 
     fun observe(x: Civilization): Observation {
@@ -101,8 +114,10 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
         val spyTech = flatten(spyRows, vocab.techCount)
 
         // ---- own + opponent units (tile-gated) ----
-        val ownUnitList = x.units.getCivUnits().sortedBy { it.currentTile.zeroBasedIndex }.toList()
-            .let { if (it.size > caps.maxOwnUnits) { overflow = true; it.take(caps.maxOwnUnits) } else it }
+        // v8: orderedOwnUnits is THE canonical order (shared w/ the unit-intent control loop + recorder),
+        // sorted by the STABLE unit id so a unit keeps its row as it moves during automateUnits.
+        val ownUnitList = orderedOwnUnits(x, caps.maxOwnUnits)
+        if (x.units.getCivUnitsSize() > caps.maxOwnUnits) overflow = true
         val ownUnits = FloatArray(ownUnitList.size * unitTokenWidth)
         ownUnitList.forEachIndexed { i, u -> writeUnitToken(ownUnits, i * unitTokenWidth, u, x, true, ownerSlot) }
 
@@ -135,6 +150,14 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
         ownUnitList.forEachIndexed { i, u ->
             val m = LegalActionMasks.promotionMask(u, vocab); for (k in m.indices) if (m[k]) promotion[i * promoW + k] = 1f
         }
+        // v8: per-unit INTENT legality mask, aligned to own_units. All-zero for non-(land-military) units
+        // (they are not modeled — the intent head only controls land-military units). Emitted in BOTH arms:
+        // the OFF/BC-gen arm needs it to legal-mask the behavior-cloning cross-entropy.
+        val intentW = vocab.unitIntentCount
+        val unitIntent = FloatArray(ownUnitList.size * intentW)
+        ownUnitList.forEachIndexed { i, u ->
+            val m = LegalActionMasks.unitIntentMask(u); for (k in m.indices) if (m[k]) unitIntent[i * intentW + k] = 1f
+        }
         val voteMask = FloatArray(presentCivs.size) // 1 if a known major (votable) — present-civ aligned
         presentCivs.forEachIndexed { i, c -> if (c.isMajorCiv()) voteMask[i] = 1f }
 
@@ -156,6 +179,7 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
             varU8("mask_diplomaticVote", 1, voteMask),
             varU8("mask_construction", constrW, construction),
             varU8("mask_promotion", promoW, promotion),
+            varU8(SampleSchema.BLOCK_MASK_UNIT_INTENT, intentW, unitIntent),
         )
         return Observation(blocks, presentCivIndex, civTokenWidth, oppCityOwners, oppCityValues,
             oppUnitOwners, oppUnitValues, overflow)

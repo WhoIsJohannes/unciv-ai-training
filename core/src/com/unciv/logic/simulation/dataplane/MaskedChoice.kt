@@ -48,4 +48,22 @@ object MaskedChoice {
         // chosen action's exp underflowed to 0 — and exactly matches Python's F.log_softmax (parity).
         return legal[pos] to ((logits[legal[pos]] - maxL).toDouble() - ln(sum)).toFloat()
     }
+
+    /**
+     * v8 — the FULL masked log-softmax vector `log π(k)` for every index (0f for illegal k), over the
+     * SAME legal-masked softmax as [chooseWithLogp] (identical numerically-stable form, so `result[chosen]`
+     * equals [chooseWithLogp]'s returned logp exactly). Used to record `log π_b(realized)` when the executed
+     * unit intent differs from the sampled one (dispatch fallback), and by the JVM↔Python parity check.
+     * Empty support → all-zero.
+     */
+    fun maskedLogSoftmax(logits: FloatArray, mask: BooleanArray): FloatArray {
+        val out = FloatArray(mask.size)
+        val legal = mask.indices.filter { it < logits.size && mask[it] }
+        if (legal.isEmpty()) return out
+        val maxL = legal.maxOf { logits[it] }
+        val sum = legal.sumOf { exp((logits[it] - maxL).toDouble()) }
+        val lnSum = ln(sum)
+        for (k in legal) out[k] = ((logits[k] - maxL).toDouble() - lnSum).toFloat()
+        return out
+    }
 }

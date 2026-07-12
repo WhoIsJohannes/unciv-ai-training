@@ -168,6 +168,24 @@ def _rich_step_blocks(blocks: dict, n_channels: int) -> dict:
     cc = blocks.get("construction_current")
     out["construction_current"] = (np.asarray(cc, dtype=np.float32).reshape(-1)
                                    if cc is not None else np.zeros(0, np.float32))
+    # v8: per-unit INTENT — the legal mask [nunits, intent_w] + the recorded REALIZED action / behavior logp
+    # [nunits] (−1 / 0 where the unit did not decide), aligned to own_units (orderedOwnUnits sortedBy{id}),
+    # plus `unit_intent_current` (the heuristic first-firing rung — the BC target). Same soft `.get()`
+    # fallbacks as construction (an OFF/legacy shard just yields empties ⇒ use_unit_intent=False downstream).
+    mu = blocks.get("mask_unit_intent")
+    mu = np.asarray(mu, dtype=np.float32) if mu is not None else np.zeros((0, 0), np.float32)
+    if mu.ndim == 1:
+        mu = mu.reshape(0, mu.shape[0] if mu.size else 0)
+    out["mask_unit_intent"] = mu
+    ua = blocks.get("unit_intent_action")
+    out["unit_intent_action"] = (np.asarray(ua, dtype=np.float32).reshape(-1)
+                                 if ua is not None else np.zeros(0, np.float32))
+    ul = blocks.get("unit_intent_logp")
+    out["unit_intent_logp"] = (np.asarray(ul, dtype=np.float32).reshape(-1)
+                               if ul is not None else np.zeros(0, np.float32))
+    uc = blocks.get("unit_intent_current")
+    out["unit_intent_current"] = (np.asarray(uc, dtype=np.float32).reshape(-1)
+                                  if uc is not None else np.zeros(0, np.float32))
     return out
 
 

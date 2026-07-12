@@ -17,6 +17,8 @@ import com.unciv.logic.civilization.diplomacy.DiplomacyFlags
 import com.unciv.logic.civilization.diplomacy.DiplomaticStatus
 import com.unciv.logic.map.mapunit.MapUnit
 import com.unciv.logic.map.tile.Tile
+import com.unciv.logic.simulation.dataplane.DataPlaneHooks
+import com.unciv.logic.simulation.dataplane.UnitIntent
 import com.unciv.models.UpgradeUnitAction
 import com.unciv.models.ruleset.unique.GameContext
 import com.unciv.models.ruleset.unique.UniqueType
@@ -35,7 +37,10 @@ object UnitAutomation {
         check(!unit.civ.isBarbarian) { "Barbarians is not allowed here." }
 
         // Might die next turn - move!
-        if (unit.getDamageFromTerrain() > 0 && tryHealUnit(unit)) return
+        // v8: `note` is a pure side-effect that records the executed INTENT for the self-play data plane
+        // (no-op unless a policy is actively recording this civ). It NEVER changes control flow, so the
+        // heuristic ladder stays byte-identical when uncontrolled.
+        if (unit.getDamageFromTerrain() > 0 && tryHealUnit(unit)) { note(unit, UnitIntent.HEAL); return }
 
 
         if (unit.isCivilian()) {
@@ -44,10 +49,10 @@ object UnitAutomation {
         }
 
         // AI upgrades units via UseGoldAutomation in NextTurnAutomation
-        if (unit.civ.isHuman() && tryUpgradeUnit(unit)) return
+        if (unit.civ.isHuman() && tryUpgradeUnit(unit)) { note(unit, UnitIntent.UPGRADE); return }
 
         //This allows for military units with certain civilian abilities to behave as civilians in peace and soldiers in war
-        if ((unit.hasUnique(UniqueType.BuildImprovements) || unit.hasUnique(UniqueType.FoundCity) || 
+        if ((unit.hasUnique(UniqueType.BuildImprovements) || unit.hasUnique(UniqueType.FoundCity) ||
                     unit.hasUnique(UniqueType.FoundPuppetCity) ||
                     unit.hasUnique(UniqueType.ReligiousUnit) || unit.hasUnique(UniqueType.CreateWaterImprovements))
             && !unit.civ.isAtWar()){
@@ -70,50 +75,126 @@ object UnitAutomation {
             return AirUnitAutomation.automateBomber(unit)
         }
 
+        // v8 CONTROLLED DISPATCH: for a controlled LAND-military unit, run ONLY the net's chosen intent's
+        // sub-routine. On success the executed intent == the net's choice (recorded via `note`). On failure
+        // (situation changed / not doable) fall THROUGH to the full heuristic ladder below, which records the
+        // realized fallback intent — so the recorded intent always equals what actually executed.
+        if (unit.baseUnit.isLandUnit && DataPlaneHooks.controlsUnitIntent(unit.civ)) {
+            val decided = DataPlaneHooks.decidedUnitIntent(unit)
+            if (decided != null && dispatchUnitIntent(unit, decided)) { note(unit, decided); return }
+        }
+
         // Accompany settlers
-        if (tryAccompanySettlerOrGreatPerson(unit)) return
+        if (tryAccompanySettlerOrGreatPerson(unit)) { note(unit, UnitIntent.ACCOMPANY); return }
 
-        if (tryGoToRuin(unit) && !unit.hasMovement()) return
+        if (tryGoToRuin(unit) && !unit.hasMovement()) { note(unit, UnitIntent.GO_TO_RUIN); return }
 
-        if (unit.health < 50 && (tryRetreat(unit) || tryHealUnit(unit))) return // do nothing but heal
+        if (unit.health < 50 && (tryRetreat(unit) || tryHealUnit(unit))) { note(unit, UnitIntent.HEAL); return } // do nothing but heal
 
         // If there are no enemies nearby and we can heal here, wait until we are at full health
-        if (unit.health < 100 && canUnitHealInTurnsOnCurrentTile(unit,2, 3)) return
+        if (unit.health < 100 && canUnitHealInTurnsOnCurrentTile(unit,2, 3)) { note(unit, UnitIntent.HEAL); return }
 
-        if (tryHeadTowardsOurSiegedCity(unit)) return
+        if (tryHeadTowardsOurSiegedCity(unit)) { note(unit, UnitIntent.DEFEND_SIEGED_CITY); return }
 
         // if a embarked melee unit can land and attack next turn, do not attack from water.
-        if (BattleHelper.tryDisembarkUnitToAttackPosition(unit)) return
+        if (BattleHelper.tryDisembarkUnitToAttackPosition(unit)) { note(unit, UnitIntent.ATTACK); return }
 
         // if there is an attackable unit in the vicinity, attack!
-        if (tryAttacking(unit)) return
+        if (tryAttacking(unit)) { note(unit, UnitIntent.ATTACK); return }
 
-        if (tryTakeBackCapturedCity(unit)) return
+        if (tryTakeBackCapturedCity(unit)) { note(unit, UnitIntent.RETAKE_CITY); return }
 
         // Focus all units without a specific target on the enemy city closest to one of our cities
-        if (HeadTowardsEnemyCityAutomation.tryHeadTowardsEnemyCity(unit)) return
+        if (HeadTowardsEnemyCityAutomation.tryHeadTowardsEnemyCity(unit)) { note(unit, UnitIntent.ADVANCE_ENEMY_CITY); return }
 
-        if (tryHeadTowardsEncampment(unit)) return
+        if (tryHeadTowardsEncampment(unit)) { note(unit, UnitIntent.ATTACK_ENCAMPMENT); return }
 
-        if (tryGarrisoningLandUnit(unit)) return
+        if (tryGarrisoningLandUnit(unit)) { note(unit, UnitIntent.GARRISON); return }
 
-        if (unit.health < 80 && tryHealUnit(unit)) return
+        if (unit.health < 80 && tryHealUnit(unit)) { note(unit, UnitIntent.HEAL); return }
 
         // move towards the closest reasonably attackable enemy unit within 3 turns of movement (and 5 tiles range)
-        if (tryAdvanceTowardsCloseEnemy(unit)) return
+        if (tryAdvanceTowardsCloseEnemy(unit)) { note(unit, UnitIntent.ADVANCE_CLOSE_ENEMY); return }
 
-        if (unit.health < 100 && tryHealUnit(unit)) return
+        if (unit.health < 100 && tryHealUnit(unit)) { note(unit, UnitIntent.HEAL); return }
 
-        if (tryPrepare(unit)) return
+        if (tryPrepare(unit)) { note(unit, UnitIntent.PREPARE); return }
 
         // else, try to go to unreached tiles
-        if (tryExplore(unit)) return
+        if (tryExplore(unit)) { note(unit, UnitIntent.EXPLORE); return }
 
-        if (tryFogBust(unit)) return
+        if (tryFogBust(unit)) { note(unit, UnitIntent.FOG_BUST); return }
 
         // Idle CS units should wander so they don't obstruct players so much
         if (unit.civ.isCityState)
             wander(unit, stayInTerritory = true)
+    }
+
+    /** v8: record the executed [intent] for [unit] into the self-play data plane. A pure side-effect —
+     *  a cheap no-op unless a policy is actively recording this unit's civ (see [DataPlaneHooks.noteUnitIntent]),
+     *  and it NEVER alters unit/game state, so the heuristic ladder is byte-identical when uncontrolled. */
+    private fun note(unit: MapUnit, intent: UnitIntent) = DataPlaneHooks.noteUnitIntent(unit, intent)
+
+    /**
+     * v8: run ONLY the sub-routine for [intent] (the net's chosen behaviour for this LAND-military unit).
+     * Returns whether it did something (its `tryX` returned true). Pathfinding lives inside the sub-routines
+     * — v8 adds NO movement/target logic. Mirrors the `automateUnitMoves` rung → `tryX` mapping.
+     */
+    private fun dispatchUnitIntent(unit: MapUnit, intent: UnitIntent): Boolean = when (intent) {
+        UnitIntent.HEAL -> tryHealUnit(unit)
+        UnitIntent.UPGRADE -> tryUpgradeUnit(unit)
+        UnitIntent.ACCOMPANY -> tryAccompanySettlerOrGreatPerson(unit)
+        UnitIntent.GO_TO_RUIN -> tryGoToRuin(unit)
+        UnitIntent.DEFEND_SIEGED_CITY -> tryHeadTowardsOurSiegedCity(unit)
+        UnitIntent.ATTACK -> BattleHelper.tryDisembarkUnitToAttackPosition(unit) || tryAttacking(unit)
+        UnitIntent.RETAKE_CITY -> tryTakeBackCapturedCity(unit)
+        UnitIntent.ADVANCE_ENEMY_CITY -> HeadTowardsEnemyCityAutomation.tryHeadTowardsEnemyCity(unit)
+        UnitIntent.ATTACK_ENCAMPMENT -> tryHeadTowardsEncampment(unit)
+        UnitIntent.GARRISON -> tryGarrisoningLandUnit(unit)
+        UnitIntent.ADVANCE_CLOSE_ENEMY -> tryAdvanceTowardsCloseEnemy(unit)
+        UnitIntent.PREPARE -> tryPrepare(unit)
+        UnitIntent.EXPLORE -> tryExplore(unit)
+        UnitIntent.FOG_BUST -> tryFogBust(unit)
+    }
+
+    /**
+     * v8: the per-unit INTENT legality mask (width [UnitIntent.COUNT], bit set ⇔ that intent is legal now),
+     * aligned to the [UnitIntent] ordinal space. Predicates mirror each rung's CHEAP early-out; the four rungs
+     * that pathfind immediately (ACCOMPANY / ATTACK / ADVANCE_CLOSE_ENEMY / EXPLORE) are included UNCONDITIONALLY
+     * — dispatch falls back to the ladder if not actually doable. Keeps ≥1 legal bit for every land-military
+     * unit (so the head never abstains). Called by the Featurizer for `mask_unit_intent`.
+     */
+    fun unitIntentMask(unit: MapUnit): BooleanArray {
+        val m = BooleanArray(UnitIntent.COUNT)
+        // Only LAND-military units are modeled (v1 scope); everything else gets an all-zero (no-legal) row.
+        if (!(unit.baseUnit.isLandUnit && unit.isMilitary())) return m
+        val civ = unit.civ
+        m[UnitIntent.HEAL.ordinal] = unit.health < 100
+        // UPGRADE is a human-only rung (line 47) ⇒ inert for AI civs.
+        m[UnitIntent.UPGRADE.ordinal] = civ.isHuman() && getUnitsToUpgradeTo(unit).any()
+        m[UnitIntent.ACCOMPANY.ordinal] = true                                   // expensive precondition ⇒ unconditional
+        m[UnitIntent.GO_TO_RUIN.ordinal] = civ.isMajorCiv() &&
+            unit.viewableTiles.any { it.tileImprovement?.isAncientRuinsEquivalent(unit.cache.state) == true }
+        m[UnitIntent.DEFEND_SIEGED_CITY.ordinal] = civ.cities.any { it.health < it.getMaxHealth() }
+        m[UnitIntent.ATTACK.ordinal] = true                                      // needs an attackable enemy in range ⇒ unconditional
+        m[UnitIntent.RETAKE_CITY.ordinal] = civ.getKnownCivs().any { other ->
+            civ.isAtWarWith(other) && other.cities.any { it.foundingCivObject == civ && it.isInResistance() && it.health < it.getMaxHealth() }
+        }
+        m[UnitIntent.ADVANCE_ENEMY_CITY.ordinal] = civ.cities.isNotEmpty() && civ.isAtWar() &&
+            civ.getKnownCivs().any { civ.isAtWarWith(it) && it.cities.any() }
+        m[UnitIntent.ATTACK_ENCAMPMENT.ordinal] = !unit.hasUnique(UniqueType.SelfDestructs) &&
+            civ.cities.asSequence().flatMap { it.getCenterTile().getTilesInDistance(6) }
+                .any { it.improvement == Constants.barbarianEncampment && civ.hasExplored(it) }
+        m[UnitIntent.GARRISON.ordinal] = !unit.baseUnit.isWaterUnit &&
+            (unit.getTile().isCityCenter() || civ.cities.any { it.getCenterTile().militaryUnit == null })
+        m[UnitIntent.ADVANCE_CLOSE_ENEMY.ordinal] = true                         // 3-turn pathfind ⇒ unconditional
+        m[UnitIntent.PREPARE.ordinal] = civ.getKnownCivs().any { other ->
+            other.isAtWarWith(civ) || civ.getDiplomacyManager(other)?.hasFlag(DiplomacyFlags.Denunciation) == true
+        }
+        m[UnitIntent.EXPLORE.ordinal] = true                                     // pathfinds immediately ⇒ unconditional
+        m[UnitIntent.FOG_BUST.ordinal] = Automation.afraidOfBarbarians(civ) &&
+            !unit.currentTile.getTilesInDistance(5).all { it.isVisible(civ) }
+        return m
     }
 
     @Readonly

@@ -76,6 +76,15 @@ class Vocab(ruleset: Ruleset) {
         else -> null
     }
 
+    /**
+     * v8 self-play CONTROL inverse for the per-unit INTENT head: map a chosen intent action index back
+     * to its [UnitIntent] name. The intent MASK space is the [UnitIntent] ordinal space directly
+     * (0-indexed, width [UnitIntent.COUNT]) — NO building/unit-style offset — so this is a plain section
+     * lookup. Out of range → null. Mirrors [constructionId] for the construction head.
+     */
+    fun unitIntentId(idx: Int): String? = id(UNIT_INTENTS, idx)
+    val unitIntentCount get() = size(UNIT_INTENTS)
+
     val techCount get() = size(TECHS)
     val buildingCount get() = size(BUILDINGS)
     val unitCount get() = size(UNITS)
@@ -99,6 +108,8 @@ class Vocab(ruleset: Ruleset) {
         const val ERAS = "eras"
         const val VICTORIES = "victories"
         const val RELIGIONS = "religions"
+        /** v8: the per-unit intent head vocabulary (code enum, not ruleset-derived). */
+        const val UNIT_INTENTS = "enum:UnitIntent"
 
         /**
          * The canonical, deterministic ordering used for BOTH vocab indexing and the ruleset
@@ -122,6 +133,7 @@ class Vocab(ruleset: Ruleset) {
             "enum:RankingType" to RankingType.entries.map { it.name },
             "enum:ResourceType" to ResourceType.entries.map { it.name },
             "enum:TerrainType" to TerrainType.entries.map { it.name },
+            UNIT_INTENTS to UnitIntent.ID_NAMES,   // v8 per-unit intent head vocabulary
             "schema:spatialChannels" to SampleSchema.SPATIAL_CHANNELS,
             "schema:demographics" to SampleSchema.DEMOGRAPHIC_CATEGORIES,
             "schema:maskHeads" to SampleSchema.MASK_HEADS,

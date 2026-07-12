@@ -26,6 +26,8 @@ OUTPUT_TECH = "tech_logits"
 OUTPUT_POLICY = "policy_logits"
 # v7: per-city construction head output [batch, n_own_cities, constr_w] — only on the STRUCTURED export.
 OUTPUT_CONSTRUCTION = "construction_logits"
+# v8: per-unit intent head output [batch, n_own_units, intent_w] — only on the STRUCTURED export.
+OUTPUT_UNIT_INTENT = "unit_intent_logits"
 MODELED_HEADS = ["tech", "policy"]
 
 # Contract v2 named multi-tensor inputs. Token sets each pair with a "<name>_mask" presence mask.
@@ -59,6 +61,7 @@ META_INPUT_WIDTH = "input_width"
 META_TECH_WIDTH = "tech_width"
 META_POLICY_WIDTH = "policy_width"
 META_CONSTRUCTION_WIDTH = "construction_width"   # v7: per-city head width (buildings+units) for the JVM dim cross-check
+META_UNIT_INTENT_WIDTH = "unit_intent_width"     # v8: per-unit intent head width (UnitIntent.COUNT) for the JVM dim cross-check
 META_INPUT_NAMES = "input_names"   # comma-joined ordered tensor names (contract v2)
 
 # Learner identity (the pinned nation Constants.simulationCiv1). The trainer filters shards to this
@@ -158,6 +161,6 @@ def vocab_counts_from_schema(schema_path: str | Path) -> dict:
         "terrains": "terrain", "resources": "resource", "improvements": "improvement",
         "religions": "religion", "eras": "era", "buildings": "building", "units": "unit",
         "promotions": "promotion", "nations": "nation", "policies": "policy",
-        "policyBranches": "policyBranch",
+        "policyBranches": "policyBranch", "unitIntents": "unitIntent",
     }
     return {_ALIASES.get(str(k), str(k)): int(v) for k, v in vc.items()}

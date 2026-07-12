@@ -156,12 +156,13 @@ object SelfPlayRunner {
         val seed = args.getOrNull(6)?.toLongOrNull() ?: 1L
         val mapSizeName = args.getOrNull(7) ?: "Tiny"
         val controlConstruction = args.getOrNull(8)?.toBooleanStrictOrNull() ?: false  // v7 positional flag
+        val controlUnitIntent = args.getOrNull(9)?.toBooleanStrictOrNull() ?: false    // v8 positional flag
 
         val ruleset = setupRuleset()
         val fingerprint = RulesetFingerprint.compute(ruleset)
         val vocab = Vocab(ruleset)
         val config = SampleConfig(enabled = true, outputDir = outDir, deterministicShuffle = true,
-            caps = SampleCaps.DEFAULT, controlConstruction = controlConstruction)
+            caps = SampleCaps.DEFAULT, controlConstruction = controlConstruction, controlUnitIntent = controlUnitIntent)
         DataPlaneHooks.startupCheck(config, fingerprint)
 
         val learner: PolicyProvider =
@@ -190,13 +191,14 @@ object SelfPlayRunner {
         val seed = args.getOrNull(5)?.toLongOrNull() ?: 999_000L
         val mapSizeName = args.getOrNull(6) ?: "Tiny"
         val controlConstruction = args.getOrNull(7)?.toBooleanStrictOrNull() ?: false  // v7 positional flag
+        val controlUnitIntent = args.getOrNull(8)?.toBooleanStrictOrNull() ?: false    // v8 positional flag
 
         val ruleset = setupRuleset()
         val fingerprint = RulesetFingerprint.compute(ruleset)
         val vocab = Vocab(ruleset)
         // Control-only (no shards): emit=false because config.enabled=false.
         val config = SampleConfig(enabled = false, deterministicShuffle = true,
-            caps = SampleCaps.DEFAULT, controlConstruction = controlConstruction)
+            caps = SampleCaps.DEFAULT, controlConstruction = controlConstruction, controlUnitIntent = controlUnitIntent)
 
         val onnx = OnnxPolicy(modelArg, vocab, config, DataPlaneHooks.defaultRngFor(), eval = true, SampleSchema.VERSION, fingerprint)
         val policy = RoutingPolicy(LEARNER, onnx, RandomPolicy(DataPlaneHooks.defaultRngFor()))
@@ -218,6 +220,7 @@ object SelfPlayRunner {
         val pval = if (games > 0) SimStats.binomialTest(wins.toDouble(), games.toDouble(), 0.5, "greater") else 1.0
         val decisions = onnx.decisionCount()
         val constructionFallbacks = onnx.constructionFallbackCount()
+        val unitIntentFallbacks = onnx.unitIntentFallbackCount()
         onnx.close()
         // D8 throughput fields: turns/s (data-gen rate) + ms/decision (ONNX forward cost proxy).
         val turnsPerSec = if (wallS > 0) turns / wallS else 0.0
@@ -227,6 +230,7 @@ object SelfPlayRunner {
                 "\"games\":$games,\"wins\":$wins,\"winrate\":$winrate,\"pval\":$pval," +
                 "\"learner\":\"$LEARNER\",\"seed\":$seed,\"onnx_decisions\":$decisions," +
                 "\"control_construction\":$controlConstruction,\"construction_fallbacks\":$constructionFallbacks," +
+                "\"control_unit_intent\":$controlUnitIntent,\"unit_intent_fallbacks\":$unitIntentFallbacks," +
                 "\"turns\":$turns,\"wall_clock_s\":$wallS,\"turns_per_sec\":$turnsPerSec,\"ms_per_decision\":$msPerDecision}"
         )
     }

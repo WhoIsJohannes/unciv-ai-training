@@ -65,6 +65,15 @@ object LegalActionMasks {
         return m
     }
 
+    /**
+     * v8 per-unit INTENT head: a bit per [UnitIntent] (width [UnitIntent.COUNT]), legal ⇔ that intent is
+     * currently applicable for [unit]. Delegates to `UnitAutomation.unitIntentMask` (which owns the `tryX`
+     * cheap preconditions). Unlike the construction/great-person masks the space is the fixed intent enum,
+     * not a ruleset vocab, so no [Vocab] is needed (decode via [Vocab.unitIntentId] for the ordinal→name map).
+     */
+    fun unitIntentMask(unit: MapUnit): BooleanArray =
+        com.unciv.logic.automation.unit.UnitAutomation.unitIntentMask(unit)
+
     private fun iterate(vocab: Vocab, category: String): List<Pair<String, Int>> =
         vocab.sections.first { it.first == category }.second.mapIndexed { i, name -> name to i }
 }

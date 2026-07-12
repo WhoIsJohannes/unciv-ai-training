@@ -50,16 +50,22 @@ class _RichPolicyOnly(nn.Module):
     trace a dict input), reassembles the dict the net expects, drops the value head. v7: when
     [with_construction] (structured nets), ALSO emits the per-city `construction_logits` output."""
 
-    def __init__(self, net: nn.Module, names: list[str], with_construction: bool = False):
+    def __init__(self, net: nn.Module, names: list[str], with_construction: bool = False,
+                 with_unit_intent: bool = False):
         super().__init__()
         self.net = net
         self.names = names
         self.with_construction = with_construction
+        self.with_unit_intent = with_unit_intent
 
     def forward(self, *tensors):
         inputs = {name: t for name, t in zip(self.names, tensors)}
         if self.with_construction:
-            tech, policy, construction, _city_value, _value = self.net(inputs, with_construction=True)
+            # v8: with_construction=True now returns the 6-tuple (+unit_intent before value). Drop both
+            # value heads; emit unit_intent as a 4th output when the net carries the v8 head.
+            tech, policy, construction, _city_value, unit_intent, _value = self.net(inputs, with_construction=True)
+            if self.with_unit_intent:
+                return tech, policy, construction, unit_intent
             return tech, policy, construction   # city_value + value are train-only, dropped from the export
         tech, policy, _value = self.net(inputs)
         return tech, policy
@@ -169,12 +175,18 @@ def export_rich(
     # [batch, n_own_cities, constr_w] (the n_own_cities axis is BOUND to the own_cities input's
     # dynamic label, so the output city axis tracks the input city count). Rich-v2 nets lack the head.
     with_construction = neighbors and hasattr(net, "construction_head")
+    # v8: the structured net also carries a per-unit intent head → emit `unit_intent_logits`
+    # [batch, n_own_units, intent_w] (the n_own_units axis is BOUND to the own_units input's dynamic label).
+    with_unit_intent = neighbors and hasattr(net, "unit_intent_head")
     output_names = [contract.OUTPUT_TECH, contract.OUTPUT_POLICY]
     if with_construction:
         output_names.append(contract.OUTPUT_CONSTRUCTION)
         dyn[contract.OUTPUT_CONSTRUCTION] = {0: "batch", 1: "n_own_cities"}
+    if with_unit_intent:
+        output_names.append(contract.OUTPUT_UNIT_INTENT)
+        dyn[contract.OUTPUT_UNIT_INTENT] = {0: "batch", 1: "n_own_units"}
 
-    wrapped = _RichPolicyOnly(net, names, with_construction)
+    wrapped = _RichPolicyOnly(net, names, with_construction, with_unit_intent)
     args = tuple(dummy[n] for n in names)  # POSITIONAL tensors in name order (ONNX-traceable)
     torch.onnx.export(
         wrapped, args, out_path,
@@ -194,6 +206,8 @@ def export_rich(
     }
     if with_construction:
         props[contract.META_CONSTRUCTION_WIDTH] = str(int(net.constr_w))
+    if with_unit_intent:
+        props[contract.META_UNIT_INTENT_WIDTH] = str(int(net.intent_w))
     model = onnx.load(out_path)
     onnx.helper.set_model_props(model, props)
     _atomic_save(model, out_path)

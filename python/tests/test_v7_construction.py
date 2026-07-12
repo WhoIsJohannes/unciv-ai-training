@@ -66,9 +66,10 @@ def _build_shard_v7(*, version, n_steps=3, n_cities=3, constr_w=5) -> bytes:
     return bytes(out)
 
 
-def test_schema_version_is_8():
-    """Lockstep bump landed on the Python side (mirrors Kotlin SampleSchema.VERSION). v8 = v7.4 BC target."""
-    assert SCHEMA_VERSION == 8, f"v7.4 requires SCHEMA_VERSION 8 (got {SCHEMA_VERSION})"
+def test_schema_version_is_9():
+    """Lockstep bump landed on the Python side (mirrors Kotlin SampleSchema.VERSION). v9 = v8 unit-intent
+    (bumped from v8 = v7.4 BC target)."""
+    assert SCHEMA_VERSION == 9, f"v8 unit-intent requires SCHEMA_VERSION 9 (got {SCHEMA_VERSION})"
 
 
 def test_construction_blocks_round_trip(tmp_path):
@@ -226,7 +227,7 @@ def test_construction_logits_ort_matches_torch():
         cnt = M if n == "own_cities" else 1
         inp[n] = torch.randn(1, cnt, _TS[n]); inp[n + "_mask"] = torch.ones(1, cnt)
     with torch.no_grad():
-        _t, _p, c_torch, _cv, _v = net(inp, with_construction=True)   # v7.3: forward is a 5-tuple (+city value)
+        _t, _p, c_torch, _cv, _ui, _v = net(inp, with_construction=True)   # v8: forward is a 6-tuple (+unit_intent)
     tmp = tempfile.mktemp(suffix=".onnx")
     export_rich(net, dims, _TS, tmp, schema_version=SCHEMA_VERSION, ruleset_fingerprint="fp",
                 sample_inputs={k: v.numpy() for k, v in inp.items()}, neighbors=True,

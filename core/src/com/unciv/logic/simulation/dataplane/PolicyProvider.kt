@@ -47,6 +47,19 @@ interface PolicyProvider {
      */
     fun chooseConstructionWithLogp(civ: Civilization, city: City, cityRow: Int, legalMask: BooleanArray, turn: Int): Pair<Int, Float> = -1 to 0f
 
+    /**
+     * v8 — per-ENTITY unit-intent decision: sample a legal INTENT for [unit] (row [unitRow] in the civ's
+     * [Featurizer.orderedOwnUnits]) from its [legalMask] (over the [UnitIntent] ordinal space), returning
+     * `(sampledIntentIdx, logpVector)`. The [sampledIntentIdx] (−1 = abstain) is DISPATCHED to that intent's
+     * `UnitAutomation.tryX`. The [logpVector] is the FULL masked log-softmax over the intent space (width
+     * [UnitIntent.COUNT], 0f for illegal) so the recorder can look up `log π_b(realized)` at turn-end — the
+     * EXECUTED intent may differ from the sampled one when dispatch falls back to the heuristic ladder.
+     *
+     * Default: ABSTAIN (`-1 to empty`) ⇒ the unit stays fully heuristic (the OFF / no-op path). [RandomPolicy]
+     * overrides uniform-over-legal; [OnnxPolicy] overrides with the net's masked-softmax sample + log-softmax.
+     */
+    fun chooseUnitIntentWithLogp(civ: Civilization, unit: MapUnit, unitRow: Int, legalMask: BooleanArray, turn: Int): Pair<Int, FloatArray> = -1 to FloatArray(0)
+
     /** Act on a unit. Default policies route this into the existing UnitAutomation sub-routines. */
     fun actUnit(unit: MapUnit)
 }
@@ -71,6 +84,17 @@ class RandomPolicy(private val rngFor: (Civilization, Int) -> Random) : PolicyPr
         if (legal.isEmpty()) return -1 to 0f
         val idx = legal[rngFor(civ, turn).nextInt(legal.size)]
         return idx to ln(1.0 / legal.size).toFloat()
+    }
+
+    /** v8: uniform-over-legal unit intent + its uniform log-prob vector (`ln(1/nLegal)` for each legal
+     *  intent, 0f elsewhere) — the opponent is "random" on unit intent the same way it is on construction. */
+    override fun chooseUnitIntentWithLogp(civ: Civilization, unit: MapUnit, unitRow: Int, legalMask: BooleanArray, turn: Int): Pair<Int, FloatArray> {
+        val legal = legalMask.indices.filter { legalMask[it] }
+        if (legal.isEmpty()) return -1 to FloatArray(0)
+        val idx = legal[rngFor(civ, turn).nextInt(legal.size)]
+        val lp = ln(1.0 / legal.size).toFloat()
+        val vec = FloatArray(legalMask.size); for (k in legal) vec[k] = lp
+        return idx to vec
     }
 
     override fun actUnit(unit: MapUnit) {
