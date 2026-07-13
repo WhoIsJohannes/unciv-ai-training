@@ -18,6 +18,7 @@ import com.unciv.models.ruleset.unit.BaseUnit
 import com.unciv.models.stats.Stat
 import com.unciv.ui.screens.victoryscreen.RankingType
 import com.unciv.utils.randomWeighted
+import yairm210.purity.annotations.Cache
 import yairm210.purity.annotations.Readonly
 import kotlin.math.max
 import kotlin.math.min
@@ -26,6 +27,15 @@ import kotlin.random.Random
 
 /** Class containing city-state-specific functions */
 class CityStateFunctions(val civInfo: Civilization) {
+
+    /** perf: constant per game — civs are never ADDED after GameStarter, and a destroyed city-state
+     *  keeps isCityState, so "any city-states in this game" can never flip. */
+    @Cache private var anyCityStatesInGame: Boolean? = null
+    @Readonly private fun gameHasCityStates(): Boolean {
+        var v = anyCityStatesInGame
+        if (v == null) { v = civInfo.gameInfo.civilizations.any { it.isCityState }; anyCityStatesInGame = v }
+        return v
+    }
 
     /** Attempts to initialize the city state, returning true if successful. */
     fun initCityState(ruleset: Ruleset, startingEra: String, usedMajorCivs: Sequence<Nation>, rng: Random): Boolean {
@@ -819,6 +829,7 @@ class CityStateFunctions(val civInfo: Civilization) {
         gameContext: GameContext
     ):Sequence<Unique> {
         if (civInfo.isCityState) return emptySequence()
+        if (!gameHasCityStates()) return emptySequence()   // perf: skip the 4-stage sequence build entirely
 
         return civInfo.getKnownCivs().filter { it.isCityState }
             .flatMap {
@@ -836,6 +847,7 @@ class CityStateFunctions(val civInfo: Civilization) {
     @Readonly
     fun forEachUniqueProvidedByCityStates(uniqueType: UniqueType, gameContext: GameContext, op: (unique: Unique) -> Unit) {
         if (civInfo.isCityState) return
+        if (!gameHasCityStates()) return
         civInfo.forEachKnownCiv {
             if (!it.isCityState) return@forEachKnownCiv
             // We don't use DiplomacyManager.getRelationshipLevel for performance reasons - it tries to calculate getTributeWillingness which is heavy

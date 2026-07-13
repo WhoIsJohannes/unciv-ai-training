@@ -116,30 +116,39 @@ class CivInfoTransientCache(val civInfo: Civilization) {
         }
 
 
-        val viewedCivs = HashMap<Civilization, Tile>()
-        for (tile in civInfo.viewableTiles) {
-            val tileOwner = tile.getOwner()
-            if (tileOwner != null) viewedCivs[tileOwner] = tile
-            val unitOwner = tile.getFirstUnit()?.civ
-            if (unitOwner != null) viewedCivs[unitOwner] = tile
-        }
-
         if (!civInfo.isBarbarian) {
-            for (entry in viewedCivs) {
-                val metCiv = entry.key
-                if (metCiv == civInfo || metCiv.isBarbarian || civInfo.diplomacy.containsKey(metCiv.civID)) continue
-                civInfo.diplomacyFunctions.makeCivilizationsMeet(metCiv)
-                if(!civInfo.isSpectator())
-                    civInfo.addNotification("We have encountered [${metCiv.civName}]!",
+            // The viewedCivs scan of all viewable tiles can only produce a meet if some unmet,
+            // non-barbarian civ still has tiles (requires cities) or units to be seen - a cheap
+            // check over the civ list; recomputed per call, so no stale-cache hazard.
+            val anyUnmetCivRemains = civInfo.gameInfo.civilizations.any {
+                it !== civInfo && !it.isBarbarian && !civInfo.diplomacy.containsKey(it.civID)
+                    && (it.cities.isNotEmpty() || it.units.getCivUnitsSize() > 0)
+            }
+            if (anyUnmetCivRemains) {
+                val viewedCivs = HashMap<Civilization, Tile>()
+                for (tile in civInfo.viewableTiles) {
+                    val tileOwner = tile.getOwner()
+                    if (tileOwner != null) viewedCivs[tileOwner] = tile
+                    val unitOwner = tile.getFirstUnit()?.civ
+                    if (unitOwner != null) viewedCivs[unitOwner] = tile
+                }
+
+                for (entry in viewedCivs) {
+                    val metCiv = entry.key
+                    if (metCiv == civInfo || metCiv.isBarbarian || civInfo.diplomacy.containsKey(metCiv.civID)) continue
+                    civInfo.diplomacyFunctions.makeCivilizationsMeet(metCiv)
+                    if(!civInfo.isSpectator())
+                        civInfo.addNotification("We have encountered [${metCiv.civName}]!",
+                            entry.value.position,
+                            NotificationCategory.Diplomacy, metCiv.civName,
+                            NotificationIcon.Diplomacy
+                        )
+                    metCiv.addNotification("We have encountered [${civInfo.civName}]!",
                         entry.value.position,
-                        NotificationCategory.Diplomacy, metCiv.civName,
+                        NotificationCategory.Diplomacy, civInfo.civName,
                         NotificationIcon.Diplomacy
                     )
-                metCiv.addNotification("We have encountered [${civInfo.civName}]!",
-                    entry.value.position,
-                    NotificationCategory.Diplomacy, civInfo.civName,
-                    NotificationIcon.Diplomacy
-                )
+                }
             }
 
             discoverNaturalWonders()
@@ -198,8 +207,18 @@ class CivInfoTransientCache(val civInfo: Civilization) {
             return
         }
 
-        val newViewableTiles = HashSet<Tile>(ourTilesAndNeighboringTiles)
-        newViewableTiles.addAll(civInfo.units.getCivUnits().flatMap { unit -> unit.viewableTiles.asSequence().filter { it.getOwner() != civInfo } })
+        // Presized set + plain loops - this runs per tile a unit moves through, so avoid the
+        // sequence machinery and the HashMap resize chain. No getOwner filter needed: every
+        // civ-owned tile is already in ourTilesAndNeighboringTiles (updateOurTiles runs on every
+        // ownership change), and HashSet.add is idempotent anyway.
+        var expectedSize = ourTilesAndNeighboringTiles.size
+        for (unit in civInfo.units.getCivUnits())
+            expectedSize += unit.viewableTiles.size
+        val newViewableTiles = HashSet<Tile>((expectedSize / 0.75f).toInt() + 1)
+        newViewableTiles.addAll(ourTilesAndNeighboringTiles)
+        for (unit in civInfo.units.getCivUnits())
+            for (tile in unit.viewableTiles)
+                newViewableTiles.add(tile)
 
         for (otherCiv in civInfo.getKnownCivs()) {
             if (otherCiv.allyCiv == civInfo || otherCiv == civInfo.allyCiv) {

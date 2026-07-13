@@ -67,12 +67,13 @@ tasks.register<JavaExec>("simBench") { // Headless throughput / training-data co
     jvmArgs = listOf("-Xmx4G", "-XX:+UseParallelGC", "-Xmn1500m", "-XX:ParallelGCThreads=6")
 }
 
-tasks.register<JavaExec>("selfPlay") { // Self-play GENERATE / EVAL / PARITY entrypoint (in-JVM ONNX)
+tasks.register<JavaExec>("selfPlay") { // Self-play GENERATE / EVAL / SERVE / PARITY entrypoint (in-JVM ONNX)
     dependsOn(tasks.getByName("classes"))
     mainClass.set("com.unciv.app.desktop.SelfPlayRunner")
     classpath = sourceSets.main.get().runtimeClasspath
     workingDir = assetsDir
     isIgnoreExitValue = true
+    standardInput = System.`in`   // serve mode reads commands from stdin (harmless for one-shot modes)
     // perf: batch-throughput GC — the sim churns 600-900MB/s of short-lived sequence/HashMap garbage;
     // ParallelGC + a large young gen collects it in cheap young GCs every few seconds instead of G1's
     // ~1/s cadence, and drops G1's mutator write barriers. GC cannot affect game decisions or the RNG

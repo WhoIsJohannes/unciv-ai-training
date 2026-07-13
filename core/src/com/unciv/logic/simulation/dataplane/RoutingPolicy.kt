@@ -23,6 +23,11 @@ class RoutingPolicy(
     override fun chooseIndex(head: String, civ: Civilization, legalMask: BooleanArray, turn: Int): Int =
         forCiv(civ).chooseIndex(head, civ, legalMask, turn)
 
+    /** perf — route the observation-injection hook so a routed OnnxPolicy can adopt the hooks'
+     *  observation instead of re-featurizing the same (game, civ, turn). */
+    override fun provideObservation(civ: Civilization, turn: Int, obs: Observation) =
+        forCiv(civ).provideObservation(civ, turn, obs)
+
     /** v6 — delegate the behavior log-prob to the routed policy too (do NOT inherit the uniform
      *  default, which would replace a routed net's true sampling logp with ln(1/nLegal)). */
     override fun chooseIndexWithLogp(head: String, civ: Civilization, legalMask: BooleanArray, turn: Int): Pair<Int, Float> =

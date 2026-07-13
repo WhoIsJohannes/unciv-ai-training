@@ -13,6 +13,15 @@ import yairm210.purity.annotations.Readonly
 
 object MovementCost {
 
+    /** ZoC can only bind when someone can exert it: an enemy city/military unit requires a war
+     *  (isAtWarWith over the diplomacy map) or barbarians in the game. At peace with everyone in a
+     *  no-barbarians game every per-edge ZoC neighbor scan is provably false — gate it out. A civ
+     *  still "at war" with a DEFEATED civ has no ZoC sources from it either (no cities, no units),
+     *  which matches isAtWar()'s !isDefeated filter. */
+    @Readonly
+    fun civMayFaceZoneOfControl(civ: Civilization): Boolean =
+        !civ.gameInfo.gameParameters.noBarbarians || civ.isAtWar()
+
     @Readonly
     fun getMovementCostBetweenAdjacentTilesEscort(
         unit: MapUnit,

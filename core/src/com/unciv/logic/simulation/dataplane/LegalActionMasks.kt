@@ -71,8 +71,8 @@ object LegalActionMasks {
      * cheap preconditions). Unlike the construction/great-person masks the space is the fixed intent enum,
      * not a ruleset vocab, so no [Vocab] is needed (decode via [Vocab.unitIntentId] for the ordinal→name map).
      */
-    fun unitIntentMask(unit: MapUnit): BooleanArray =
-        com.unciv.logic.automation.unit.UnitAutomation.unitIntentMask(unit)
+    fun unitIntentMask(unit: MapUnit, civBits: com.unciv.logic.automation.unit.UnitAutomation.CivIntentBits? = null): BooleanArray =
+        com.unciv.logic.automation.unit.UnitAutomation.unitIntentMask(unit, civBits)
 
     private fun iterate(vocab: Vocab, category: String): List<Pair<String, Int>> =
         vocab.sections.first { it.first == category }.second.mapIndexed { i, name -> name to i }

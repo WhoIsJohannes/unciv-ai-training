@@ -24,6 +24,7 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
     private val caps = config.caps
     private val fair = FairOpponentModel(vocab, ruleset, config)
     private val demographics = SampleSchema.DEMOGRAPHIC_CATEGORIES.map { RankingType.valueOf(it) }
+    @Transient private var spatialCoordsCache: FloatArray? = null   // per-game static (see buildSpatialCoords)
     private val channels = SampleSchema.NUM_SPATIAL_CHANNELS
 
     val civTokenWidth get() = fair.tokenWidth
@@ -155,8 +156,13 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
         // the OFF/BC-gen arm needs it to legal-mask the behavior-cloning cross-entropy.
         val intentW = vocab.unitIntentCount
         val unitIntent = FloatArray(ownUnitList.size * intentW)
+        // perf: the civ-level mask bits are identical for every land-military unit in this pass —
+        // compute them once, lazily on the first modeled unit (preserves the no-modeled-units case).
+        var civIntentBits: com.unciv.logic.automation.unit.UnitAutomation.CivIntentBits? = null
         ownUnitList.forEachIndexed { i, u ->
-            val m = LegalActionMasks.unitIntentMask(u); for (k in m.indices) if (m[k]) unitIntent[i * intentW + k] = 1f
+            if (civIntentBits == null && u.baseUnit.isLandUnit && u.isMilitary())
+                civIntentBits = com.unciv.logic.automation.unit.UnitAutomation.CivIntentBits(x)
+            val m = LegalActionMasks.unitIntentMask(u, civIntentBits); for (k in m.indices) if (m[k]) unitIntent[i * intentW + k] = 1f
         }
         val voteMask = FloatArray(presentCivs.size) // 1 if a known major (votable) — present-civ aligned
         presentCivs.forEachIndexed { i, c -> if (c.isMajorCiv()) voteMask[i] = 1f }
@@ -329,6 +335,9 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
      * Python hex-GNN adjacency builder reads this; it is NOT an ONNX model input.
      */
     private fun buildSpatialCoords(): FloatArray {
+        // perf: pure map geometry, frozen after setTransients — compute once per Featurizer (one per
+        // game); the array is only ever read (serialized / buffer-wrapped), never mutated downstream.
+        spatialCoordsCache?.let { return it }
         val tiles = gameInfo.tileMap.tileList
         val w = SampleSchema.NUM_SPATIAL_COORDS
         val out = FloatArray(tiles.size * w)
@@ -338,6 +347,7 @@ class Featurizer(private val gameInfo: GameInfo, val vocab: Vocab, val config: S
             out[base] = tile.position.x.toFloat()
             out[base + 1] = tile.position.y.toFloat()
         }
+        spatialCoordsCache = out
         return out
     }
 

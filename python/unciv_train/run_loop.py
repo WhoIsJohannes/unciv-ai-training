@@ -49,13 +49,107 @@ def gradle_selfplay(args: list[str], timeout: float) -> str:
     return out
 
 
+class JvmWorker:
+    """perf: persistent selfPlay JVM (`serve` mode) — ONE gradle+JVM spawn and ONE JIT warmup per job
+    instead of one per gen/eval phase (2×rounds spawns; the C2 tax alone was ~4% of each phase's CPU).
+    Commands are seed-scoped exactly like one-shot invocations (sessions opened/closed per command,
+    hooks uninstalled per Simulation teardown), so results are identical to spawn mode. Any error,
+    timeout, or unexpected death kills the worker; the next command respawns a clean JVM."""
+
+    _MARKERS = ("SELFPLAY_GEN_DONE", "EVAL_RESULT", "SERVE_ERROR")
+
+    def __init__(self):
+        self._p: subprocess.Popen | None = None
+
+    def _spawn(self, timeout: float) -> None:
+        import collections
+        env = dict(os.environ)
+        env.setdefault("JAVA_HOME", env.get("JAVA_HOME") or DEFAULT_JAVA_HOME)
+        cmd = [str(GRADLEW), "selfPlay", "--console=plain", "--args=serve"]
+        self._tail = collections.deque(maxlen=400)
+        # start_new_session ⇒ own process group, so kill() reaps the gradle→JVM tree, not just gradle
+        self._p = subprocess.Popen(cmd, cwd=str(REPO), env=env, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, bufsize=1, start_new_session=True)
+        self._read_until(("SERVE_READY",), timeout)   # engine bootstrap (rulesets etc.)
+
+    def _read_until(self, prefixes: tuple[str, ...], timeout: float) -> list[str]:
+        import select
+        deadline = time.time() + timeout
+        lines: list[str] = []
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                self.kill()
+                raise RuntimeError(f"serve worker timed out after {timeout:.0f}s waiting for {prefixes} "
+                                   f"(tail: {''.join(list(self._tail)[-20:])[-2000:]})")
+            ready, _, _ = select.select([self._p.stdout], [], [], min(remaining, 5.0))
+            if not ready:
+                continue
+            line = self._p.stdout.readline()
+            if line == "":   # EOF — worker died
+                self.kill()
+                raise RuntimeError(f"serve worker died (tail: {''.join(list(self._tail)[-20:])[-2000:]})")
+            self._tail.append(line)
+            lines.append(line)
+            if any(line.startswith(p) for p in prefixes):
+                return lines
+
+    def run(self, args: list[str], timeout: float) -> str:
+        """Run one gen/eval command; returns the output up to its marker line (same contract as
+        gradle_selfplay: the caller regex-scans for SELFPLAY_GEN_DONE / EVAL_RESULT)."""
+        if self._p is None or self._p.poll() is not None:
+            self._spawn(timeout)
+        try:
+            self._p.stdin.write(" ".join(args) + "\n")
+            self._p.stdin.flush()
+            lines = self._read_until(self._MARKERS, timeout)
+            if lines[-1].startswith("SERVE_ERROR"):
+                self.kill()   # the worker exits(1) after SERVE_ERROR by design — never reuse it
+                raise RuntimeError(f"serve command failed for args={args}: {lines[-1].strip()}")
+            self._read_until(("SERVE_READY",), 120.0)   # drain to idle so the next command starts clean
+            return "".join(lines)
+        except Exception:
+            self.kill()
+            raise
+
+    def kill(self) -> None:
+        import signal
+        p, self._p = self._p, None
+        if p is None or p.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            p.wait(timeout=10)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self._p is not None and self._p.poll() is None:
+            try:
+                self._p.stdin.write("quit\n")
+                self._p.stdin.flush()
+                self._p.wait(timeout=30)
+            except Exception:
+                pass
+        self.kill()
+
+
+def _selfplay(args: list[str], timeout: float, worker: "JvmWorker | None") -> str:
+    """Route one gen/eval command through the persistent worker when given, else one-shot gradle."""
+    return worker.run(args, timeout) if worker is not None else gradle_selfplay(args, timeout)
+
+
 def generate(model: str, out_dir: Path, n: int, max_turns: int, threads: int, seed: int,
              timeout: float, map_size: str = "Tiny", control_construction: bool = False,
-             control_unit_intent: bool = False) -> int:
+             control_unit_intent: bool = False, worker: "JvmWorker | None" = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = gradle_selfplay(["gen", model, str(out_dir), str(n), str(max_turns), str(threads),
-                           str(seed), map_size, str(control_construction).lower(),
-                           str(control_unit_intent).lower()], timeout)
+    out = _selfplay(["gen", model, str(out_dir), str(n), str(max_turns), str(threads),
+                     str(seed), map_size, str(control_construction).lower(),
+                     str(control_unit_intent).lower()], timeout, worker)
     m = GEN_RE.search(out)
     if not m:
         sys.stderr.write(out[-4000:])
@@ -65,10 +159,10 @@ def generate(model: str, out_dir: Path, n: int, max_turns: int, threads: int, se
 
 def evaluate(model: Path, m_games: int, max_turns: int, threads: int, seed: int,
              timeout: float, map_size: str = "Tiny", control_construction: bool = False,
-             control_unit_intent: bool = False) -> dict:
-    out = gradle_selfplay(["eval", str(model), str(m_games), str(max_turns), str(threads),
-                           str(seed), map_size, str(control_construction).lower(),
-                           str(control_unit_intent).lower()], timeout)
+             control_unit_intent: bool = False, worker: "JvmWorker | None" = None) -> dict:
+    out = _selfplay(["eval", str(model), str(m_games), str(max_turns), str(threads),
+                     str(seed), map_size, str(control_construction).lower(),
+                     str(control_unit_intent).lower()], timeout, worker)
     m = EVAL_RE.search(out)
     if not m:
         sys.stderr.write(out[-4000:])
@@ -325,6 +419,10 @@ def main(argv=None) -> int:
                     help="perf: torch intra-op thread cap (default $TORCH_THREADS or 8). Uncapped "
                          "torch (32 threads/trainer) was measured starving the sim JVMs to ~2-3 of "
                          "their 6 requested cores when several experiment arms run concurrently.")
+    ap.add_argument("--jvm-worker", choices=["serve", "spawn"], default="serve",
+                    help="perf: 'serve' (default) keeps ONE persistent selfPlay JVM for all gen/eval "
+                         "phases (no per-phase gradle+JVM spawn or cold JIT; identical seed-scoped "
+                         "results). 'spawn' restores the legacy one-JVM-per-phase invocation.")
     args = ap.parse_args(argv)
     # perf: cap trainer parallelism BEFORE any tensor work. interop must be set before the first
     # parallel op and raises if torch already initialized it — guard, don't crash a run over it.
@@ -358,6 +456,14 @@ def main(argv=None) -> int:
     if start_round == 0:
         with open(curve_csv, "w", newline="") as f:
             csv.writer(f).writerow(CURVE_COLS)
+
+    # perf: persistent selfPlay JVM for every gen/eval phase of this job (closed at process exit —
+    # atexit also fires on the loud abort paths, so no gradle/JVM orphans survive a failed run).
+    worker = None
+    if args.jvm_worker == "serve":
+        import atexit
+        worker = JvmWorker()
+        atexit.register(worker.close)
 
     warm_net = warm_opt = None       # v5: the persistent continual (net, optimizer) pair
     bc_ref = None                    # v7.4: frozen BC-clone KL-leash reference (set in the BC block)
@@ -438,7 +544,7 @@ def main(argv=None) -> int:
         n_games = generate(gen_model, round_dir, args.gen_games, args.turn_cap, args.threads,
                            args.gen_seed + r * 1000, args.gradle_timeout, args.map_size,
                            control_construction=(args.control_construction == "on"),
-                           control_unit_intent=(args.control_unit_intent == "on"))
+                           control_unit_intent=(args.control_unit_intent == "on"), worker=worker)
 
         schema = round_dir / "schema.json"
         dims = contract.dims_from_schema(schema)
@@ -521,7 +627,7 @@ def main(argv=None) -> int:
         ev = evaluate(model_path, args.eval_games, args.turn_cap, args.threads, args.eval_seed,
                       args.gradle_timeout, args.map_size,
                       control_construction=(args.control_construction == "on"),
-                      control_unit_intent=(args.control_unit_intent == "on"))
+                      control_unit_intent=(args.control_unit_intent == "on"), worker=worker)
         row = {"round": r, "games": ev["games"], "winrate": ev["winrate"], "pval": ev["pval"],
                "n_steps": stats.get("n", 0), "loss": stats.get("loss", 0.0),
                "value_loss": stats.get("value_loss", 0.0), "entropy": stats.get("entropy", 0.0),

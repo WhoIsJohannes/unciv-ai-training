@@ -188,6 +188,7 @@ object DataPlaneHooks {
         val config = state.featurizer.config
         val obs = state.featurizer.observe(civ)
         val turn = civ.gameInfo.turns
+        policy.provideObservation(civ, turn, obs)   // perf: OnnxPolicy adopts obs instead of re-featurizing
         val d = chooseAndApply(civ, policy, state.vocab, config, obs, turn)
         // v8: decide per-unit intents at turn-start (for dispatch during automateUnits) and DEFER the frame
         // emission to turn-end so the recorded intent equals the realized executed intent.

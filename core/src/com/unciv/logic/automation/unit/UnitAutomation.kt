@@ -164,35 +164,49 @@ object UnitAutomation {
      * — dispatch falls back to the ladder if not actually doable. Keeps ≥1 legal bit for every land-military
      * unit (so the head never abstains). Called by the Featurizer for `mask_unit_intent`.
      */
-    fun unitIntentMask(unit: MapUnit): BooleanArray {
+    /** perf — the CIV-level unit-intent mask inputs, identical for every land-military unit of the
+     *  civ within one featurize pass (no game mutation between units there); computed once per pass
+     *  instead of per unit. [afraidOfBarbarians]'s assignContinents(Ensure) side effect still fires
+     *  (once) — it is idempotent. */
+    class CivIntentBits(civ: Civilization) {
+        val defendSiegedCity = civ.cities.any { it.health < it.getMaxHealth() }
+        val retakeCity = civ.getKnownCivs().any { other ->
+            civ.isAtWarWith(other) && other.cities.any { it.foundingCivObject == civ && it.isInResistance() && it.health < it.getMaxHealth() }
+        }
+        val advanceEnemyCity = civ.cities.isNotEmpty() && civ.isAtWar() &&
+            civ.getKnownCivs().any { civ.isAtWarWith(it) && it.cities.any() }
+        val encampmentInReach = civ.cities.asSequence().flatMap { it.getCenterTile().getTilesInDistance(6) }
+            .any { it.improvement == Constants.barbarianEncampment && civ.hasExplored(it) }
+        val anyCityLacksGarrison = civ.cities.any { it.getCenterTile().militaryUnit == null }
+        val prepare = civ.getKnownCivs().any { other ->
+            other.isAtWarWith(civ) || civ.getDiplomacyManager(other)?.hasFlag(DiplomacyFlags.Denunciation) == true
+        }
+        val afraidOfBarbarians = Automation.afraidOfBarbarians(civ)
+    }
+
+    fun unitIntentMask(unit: MapUnit, civBits: CivIntentBits? = null): BooleanArray {
         val m = BooleanArray(UnitIntent.COUNT)
         // Only LAND-military units are modeled (v1 scope); everything else gets an all-zero (no-legal) row.
         if (!(unit.baseUnit.isLandUnit && unit.isMilitary())) return m
         val civ = unit.civ
+        val bits = civBits ?: CivIntentBits(civ)
         m[UnitIntent.HEAL.ordinal] = unit.health < 100
         // UPGRADE is a human-only rung (line 47) ⇒ inert for AI civs.
         m[UnitIntent.UPGRADE.ordinal] = civ.isHuman() && getUnitsToUpgradeTo(unit).any()
         m[UnitIntent.ACCOMPANY.ordinal] = true                                   // expensive precondition ⇒ unconditional
         m[UnitIntent.GO_TO_RUIN.ordinal] = civ.isMajorCiv() &&
             unit.viewableTiles.any { it.tileImprovement?.isAncientRuinsEquivalent(unit.cache.state) == true }
-        m[UnitIntent.DEFEND_SIEGED_CITY.ordinal] = civ.cities.any { it.health < it.getMaxHealth() }
+        m[UnitIntent.DEFEND_SIEGED_CITY.ordinal] = bits.defendSiegedCity
         m[UnitIntent.ATTACK.ordinal] = true                                      // needs an attackable enemy in range ⇒ unconditional
-        m[UnitIntent.RETAKE_CITY.ordinal] = civ.getKnownCivs().any { other ->
-            civ.isAtWarWith(other) && other.cities.any { it.foundingCivObject == civ && it.isInResistance() && it.health < it.getMaxHealth() }
-        }
-        m[UnitIntent.ADVANCE_ENEMY_CITY.ordinal] = civ.cities.isNotEmpty() && civ.isAtWar() &&
-            civ.getKnownCivs().any { civ.isAtWarWith(it) && it.cities.any() }
-        m[UnitIntent.ATTACK_ENCAMPMENT.ordinal] = !unit.hasUnique(UniqueType.SelfDestructs) &&
-            civ.cities.asSequence().flatMap { it.getCenterTile().getTilesInDistance(6) }
-                .any { it.improvement == Constants.barbarianEncampment && civ.hasExplored(it) }
+        m[UnitIntent.RETAKE_CITY.ordinal] = bits.retakeCity
+        m[UnitIntent.ADVANCE_ENEMY_CITY.ordinal] = bits.advanceEnemyCity
+        m[UnitIntent.ATTACK_ENCAMPMENT.ordinal] = !unit.hasUnique(UniqueType.SelfDestructs) && bits.encampmentInReach
         m[UnitIntent.GARRISON.ordinal] = !unit.baseUnit.isWaterUnit &&
-            (unit.getTile().isCityCenter() || civ.cities.any { it.getCenterTile().militaryUnit == null })
+            (unit.getTile().isCityCenter() || bits.anyCityLacksGarrison)
         m[UnitIntent.ADVANCE_CLOSE_ENEMY.ordinal] = true                         // 3-turn pathfind ⇒ unconditional
-        m[UnitIntent.PREPARE.ordinal] = civ.getKnownCivs().any { other ->
-            other.isAtWarWith(civ) || civ.getDiplomacyManager(other)?.hasFlag(DiplomacyFlags.Denunciation) == true
-        }
+        m[UnitIntent.PREPARE.ordinal] = bits.prepare
         m[UnitIntent.EXPLORE.ordinal] = true                                     // pathfinds immediately ⇒ unconditional
-        m[UnitIntent.FOG_BUST.ordinal] = Automation.afraidOfBarbarians(civ) &&
+        m[UnitIntent.FOG_BUST.ordinal] = bits.afraidOfBarbarians &&
             !unit.currentTile.getTilesInDistance(5).all { it.isVisible(civ) }
         return m
     }

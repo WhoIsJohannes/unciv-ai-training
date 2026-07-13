@@ -17,6 +17,14 @@ interface PolicyProvider {
     fun chooseIndex(head: String, civ: Civilization, legalMask: BooleanArray, turn: Int): Int
 
     /**
+     * Observation-injection hook: [DataPlaneHooks.handleCivTurn] calls this right after featurizing
+     * ([civ], [turn]) so a policy whose forward re-featurizes the SAME (gameId, civ, turn) — e.g.
+     * OnnxPolicy's per-civ-turn memo — can adopt [obs] instead of building an identical one. Purely
+     * an optimization seam: a policy that ignores it (the default) just re-featurizes as before.
+     */
+    fun provideObservation(civ: Civilization, turn: Int, obs: Observation) {}
+
+    /**
      * v6 — [chooseIndex] PLUS the behavior-policy log-prob log π_b(chosen | state) of the picked
      * action, recorded into the shard for off-policy replay. Default: delegate to [chooseIndex] and
      * return a UNIFORM-over-legal log-prob `ln(1/nLegal)` (idx<0 → 0f).

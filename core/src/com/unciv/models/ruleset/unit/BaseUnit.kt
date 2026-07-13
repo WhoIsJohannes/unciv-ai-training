@@ -251,7 +251,7 @@ class BaseUnit : RulesetObject(), INonPerpetualConstruction {
         if (civ.cache.uniqueUnits.any { it.replaces == name })
             yield(RejectionReasonType.ReplacedByOurUnique.toInstance("Our unique unit replaces this"))
 
-        if (isUnavailableBySettings(civ.gameInfo))
+        if (civ.gameInfo.isUnavailableBySettingsCached(this@BaseUnit))   // perf: memoized — constant per (object, game)
             yield(RejectionReasonType.DisabledBySetting.toInstance())
 
         if (hasUnique(UniqueType.Unbuildable, stateForConditionals))

@@ -111,8 +111,18 @@ class Tile : IsPartOfGameInfoSerialization {
 
     // This is for performance - since we access the neighbors of a tile ALL THE TIME,
     // and the neighbors of a tile never change, it's much more efficient to save the list once and for all!
-    @delegate:Transient
-    val neighbors: Sequence<Tile> by lazy { getTilesAtDistance(1).toList().asSequence() }
+    // Plain nullable field instead of `by lazy`: adjacency is immutable after TileMap.setTransients and
+    // tiles are accessed by a single game coroutine, so we don't need SynchronizedLazyImpl's volatile read
+    // per access; init stays on-demand because mapgen calls setTransients on partially-built maps.
+    @Transient @Cache
+    private var neighborsCache: Sequence<Tile>? = null
+    @get:Readonly
+    val neighbors: Sequence<Tile>
+        get() {
+            if (neighborsCache == null)
+                neighborsCache = getTilesAtDistance(1).toList().asSequence()
+            return neighborsCache!!
+        }
     // We have to .toList() so that the values are stored together once for caching,
     // and the toSequence so that aggregations (like neighbors.flatMap{it.units} don't take up their own space
 
@@ -1186,12 +1196,21 @@ class Tile : IsPartOfGameInfoSerialization {
     }
 
     fun setExplored(player: Civilization, isExplored: Boolean, explorerPosition: HexCoord? = null) {
+        // Hot path: updateViewableTiles re-explores every viewable tile on every unit move,
+        // so the already-explored case must stay a minimal no-op (Humans still track exploredRegion)
+        if (isExplored && exploredBy.contains(player.civID)) {
+            if (player.playerType == PlayerType.Human)
+                player.exploredRegion.checkTilePosition(position, explorerPosition)
+            return
+        }
+        setExploredChanged(player, isExplored, explorerPosition)
+    }
+
+    private fun setExploredChanged(player: Civilization, isExplored: Boolean, explorerPosition: HexCoord?) {
         if (isExplored) {
             // Disable the undo button if a new tile has been explored
-            if (!exploredBy.contains(player.civID)) {
-                GUI.clearUndoCheckpoints()
-                exploredBy = exploredBy.withItem(player.civID)
-            }
+            GUI.clearUndoCheckpoints()
+            exploredBy = exploredBy.withItem(player.civID)
 
             if (player.playerType == PlayerType.Human)
                 player.exploredRegion.checkTilePosition(position, explorerPosition)

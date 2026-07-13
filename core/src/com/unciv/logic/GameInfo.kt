@@ -40,6 +40,7 @@ import com.unciv.ui.screens.worldscreen.status.NextTurnProgress
 import com.unciv.utils.DebugUtils
 import com.unciv.utils.debug
 import com.unciv.utils.pseudoRandomUuid
+import com.unciv.models.ruleset.unique.IHasUniques
 import yairm210.purity.annotations.Readonly
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -147,6 +148,16 @@ class GameInfo : IsPartOfGameInfoSerialization, HasGameInfoSerializationVersion 
 
     @Transient
     private lateinit var difficultyObject: Difficulty // Since this is static game-wide, and was taking a large part of nextTurn
+
+    /** perf: memo for [IHasUniques.isUnavailableBySettings] — a pure function of game-start constants
+     *  (gameParameters / startingEra / modOptions uniques), but evaluated per building × city × turn
+     *  on the construction-candidacy hot path. Keyed by rule-object identity; one map per game. */
+    @Transient @yairm210.purity.annotations.Cache
+    private val settingsUnavailability = java.util.concurrent.ConcurrentHashMap<IHasUniques, Boolean>()
+
+    @Readonly
+    fun isUnavailableBySettingsCached(obj: IHasUniques): Boolean =
+        settingsUnavailability.computeIfAbsent(obj) { it.isUnavailableBySettings(this) }
 
     @Transient
     lateinit var speed: Speed

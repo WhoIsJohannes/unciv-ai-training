@@ -48,8 +48,12 @@ class AStar(
     /** Maximum number of tiles to search */
     var maxSize = Int.MAX_VALUE
 
-    /** Cache for storing the costs */
-    private val costCache = mutableMapOf<Pair<Tile,Tile>, Float>()
+    private val nTiles = startingPoint.tileMap.tileList.size
+
+    /** Cost per (tile, clock-direction) edge, NaN = not yet computed. Primitive replacement for the
+     *  old HashMap<Pair<Tile,Tile>, Float> which allocated a Pair + boxed Float per edge EVALUATION
+     *  (11.9% of the sim's total allocation pressure). */
+    private val costCache = FloatArray(nTiles * 6) { Float.NaN }
 
     /**
      * Retrieves the cost of moving to a given tile, utilizing a cache to improve efficiency.
@@ -60,7 +64,12 @@ class AStar(
      * @return The cost of moving between the tiles.
      */
     private fun getCost(from: Tile, to: Tile): Float {
-        return costCache.getOrPut(Pair(from, to)) { cost(from, to) }
+        val key = HexMath.tilesAndNeighborUniqueIndex(from, to)
+        val cached = costCache[key]
+        if (!cached.isNaN()) return cached
+        val computed = cost(from, to)
+        costCache[key] = computed
+        return computed
     }
 
     /**
@@ -85,15 +94,15 @@ class AStar(
     private val tilesReached = HashMap<Tile, Tile>()
 
     /**
-     * A map holding the cumulative cost to reach each tile.
+     * The cumulative cost to reach each tile, indexed by zeroBasedIndex; NaN = unreached.
      * This is used to calculate the most efficient path to a tile during the search process.
      */
-    private val cumulativeTileCost = HashMap<Tile, Float>()
+    private val cumulativeTileCost = FloatArray(nTiles) { Float.NaN }
 
     init {
         tilesToCheck.add(TilePriority(startingPoint, 0f))
         tilesReached[startingPoint] = startingPoint
-        cumulativeTileCost[startingPoint] = 0f
+        cumulativeTileCost[startingPoint.zeroBasedIndex] = 0f
     }
 
     /**
@@ -125,13 +134,12 @@ class AStar(
     fun nextStep() {
         if (tilesReached.size >= maxSize) { tilesToCheck.clear(); return }
         val currentTile = tilesToCheck.poll()?.tile ?: return
+        val currentCost = cumulativeTileCost[currentTile.zeroBasedIndex]
         for (neighbor in currentTile.neighbors) {
-            val newCost: Float = cumulativeTileCost[currentTile]!! + getCost(currentTile, neighbor)
-            if (predicate(neighbor) &&
-                (!cumulativeTileCost.containsKey(neighbor)
-                || newCost < (cumulativeTileCost[neighbor] ?: Float.MAX_VALUE))
-            ){
-                cumulativeTileCost[neighbor] = newCost
+            val newCost: Float = currentCost + getCost(currentTile, neighbor)
+            val neighborCost = cumulativeTileCost[neighbor.zeroBasedIndex]
+            if (predicate(neighbor) && (neighborCost.isNaN() || newCost < neighborCost)) {
+                cumulativeTileCost[neighbor.zeroBasedIndex] = newCost
                 val priority: Float = newCost + heuristic(currentTile, neighbor)
                 tilesToCheck.add(TilePriority(neighbor, priority))
                 tilesReached[neighbor] = currentTile

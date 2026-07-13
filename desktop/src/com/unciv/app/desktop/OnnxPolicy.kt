@@ -117,6 +117,17 @@ class OnnxPolicy(
     )
     private val memo = ThreadLocal<Memo?>()
 
+    /** perf — the observation [DataPlaneHooks.handleCivTurn] just built for this (game, civ, turn),
+     *  adopted by [forwardCached] instead of re-featurizing an identical one (observe() ran twice
+     *  per controlled civ-turn). ThreadLocal: games run one-per-thread, like [memo]. */
+    private val providedObs = ThreadLocal<Pair<String, Observation>?>()
+
+    override fun provideObservation(civ: Civilization, turn: Int, obs: Observation) {
+        providedObs.set(memoKey(civ, turn) to obs)
+    }
+
+    private fun memoKey(civ: Civilization, turn: Int) = "${civ.gameInfo.gameId}|${civ.civID}|$turn"
+
     /** Net decisions actually made (index ≥ 0). EVAL asserts this is > 0 to confirm the learner civ
      *  was really routed to the net (routing-held check, FND-0028). */
     private val decisions = java.util.concurrent.atomic.AtomicLong(0)
@@ -184,10 +195,14 @@ class OnnxPolicy(
 
     /** The ONE memoized forward per (game, civ, turn), reused by tech/policy/construction calls. */
     private fun forwardCached(civ: Civilization, turn: Int): Memo {
-        val key = "${civ.gameInfo.gameId}|${civ.civID}|$turn"
+        val key = memoKey(civ, turn)
         val cached = memo.get()
         if (cached != null && cached.key == key) return cached
-        val obs = Featurizer(civ.gameInfo, vocab, config).observe(civ)
+        // perf: adopt the hooks-provided observation for this exact key (identical Featurizer inputs
+        // — the same game, civ, turn, vocab, config); re-featurize only on a cold/foreign key.
+        val provided = providedObs.get()
+        val obs = if (provided != null && provided.first == key) provided.second
+                  else Featurizer(civ.gameInfo, vocab, config).observe(civ)
         val m = if (rich) forwardRich(key, obs, if (structured) civ.gameInfo.tileMap else null)
                 else forward(key, obs.block("global") + obs.block("acting_civ"))
         memo.set(m)
@@ -209,13 +224,29 @@ class OnnxPolicy(
         }
     }
 
+    /** perf — hex adjacency is static per map: cache the computed (index, mask) arrays per TileMap
+     *  and only wrap them into fresh OnnxTensors per forward (createTensor copies the buffer; the
+     *  caller still closes the tensors). WeakHashMap so entries die with their game; synchronized —
+     *  the policy is shared by all worker threads (a lost race just recomputes a pure function). */
+    private val neighborArrays: MutableMap<TileMap, Pair<LongArray, FloatArray>> =
+        java.util.Collections.synchronizedMap(java.util.WeakHashMap())
+
+    private fun neighborTensorsCached(tileMap: TileMap): Pair<OnnxTensor, OnnxTensor> {
+        val (idx, mask) = neighborArrays.getOrPut(tileMap) { buildNeighborArrays(tileMap) }
+        val n = tileMap.tileList.size.toLong()
+        val deg = SampleSchema.OnnxContract.HEX_DEGREE.toLong()
+        val idxT = OnnxTensor.createTensor(env, LongBuffer.wrap(idx), longArrayOf(1, n, deg))
+        val mskT = OnnxTensor.createTensor(env, FloatBuffer.wrap(mask), longArrayOf(1, n, deg))
+        return idxT to mskT
+    }
+
     /** Rich (contract v2/v3) forward: build the SAME multi-tensor input the trainer pads, feed
      *  onnxruntime, read tech/policy (+ v7 per-city construction when present). EVERY created
      *  [OnnxTensor] is closed (no native leak — council R7). */
     private fun forwardRich(key: String, obs: Observation, tileMap: TileMap?): Memo {
         val inputs = buildRichTensors(env, obs)
         if (tileMap != null) {  // v3 structured: add the hex-GNN neighbor inputs from the LIVE map
-            val (idx, mask) = buildNeighborTensorsLive(env, tileMap)
+            val (idx, mask) = neighborTensorsCached(tileMap)
             inputs[SampleSchema.OnnxContract.INPUT_NEIGHBOR_INDEX] = idx
             inputs[SampleSchema.OnnxContract.INPUT_NEIGHBOR_MASK] = mask
         }
@@ -264,11 +295,9 @@ class OnnxPolicy(
             intArrayOf(-1, -1), intArrayOf(0, -1), intArrayOf(1, 0),
         )
 
-        /** Build the live hex-GNN adjacency [1,N,6] int64 + [1,N,6] f32 from the real [TileMap] using
-         *  the engine's own world-wrap-correct [TileMap.getIfTileExistsOrNull]. Rows are in
-         *  zeroBasedIndex order (matches the spatial token set); missing neighbor → sentinel index N
-         *  (the model's zero pad row) + mask 0. Caller closes the returned tensors. */
-        fun buildNeighborTensorsLive(env: OrtEnvironment, tileMap: TileMap): Pair<OnnxTensor, OnnxTensor> {
+        /** The raw hex-GNN adjacency arrays for [buildNeighborTensorsLive]/the per-map cache — a pure
+         *  function of the (frozen-after-load) map geometry. */
+        fun buildNeighborArrays(tileMap: TileMap): Pair<LongArray, FloatArray> {
             val tiles = tileMap.tileList
             val n = tiles.size
             val deg = SampleSchema.OnnxContract.HEX_DEGREE
@@ -284,6 +313,17 @@ class OnnxPolicy(
                     if (nr in 0 until n) { idx[r * deg + d] = nr.toLong(); mask[r * deg + d] = 1f }
                 }
             }
+            return idx to mask
+        }
+
+        /** Build the live hex-GNN adjacency [1,N,6] int64 + [1,N,6] f32 from the real [TileMap] using
+         *  the engine's own world-wrap-correct [TileMap.getIfTileExistsOrNull]. Rows are in
+         *  zeroBasedIndex order (matches the spatial token set); missing neighbor → sentinel index N
+         *  (the model's zero pad row) + mask 0. Caller closes the returned tensors. */
+        fun buildNeighborTensorsLive(env: OrtEnvironment, tileMap: TileMap): Pair<OnnxTensor, OnnxTensor> {
+            val n = tileMap.tileList.size
+            val deg = SampleSchema.OnnxContract.HEX_DEGREE
+            val (idx, mask) = buildNeighborArrays(tileMap)
             val idxT = OnnxTensor.createTensor(env, LongBuffer.wrap(idx), longArrayOf(1, n.toLong(), deg.toLong()))
             val mskT = OnnxTensor.createTensor(env, FloatBuffer.wrap(mask), longArrayOf(1, n.toLong(), deg.toLong()))
             return idxT to mskT

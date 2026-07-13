@@ -65,10 +65,11 @@ object SelfPlayRunner {
     @ExperimentalTime
     @JvmStatic
     fun main(args: Array<String>) {
-        val mode = args.getOrNull(0) ?: error("usage: SelfPlayRunner <gen|eval|parity-dump|parity-run> ...")
+        val mode = args.getOrNull(0) ?: error("usage: SelfPlayRunner <gen|eval|serve|parity-dump|parity-run> ...")
         when (mode) {
             "gen" -> { bootstrap(); gen(args) }
             "eval" -> { bootstrap(); eval(args) }
+            "serve" -> { bootstrap(); serve() }   // perf: persistent worker — one JVM/JIT across many gen|eval commands
             "parity-dump" -> { bootstrap(); parityDump(args) }
             "parity-run" -> parityRun(args)   // ORT only — no engine bootstrap needed
             "parity-dump-rich" -> { bootstrap(); parityDumpRich(args) }
@@ -77,6 +78,43 @@ object SelfPlayRunner {
             "bench-onnx" -> { bootstrap(); benchOnnx(args) }            // D8 throughput guard (70% gate)
             "trace" -> { bootstrap(); trace(args) }
             else -> error("unknown mode '$mode'")
+        }
+    }
+
+    /**
+     * perf: persistent worker loop. Reads one command per stdin line — `gen ...` / `eval ...` with the
+     * SAME positional args as the CLI modes — runs it, and prints `SERVE_READY` when idle again (the
+     * driver reads until the command's own marker line, then until SERVE_READY). `quit` / EOF exits.
+     *
+     * Every command is seed-scoped exactly like a fresh CLI invocation (per-game map seeds derive from
+     * the command's seedBase; OnnxPolicy sessions are created and closed per command; DataPlaneHooks is
+     * uninstalled in Simulation.start's teardown) — so serve-mode results are identical to spawn-mode,
+     * minus the JVM/gradle spawn + cold-JIT tax. On ANY command failure the process exits(1) — a stale
+     * hook or half-finished simulation must never leak into the next command; the driver respawns.
+     */
+    @ExperimentalTime
+    private fun serve() {
+        println("SERVE_READY")
+        System.out.flush()   // stdout is a pipe under gradle — no console autoflush; flush per protocol line
+        while (true) {
+            val line = readLine() ?: break
+            val tokens = line.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            if (tokens.isEmpty()) continue
+            if (tokens[0] == "quit") break
+            try {
+                DataPlaneHooks.uninstall()   // hygiene: a healthy previous command left this clear already
+                when (tokens[0]) {
+                    "gen" -> gen(tokens.toTypedArray())
+                    "eval" -> eval(tokens.toTypedArray())
+                    else -> error("serve: unknown command '${tokens[0]}' (expected gen|eval|quit)")
+                }
+            } catch (e: Throwable) {
+                println("SERVE_ERROR ${e::class.simpleName}: ${e.message?.take(500)}")
+                System.out.flush()
+                System.exit(1)   // fail LOUD and let the driver respawn a clean JVM — never serve after a wreck
+            }
+            println("SERVE_READY")
+            System.out.flush()
         }
     }
 
