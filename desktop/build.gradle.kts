@@ -63,7 +63,8 @@ tasks.register<JavaExec>("simBench") { // Headless throughput / training-data co
     classpath = sourceSets.main.get().runtimeClasspath
     workingDir = assetsDir
     isIgnoreExitValue = true
-    jvmArgs = listOf("-Xmx4G")
+    // perf: mirror the selfPlay GC config so the benchmark measures the production stack
+    jvmArgs = listOf("-Xmx4G", "-XX:+UseParallelGC", "-Xmn1500m", "-XX:ParallelGCThreads=6")
 }
 
 tasks.register<JavaExec>("selfPlay") { // Self-play GENERATE / EVAL / PARITY entrypoint (in-JVM ONNX)
@@ -72,7 +73,11 @@ tasks.register<JavaExec>("selfPlay") { // Self-play GENERATE / EVAL / PARITY ent
     classpath = sourceSets.main.get().runtimeClasspath
     workingDir = assetsDir
     isIgnoreExitValue = true
-    jvmArgs = listOf("-Xmx8G")
+    // perf: batch-throughput GC — the sim churns 600-900MB/s of short-lived sequence/HashMap garbage;
+    // ParallelGC + a large young gen collects it in cheap young GCs every few seconds instead of G1's
+    // ~1/s cadence, and drops G1's mutator write barriers. GC cannot affect game decisions or the RNG
+    // stream (identity hashes are mark-word stored in HotSpot), so replays stay byte-identical.
+    jvmArgs = listOf("-Xmx8G", "-XX:+UseParallelGC", "-Xmn3G", "-XX:ParallelGCThreads=6")
 }
 
 tasks.register<Jar>("dist") { // Compiles the jar file

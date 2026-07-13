@@ -21,6 +21,11 @@ import sys
 import time
 from pathlib import Path
 
+# perf: idle OpenMP pool threads must SLEEP, not spin — 4 concurrent trainers' spin-wait was measured
+# starving the sim JVMs (verified bit-identical training numerics). Must be set BEFORE torch/libgomp
+# initialize, hence before the `train` import below; setdefault so an explicit env wins.
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 from . import contract, dataset as ds, export_onnx as ex, train as tr  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
@@ -127,11 +132,13 @@ def _replay_refill_rounds(start_round: int, replay_window: int) -> list[int]:
 
 
 def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, seed: int,
-                *, net=None, optimizer=None, replay_active: bool | None = None, bc_ref=None):
+                *, net=None, optimizer=None, replay_active: bool | None = None, bc_ref=None,
+                device: str = "cpu"):
     """Dispatch to the right trainer by variant. Returns (net, stats, exporter_callable, optimizer).
     v5: `net`/`optimizer` are the warm continual pair (None ⇒ fresh round); the trainer returns the
     optimizer so run_loop can carry it forward. micro_batch_steps is threaded from args.
-    v6: `replay_active` (per-round; None ⇒ derive from --replay-window) gates the stored-logp source."""
+    v6: `replay_active` (per-round; None ⇒ derive from --replay-window) gates the stored-logp source.
+    perf: `device` is threaded to the trainers; nets/checkpoints/export remain CPU-side."""
     from . import contract
     mb = getattr(args, "micro_batch_steps", 0) or None
     # v6: window-gated source switch — replay active ⇒ use the STORED behavior logp as old_logp for
@@ -148,7 +155,8 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             trajectories_or_steps, dims, epochs=args.epochs, lr=args.lr, seed=seed,
             gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
-            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl, reward_shaping_coef=rsc)
+            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl, reward_shaping_coef=rsc,
+            device=device)
         return net, stats, "blind", optimizer
     if variant == "rich-critic":
         token_specs = contract.token_specs_from_schema(schema_path)
@@ -156,7 +164,8 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             trajectories_or_steps, dims, token_specs, epochs=args.epochs, lr=args.lr, seed=seed,
             gamma=args.gamma, lam=args.lam, value_coef=args.value_coef,
             entropy_coef=args.entropy_coef, clip_eps=args.clip_eps,
-            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl, reward_shaping_coef=rsc)
+            net=net, optimizer=optimizer, micro_batch_steps=mb, behavior_logp=bl, reward_shaping_coef=rsc,
+            device=device)
         return net, stats, ("rich", token_specs), optimizer
     if variant == "structured":
         from .model import RUNGS
@@ -172,7 +181,8 @@ def train_round(variant: str, trajectories_or_steps, dims, schema_path, args, se
             construction_credit_coef=ccc,   # v7.3: >0 ⇒ per-city credit (separate per-city construction PG term)
             bc_ref=bc_ref, construction_kl_coef=getattr(args, "construction_kl_coef", 0.0),  # v7.4 KL-to-clone leash
             unit_intent=(getattr(args, "control_unit_intent", "off") == "on"),   # v8: train the per-unit intent head only when ON
-            unit_kl_coef=getattr(args, "unit_kl_coef", 0.0))  # v8 KL-to-clone leash for the unit-intent head
+            unit_kl_coef=getattr(args, "unit_kl_coef", 0.0),  # v8 KL-to-clone leash for the unit-intent head
+            device=device)
         return net, stats, ("structured", token_specs), optimizer
     raise ValueError(f"unknown variant {variant!r}")
 
@@ -306,7 +316,24 @@ def main(argv=None) -> int:
                          "--bc-pretrain-dir), penalize KL(current unit-intent || frozen BC clone) each RL "
                          "epoch — the direct analog of --construction-kl-coef for units. Try ~0.5.")
     ap.add_argument("--gradle-timeout", type=float, default=1800.0)
+    ap.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                    help="perf: training device. 'auto' (default) uses CUDA when available — verified "
+                         "~145x per epoch on this box's RTX 5090 vs CPU whole-batch — else CPU. "
+                         "Checkpoints/ONNX export are always CPU-side. A CUDA OOM (e.g. several "
+                         "concurrent whole-batch trainers) falls back to CPU for that call, loudly.")
+    ap.add_argument("--torch-threads", type=int, default=int(os.environ.get("TORCH_THREADS", "8")),
+                    help="perf: torch intra-op thread cap (default $TORCH_THREADS or 8). Uncapped "
+                         "torch (32 threads/trainer) was measured starving the sim JVMs to ~2-3 of "
+                         "their 6 requested cores when several experiment arms run concurrently.")
     args = ap.parse_args(argv)
+    # perf: cap trainer parallelism BEFORE any tensor work. interop must be set before the first
+    # parallel op and raises if torch already initialized it — guard, don't crash a run over it.
+    import torch
+    torch.set_num_threads(max(1, args.torch_threads))
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
     if args.variant == "rich-v2":   # alias for the v4 structured encoder
         args.variant = "structured"
     # v6: keep enough recent round_*/ shard dirs alive that the last K-1 rounds survive the prune for
@@ -358,9 +385,17 @@ def main(argv=None) -> int:
         bc_net = StructuredPolicyValueNet(bc_dims, bc_ts, bc_vc, **RUNGS[args.rung])
         # v8: bc_pretrain_construction clones BOTH the construction AND unit-intent heads in one pass (when the
         # net carries the unit-intent head) — one warm-start serves both heads + both KL leashes.
-        bc_net, bc_stats = tr.bc_pretrain_construction(
-            bc_net, bc_trajs, bc_dims, bc_ts, epochs=getattr(args, "bc_epochs", 8), lr=args.lr,
-            micro_batch_steps=(args.micro_batch_steps or 512))
+        try:
+            bc_net, bc_stats = tr.bc_pretrain_construction(
+                bc_net, bc_trajs, bc_dims, bc_ts, epochs=getattr(args, "bc_epochs", 8), lr=args.lr,
+                micro_batch_steps=(args.micro_batch_steps or 512), device=args.device)
+        except torch.cuda.OutOfMemoryError:
+            sys.stderr.write("[bc] CUDA OOM — falling back to CPU for the BC pretrain\n")
+            torch.cuda.empty_cache()
+            bc_net = bc_net.cpu()
+            bc_net, bc_stats = tr.bc_pretrain_construction(
+                bc_net, bc_trajs, bc_dims, bc_ts, epochs=getattr(args, "bc_epochs", 8), lr=args.lr,
+                micro_batch_steps=(args.micro_batch_steps or 512), device="cpu")
         _uacc = bc_stats.get("bc_unit_acc")
         print(f"[bc] pretrained per-entity heads on {len(bc_trajs)} heuristic trajectories "
               f"({bc_stats['n']} steps): bc_loss={bc_stats['bc_loss']:.4f} bc_acc={bc_stats['bc_acc']:.3f}"
@@ -438,11 +473,25 @@ def main(argv=None) -> int:
         # stored logp is the uniform RandomPolicy logp, and forcing recompute keeps round 0 IDENTICAL across
         # the K=1 and K=4 arms (the v5 bootstrap), isolating the replay effect to rounds ≥1.
         replay_active = (args.variant != "v1-reinforce" and args.replay_window > 1 and r > 0)
-        net, stats, mode, opt = train_round(
-            args.variant, train_data, dims, schema, args, seed=r,
-            net=(warm_net if args.continual else None),
-            optimizer=(warm_opt if args.continual else None),
-            replay_active=replay_active, bc_ref=bc_ref)
+        try:
+            net, stats, mode, opt = train_round(
+                args.variant, train_data, dims, schema, args, seed=r,
+                net=(warm_net if args.continual else None),
+                optimizer=(warm_opt if args.continual else None),
+                replay_active=replay_active, bc_ref=bc_ref, device=args.device)
+        except torch.cuda.OutOfMemoryError:
+            # perf: several concurrent whole-batch trainers can exceed VRAM — retry THIS round on CPU
+            # (weights may have taken some GPU epochs' steps already; the pipeline is not bit-repro
+            # across devices anyway, and a loud fallback beats a dead multi-hour run).
+            sys.stderr.write(f"[r{r}] CUDA OOM — falling back to CPU for this round's training\n")
+            torch.cuda.empty_cache()
+            if warm_net is not None:
+                warm_net = warm_net.cpu()
+            net, stats, mode, opt = train_round(
+                args.variant, train_data, dims, schema, args, seed=r,
+                net=(warm_net if args.continual else None),
+                optimizer=(warm_opt if args.continual else None),
+                replay_active=replay_active, bc_ref=bc_ref, device="cpu")
         if args.continual:
             warm_net, warm_opt = net, opt                   # carry the persistent pair to next round
 

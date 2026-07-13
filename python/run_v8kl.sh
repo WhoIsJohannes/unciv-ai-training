@@ -14,6 +14,9 @@ set -uo pipefail
 cd "$(dirname "$0")"
 export JAVA_HOME="${JAVA_HOME:-/home/johannes/.jdks/jdk-21.0.11+10}"
 export PATH="$JAVA_HOME/bin:$PATH"
+# perf: idle OpenMP threads sleep instead of spin-waiting (bit-identical training numerics;
+# frees ~2-4 cores for the sim JVMs whenever trainer phases overlap sim phases).
+export OMP_WAIT_POLICY="${OMP_WAIT_POLICY:-PASSIVE}"
 # numpy/torch live in the project venv, not system python3 — activate it so `python3` resolves there.
 [ -f .venv/bin/activate ] && source .venv/bin/activate
 # gradlew lives at the repo root AND gradle must be invoked from there (it locates the build by CWD); this

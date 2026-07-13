@@ -25,6 +25,28 @@ from .dataset import TrainStep, TrainTrajectory
 from .model import PolicyNet
 
 
+def resolve_device(spec: str | torch.device = "auto") -> torch.device:
+    """'auto' → cuda when available else cpu; explicit 'cuda'/'cpu' pass through (torch fails loud
+    on an unusable explicit 'cuda'). Training math is device-agnostic; checkpoints/export stay
+    CPU-side because every trainer moves the net back to CPU before returning."""
+    if isinstance(spec, torch.device):
+        return spec
+    if spec == "auto":
+        return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    return torch.device(spec)
+
+
+def _optimizer_state_to(opt, dev: torch.device) -> None:
+    """Move a (possibly warm) optimizer's state tensors (Adam moments) to `dev` in place — a warm
+    CPU optimizer stepping a CUDA net (or vice versa) raises a device-mismatch error otherwise."""
+    if opt is None:
+        return
+    for state in opt.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(dev)
+
+
 def _masked_logp(logits: torch.Tensor, actions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """log π(a|s) over the legal-masked softmax; 0 where the head did not act (action < 0)."""
     neg = torch.where(mask > 0, logits, torch.full_like(logits, -1e9))
@@ -418,8 +440,8 @@ def _optimize_actor_critic(
             if m.sum() > 1:
                 vals = a_city_np[m]
                 a_city_np = np.where(m, (a_city_np - vals.mean()) / (vals.std() + 1e-8), 0.0).astype(np.float32)
-        A_city = torch.tensor(a_city_np)
-        R_city = torch.tensor(r_city_np)
+        A_city = torch.tensor(a_city_np, device=a_tech.device)
+        R_city = torch.tensor(r_city_np, device=a_tech.device)
     # v7.2 POTENTIAL-BASED REWARD SHAPING (Ng-Harada, policy-invariant): add F_t = coef·(γ·Φ_{t+1}−Φ_t)
     # to each non-terminal step WITHIN a trajectory; the LAST step keeps only the terminal ±1 (F=0 there,
     # so the terminal reward stands alone). The F terms telescope to a constant, leaving the optimal
@@ -442,8 +464,8 @@ def _optimize_actor_critic(
         adv_np[off:off + L] = a
         ret_np[off:off + L] = r
         off += L
-    adv = torch.tensor(adv_np)
-    ret = torch.tensor(ret_np)                              # fixed value target for the round
+    adv = torch.tensor(adv_np, device=a_tech.device)
+    ret = torch.tensor(ret_np, device=a_tech.device)        # fixed value target for the round
     if norm_adv and adv.numel() > 1:                        # BATCH-level normalization (not per-traj)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
     adv = adv.detach()
@@ -755,7 +777,7 @@ def _bc_masked_ce(logits: torch.Tensor, mk: torch.Tensor, tg: torch.Tensor):
 
 
 def bc_pretrain_construction(net, trajectories, dims, token_specs, *, epochs=8, lr=1e-3,
-                             seed=0, micro_batch_steps=512, clone_unit_intent=True):
+                             seed=0, micro_batch_steps=512, clone_unit_intent=True, device="cpu"):
     """v7.4/v8 BEHAVIOR CLONING: supervised-pretrain the per-entity head(s) to mimic the heuristic's picks
     (`construction_current` / `unit_intent_current`, gen'd with control OFF). Cross-entropy over the
     legal-masked head logits vs the target idx, for entities with a valid legal target. Only the head-loss
@@ -776,6 +798,13 @@ def bc_pretrain_construction(net, trajectories, dims, token_specs, *, epochs=8, 
     if not have_c and not have_u:
         return net, {"bc_loss": 0.0, "bc_acc": 0.0, "n": 0, "note": "no BC targets"}
     inputs = build_rich_batch(trajectories, dims, token_specs)
+    # perf: same device seam as the RL trainers — clone on GPU when asked, return a CPU net.
+    dev = resolve_device(device)
+    net = net.to(dev)
+    tgt, m_c = tgt.to(dev), m_c.to(dev)
+    if clone_u:
+        tgt_u, m_u = tgt_u.to(dev), m_u.to(dev)
+    inputs = {k: v.to(dev) for k, v in inputs.items()}
     n = tgt.shape[0]
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     mb = micro_batch_steps if (micro_batch_steps and 0 < micro_batch_steps < n) else n
@@ -802,7 +831,7 @@ def bc_pretrain_construction(net, trajectories, dims, token_specs, *, epochs=8, 
         last = {"bc_loss": tot_loss, "bc_acc": (tot_correct / tot_valid if tot_valid else 0.0), "n": n}
         if clone_u:
             last["bc_unit_acc"] = (tot_u_correct / tot_u_valid if tot_u_valid else 0.0)
-    return net, last
+    return net.cpu(), last
 
 
 def train_actor_critic_blind(
@@ -823,6 +852,7 @@ def train_actor_critic_blind(
     micro_batch_steps: int | None = None,
     behavior_logp: bool = False,     # v6: use stored behavior logp as old_logp (off-policy replay); False ⇒ v5 recompute
     reward_shaping_coef: float = 0.0,  # v7.2: PBRS coefficient (F = coef·(γ·Φ'−Φ)); 0 ⇒ terminal-only
+    device: str | torch.device = "cpu",  # perf: 'cuda'/'auto' trains on GPU; net returns to CPU
 ) -> tuple[PolicyNet, dict, object]:
     if net is None:
         torch.manual_seed(seed)
@@ -835,6 +865,13 @@ def train_actor_critic_blind(
     # v6: stored behavior logp (sum of per-head logps) for off-policy replayed data; None ⇒ on-policy (v5).
     stored = (b_logp_tech + b_logp_policy) if behavior_logp else None
     obs = torch.tensor(np.concatenate([t.obs for t in trajectories]))
+
+    dev = resolve_device(device)
+    net = net.to(dev)
+    _optimizer_state_to(optimizer, dev)
+    a_tech, a_policy, m_tech, m_policy, obs = (t.to(dev) for t in (a_tech, a_policy, m_tech, m_policy, obs))
+    if stored is not None:
+        stored = stored.to(dev)
 
     def forward_fn():
         return net(obs)
@@ -851,6 +888,8 @@ def train_actor_critic_blind(
         clip_eps=clip_eps, norm_adv=norm_adv, stored_old_logp=stored,
         phi_np=phi_np, reward_shaping_coef=reward_shaping_coef,
     )
+    net = net.cpu()
+    _optimizer_state_to(optimizer, torch.device("cpu"))
     return net, stats, optimizer
 
 
@@ -873,6 +912,7 @@ def train_actor_critic_rich(
     micro_batch_steps: int | None = None,
     behavior_logp: bool = False,     # v6: use stored behavior logp as old_logp (off-policy replay); False ⇒ v5 recompute
     reward_shaping_coef: float = 0.0,  # v7.2: PBRS coefficient (F = coef·(γ·Φ'−Φ)); 0 ⇒ terminal-only
+    device: str | torch.device = "cpu",  # perf: 'cuda'/'auto' trains on GPU; net returns to CPU
 ) -> tuple[object, dict, object]:
     """Rich variant. Trajectories carry `rich` dicts of padded per-step token tensors + masks
     (assembled by features.build_rich_batch). The whole round is one padded batch.
@@ -892,6 +932,14 @@ def train_actor_critic_rich(
     stored = (b_logp_tech + b_logp_policy) if behavior_logp else None
     inputs = build_rich_batch(trajectories, dims, token_specs)  # dict[name -> tensor], padded
 
+    dev = resolve_device(device)
+    net = net.to(dev)
+    _optimizer_state_to(optimizer, dev)
+    a_tech, a_policy, m_tech, m_policy = (t.to(dev) for t in (a_tech, a_policy, m_tech, m_policy))
+    if stored is not None:
+        stored = stored.to(dev)
+    inputs = {k: v.to(dev) for k, v in inputs.items()}
+
     def forward_fn():
         return net(inputs)
 
@@ -907,6 +955,8 @@ def train_actor_critic_rich(
         clip_eps=clip_eps, norm_adv=norm_adv, stored_old_logp=stored,
         phi_np=phi_np, reward_shaping_coef=reward_shaping_coef,
     )
+    net = net.cpu()
+    _optimizer_state_to(optimizer, torch.device("cpu"))
     return net, stats, optimizer
 
 
@@ -937,6 +987,7 @@ def train_actor_critic_structured(
     construction_kl_coef: float = 0.0,  # v7.4: KL-to-clone leash weight
     unit_intent: bool = False,       # v8: train the per-unit intent head; False ⇒ head inert (no-op oracle)
     unit_kl_coef: float = 0.0,       # v8: KL-to-clone leash weight for the unit-intent head
+    device: str | torch.device = "cpu",  # perf: 'cuda'/'auto' trains on GPU; net returns to CPU (ckpt/export unchanged)
 ) -> tuple[object, dict, object]:
     """v4 STRUCTURED variant: same encoder-AGNOSTIC core (_optimize_actor_critic) + same rich
     batch/stacking as train_actor_critic_rich — ONLY the nn.Module is swapped for
@@ -959,6 +1010,16 @@ def train_actor_critic_structured(
     stored = (b_logp_tech + b_logp_policy) if behavior_logp else None
     inputs = build_rich_batch(trajectories, dims, token_specs)
 
+    # perf: single device seam — net, warm optimizer moments, and every batch tensor move to `dev`;
+    # math is device-agnostic (numpy GAE stays CPU-side off .cpu() snapshots). Moved back before return.
+    dev = resolve_device(device)
+    net = net.to(dev)
+    _optimizer_state_to(optimizer, dev)
+    a_tech, a_policy, m_tech, m_policy = a_tech.to(dev), a_policy.to(dev), m_tech.to(dev), m_policy.to(dev)
+    if stored is not None:
+        stored = stored.to(dev)
+    inputs = {k: v.to(dev) for k, v in inputs.items()}
+
     # v7: per-city construction tensors (action / behavior-logp-sum / mask), padded to the SAME city
     # axis build_rich_batch pads own_cities to. The construction summand is part of the per-step joint
     # logp AND (for replay) the stored old_logp — the importance ratio covers all heads jointly.
@@ -966,7 +1027,7 @@ def train_actor_critic_structured(
     econ_city_t = city_present_t = old_logp_construction_pc = None
     if construction:
         a_construction, b_logp_construction, m_construction, econ_all, present_all, b_logp_construction_pc = \
-            _stack_construction(trajectories, net.constr_w)
+            (t.to(dev) if torch.is_tensor(t) else t for t in _stack_construction(trajectories, net.constr_w))
         # v7.3: per-city credit is active ONLY when coef>0 AND the shards carry econ_city. Then construction
         # trains as a SEPARATE per-city term (excluded from the joint ratio ⇒ NOT added to stored old_logp),
         # with its OWN per-city PPO importance ratio (b_logp_construction_pc) so it is valid under replay.
@@ -983,7 +1044,8 @@ def train_actor_critic_structured(
     # no per-unit credit) ⇒ their behavior-logp sum is added to the stored old_logp under replay.
     a_unit_intent = m_unit_intent = None
     if unit_intent:
-        a_unit_intent, b_logp_unit_intent, m_unit_intent = _stack_unit_intent(trajectories, net.intent_w)
+        a_unit_intent, b_logp_unit_intent, m_unit_intent = \
+            (t.to(dev) for t in _stack_unit_intent(trajectories, net.intent_w))
         if stored is not None:
             stored = stored + b_logp_unit_intent
 
@@ -1006,6 +1068,7 @@ def train_actor_critic_structured(
     need_cref = construction and bc_ref is not None and construction_kl_coef > 0 and m_construction is not None
     need_uref = unit_intent and bc_ref is not None and unit_kl_coef > 0 and m_unit_intent is not None
     if need_cref or need_uref:
+        bc_ref = bc_ref.to(dev)   # frozen clone rides the same device; tiny net, cheap either way
         bc_ref.eval()
         with torch.no_grad():
             n_all = a_tech.shape[0]
@@ -1042,4 +1105,8 @@ def train_actor_critic_structured(
         a_unit_intent=a_unit_intent, m_unit_intent=m_unit_intent,
         ref_unit_intent_logp=ref_unit_intent_logp, unit_kl_coef=unit_kl_coef,
     )
+    # perf: return to CPU so checkpoints, ONNX export, and cross-round warm-carry stay CPU-side
+    # (run_loop's save/export code is untouched by the device seam).
+    net = net.cpu()
+    _optimizer_state_to(optimizer, torch.device("cpu"))
     return net, stats, optimizer
