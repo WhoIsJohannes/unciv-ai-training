@@ -38,6 +38,7 @@ import com.unciv.ui.components.extensions.toPercent
 import com.unciv.ui.screens.victoryscreen.RankingType
 import org.jetbrains.annotations.VisibleForTesting
 import yairm210.purity.annotations.Cache
+import yairm210.purity.annotations.LocalState
 import yairm210.purity.annotations.Readonly
 import kotlin.contracts.ExperimentalContracts
 import kotlin.contracts.contract
@@ -89,6 +90,13 @@ class Civilization : IsPartOfGameInfoSerialization {
 
     @Transient
     var viewableTiles = setOf<Tile>()
+
+    /** Per-tile exploration mirror of each [Tile.exploredBy], indexed by [Tile.zeroBasedIndex].
+     *  Seeded in [setTransients]; the ONLY exploredBy mutation site, Tile.setExploredChanged, keeps it in
+     *  sync afterwards (exploredBy stays the serialized source of truth). Null until setTransients has run —
+     *  Tile.isExplored then falls back to the HashSet. */
+    @Transient
+    var exploredTiles: java.util.BitSet? = null
 
     @Transient
     var viewableInvisibleUnitsTiles = setOf<Tile>()
@@ -574,8 +582,21 @@ class Civilization : IsPartOfGameInfoSerialization {
     @Readonly fun hasResource(resource: TileResource): Boolean = getResourceAmount(resource) > 0
 
     @Readonly
-    fun hasUnique(uniqueType: UniqueType, gameContext: GameContext = state) =
-        getMatchingUniques(uniqueType, gameContext).any()
+    fun hasUnique(uniqueType: UniqueType, gameContext: GameContext = state): Boolean {
+        // Short-circuit mirror of getMatchingUniques(...).any(): same sources, same order, same filters
+        // (incl. the multiplier>0 check that getMultiplied implies)
+        if (nation.uniqueMap.hasMatchingUniqueMultiplied(uniqueType, gameContext)) return true
+        for (i in 0..<cities.size)
+            if (cities[i].hasMatchingUniqueWithNonLocalEffects(uniqueType, gameContext)) return true
+        if (policies.policyUniques.hasMatchingUniqueMultiplied(uniqueType, gameContext)) return true
+        if (tech.techUniques.hasMatchingUniqueMultiplied(uniqueType, gameContext)) return true
+        if (temporaryUniques.hasMatchingUnique(uniqueType, gameContext)) return true
+        if (getEra().uniqueMap.hasMatchingUniqueMultiplied(uniqueType, gameContext)) return true
+        if (cityStateFunctions.anyUniqueProvidedByCityStates(uniqueType, gameContext)) return true
+        if (religionManager.religion?.founderBeliefUniqueMap?.hasMatchingUniqueMultiplied(uniqueType, gameContext) == true) return true
+        if (civResourcesUniqueMap.hasMatchingUniqueMultiplied(uniqueType, gameContext)) return true
+        return gameInfo.getGlobalUniques().uniqueMap.hasMatchingUniqueMultiplied(uniqueType, gameContext)
+    }
 
     // Does not return local uniques, only global ones.
     /** Destined to replace getMatchingUniques, gradually, as we fill the enum */
@@ -585,21 +606,12 @@ class Civilization : IsPartOfGameInfoSerialization {
     fun getMatchingUniques(
         uniqueType: UniqueType,
         gameContext: GameContext = state
-    ): Sequence<Unique> = sequence {
-        yieldAll(nation.getMatchingUniques(uniqueType, gameContext))
-        yieldAll(cities.asSequence()
-            .flatMap { city -> city.getMatchingUniquesWithNonLocalEffects(uniqueType, gameContext) }
-        )
-        yieldAll(policies.policyUniques.getMatchingUniques(uniqueType, gameContext))
-        yieldAll(tech.techUniques.getMatchingUniques(uniqueType, gameContext))
-        yieldAll(temporaryUniques.getMatchingTagUniques(uniqueType, gameContext))
-        yieldAll(getEra().getMatchingUniques(uniqueType, gameContext))
-        yieldAll(cityStateFunctions.getUniquesProvidedByCityStates(uniqueType, gameContext))
-        if (religionManager.religion != null)
-            yieldAll(religionManager.religion!!.founderBeliefUniqueMap.getMatchingUniques(uniqueType, gameContext))
-
-        yieldAll(civResourcesUniqueMap.getMatchingUniques(uniqueType, gameContext))
-        yieldAll(gameInfo.getGlobalUniques().getMatchingUniques(uniqueType, gameContext))
+    ): Sequence<Unique> {
+        // Eager mirror of the old sequence{} builder - forEachMatchingUnique visits the same
+        // sources in the same order with the same filters (no coroutine machinery)
+        @LocalState val result = ArrayList<Unique>()
+        forEachMatchingUnique(uniqueType, gameContext) { result.add(it) }
+        return result.asSequence()
     }
 
     @Readonly
@@ -930,6 +942,15 @@ class Civilization : IsPartOfGameInfoSerialization {
     }
 
     fun setTransients():Unit = timeThis("Civilization.setTransients") {
+        // Seed the O(1) exploration mirror - requires tileMap.setTransients to have assigned zeroBasedIndex
+        // (guaranteed: GameInfo.setTransients runs it before any civ's setTransients, and mid-game civ
+        // additions happen on a fully-loaded game). Safe at any point within this function: any earlier
+        // setExplored calls already mutated exploredBy, which is exactly what we seed from.
+        val explored = java.util.BitSet(gameInfo.tileMap.tileList.size)
+        for (tile in gameInfo.tileMap.tileList)
+            if (tile.isExploredBy(civID)) explored.set(tile.zeroBasedIndex)
+        exploredTiles = explored
+
         goldenAges.civInfo = this
         greatPeople.civInfo = this
         civConstructions.setTransients(civInfo = this)

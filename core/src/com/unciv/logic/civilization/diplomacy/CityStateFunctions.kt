@@ -845,6 +845,28 @@ class CityStateFunctions(val civInfo: Civilization) {
     }
 
     @Readonly
+    /** Short-circuit equivalent of `getUniquesProvidedByCityStates(...).any()` */
+    fun anyUniqueProvidedByCityStates(uniqueType: UniqueType, gameContext: GameContext): Boolean {
+        if (civInfo.isCityState) return false
+        if (!gameHasCityStates()) return false
+        for (otherCiv in civInfo.getKnownCivs()) {
+            if (!otherCiv.isCityState) continue
+            // We don't use DiplomacyManager.getRelationshipLevel for performance reasons - it tries to calculate getTributeWillingness which is heavy
+            val relationshipLevel =
+                if (otherCiv.allyCiv == civInfo) RelationshipLevel.Ally
+                else if (otherCiv.getDiplomacyManager(civInfo)!!.getInfluence() >= 30) RelationshipLevel.Friend
+                else RelationshipLevel.Neutral
+            val cityStateUniqueMap = when (relationshipLevel) {
+                RelationshipLevel.Ally -> otherCiv.cityStateType.allyBonusUniqueMap
+                RelationshipLevel.Friend -> otherCiv.cityStateType.friendBonusUniqueMap
+                else -> continue
+            }
+            if (cityStateUniqueMap.hasMatchingUniqueMultiplied(uniqueType, gameContext)) return true
+        }
+        return false
+    }
+
+    @Readonly
     fun forEachUniqueProvidedByCityStates(uniqueType: UniqueType, gameContext: GameContext, op: (unique: Unique) -> Unit) {
         if (civInfo.isCityState) return
         if (!gameHasCityStates()) return

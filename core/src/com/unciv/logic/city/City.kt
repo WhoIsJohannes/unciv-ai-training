@@ -614,15 +614,18 @@ class City : IsPartOfGameInfoSerialization, INamed {
         gameContext: GameContext = state,
         includeCivUniques: Boolean = true
     ): Sequence<Unique> {
-        return if (includeCivUniques)
-            civ.getMatchingUniques(uniqueType, gameContext) +
-                getLocalMatchingUniques(uniqueType, gameContext)
-        else (
-            cityConstructions.builtBuildingUniqueMap.getUniques(uniqueType)
-                + religion.getUniques(uniqueType)
-            ).filter {
-                !it.isTimedTriggerable && it.conditionalsApply(gameContext)
-            }.flatMap { it.getMultiplied(gameContext) }
+        // Eager mirror of the old sequence chains - same sources, same order.
+        // NB the else branch deliberately uses gameContext (not `state` like forEachMatchingUnique's else branch)
+        // to preserve this function's historical semantics.
+        @LocalState val result = ArrayList<Unique>()
+        if (includeCivUniques) {
+            civ.forEachMatchingUnique(uniqueType, gameContext) { result.add(it) }
+            forEachLocalMatchingUnique(uniqueType, gameContext) { result.add(it) }
+        } else {
+            cityConstructions.builtBuildingUniqueMap.forEachMatchingUnique(uniqueType, gameContext) { result.add(it) }
+            religion.forEachMatchingUnique(uniqueType, gameContext) { result.add(it) }
+        }
+        return result.asSequence()
     }
 
     @Readonly
@@ -652,10 +655,10 @@ class City : IsPartOfGameInfoSerialization, INamed {
     @Deprecated(message = "forEachLocalMatchingUnique is faster. If not viable, then this can still be used",
         replaceWith = ReplaceWith("forEachLocalMatchingUnique"))
     fun getLocalMatchingUniques(uniqueType: UniqueType, gameContext: GameContext = state): Sequence<Unique> {
-        val uniques = cityConstructions.builtBuildingUniqueMap.getUniques(uniqueType).filter { it.isLocalEffect } +
-            religion.getUniques(uniqueType)
-        return uniques.filter { !it.isTimedTriggerable && it.conditionalsApply(gameContext) }
-                .flatMap { it.getMultiplied(gameContext) }
+        // Eager mirror of the old sequence chain - forEachLocalMatchingUnique applies identical filters in the same order
+        @LocalState val result = ArrayList<Unique>()
+        forEachLocalMatchingUnique(uniqueType, gameContext) { result.add(it) }
+        return result.asSequence()
     }
 
     // Uniques special to this city
@@ -670,17 +673,21 @@ class City : IsPartOfGameInfoSerialization, INamed {
     @Deprecated(message = "forEachMatchingUniqueWithNonLocalEffects is faster. If not viable, then this can still be used",
         replaceWith = ReplaceWith("forEachMatchingUniqueWithNonLocalEffects"))
     fun getMatchingUniquesWithNonLocalEffects(uniqueType: UniqueType, gameContext: GameContext = state): Sequence<Unique> {
-        val uniques = cityConstructions.builtBuildingUniqueMap.getUniques(uniqueType)
-        // Memory performance showed that this function was very memory intensive, thus we only create the filter if needed
-        return if (uniques.any()) uniques.filter { !it.isLocalEffect && !it.isTimedTriggerable
-            && it.conditionalsApply(gameContext) }.flatMap { it.getMultiplied(gameContext) }
-        else uniques
+        // Eager mirror of the old sequence chain - forEachMatchingUniqueWithNonLocalEffects applies identical filters
+        @LocalState val result = ArrayList<Unique>()
+        forEachMatchingUniqueWithNonLocalEffects(uniqueType, gameContext) { result.add(it) }
+        return result.asSequence()
     }
 
     // Uniques coming from this city, but that should be provided globally
     @Readonly
     fun forEachMatchingUniqueWithNonLocalEffects(uniqueType: UniqueType, gameContext: GameContext, op: (unique: Unique)->Unit)
         = cityConstructions.builtBuildingUniqueMap.forEachMatchingUnique(uniqueType, gameContext, nonLocalUniqueFilter, op)
+
+    /** Short-circuit equivalent of `getMatchingUniquesWithNonLocalEffects(...).any()` */
+    @Readonly
+    fun hasMatchingUniqueWithNonLocalEffects(uniqueType: UniqueType, gameContext: GameContext): Boolean
+        = cityConstructions.builtBuildingUniqueMap.hasMatchingUniqueMultiplied(uniqueType, gameContext, nonLocalUniqueFilter)
 
     // All uniques affecting this city: both local uniques and civ uniques.
     // This replaces LocalUniqueCache#forCityGetMatchingUniques

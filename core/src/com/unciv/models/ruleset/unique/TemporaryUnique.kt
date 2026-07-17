@@ -42,6 +42,17 @@ fun ArrayList<TemporaryUnique>.getMatchingTagUniques(uniqueType: UniqueType, gam
 }
 
 @Readonly
+/** Short-circuit equivalent of `getMatchingTagUniques(...).any()` - includes the multiplier>0 check [Unique.getMultiplied] implies */
+fun ArrayList<TemporaryUnique>.hasMatchingUnique(uniqueType: UniqueType, gameContext: GameContext): Boolean {
+    for (i in 0..<size) {
+        val unique = get(i).uniqueObject
+        if (unique.type == uniqueType && unique.conditionalsApply(gameContext) && unique.getUniqueMultiplier(gameContext) > 0)
+            return true
+    }
+    return false
+}
+
+@Readonly
 fun ArrayList<TemporaryUnique>.forEachMatchingUnique(uniqueType: UniqueType, gameContext: GameContext, op: (unique: Unique)->Unit) {
     for (i in 0..<size) {
         val unique = get(i).uniqueObject

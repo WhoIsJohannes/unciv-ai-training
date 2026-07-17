@@ -373,10 +373,25 @@ object UnitAutomation {
 
     private fun tryHeadTowardsEncampment(unit: MapUnit): Boolean {
         if (unit.hasUnique(UniqueType.SelfDestructs)) return false // don't use single-use units against barbarians...
-        val cities = unit.civ.cities
+        val civ = unit.civ
+        val cities = civ.cities
+        if (cities.isEmpty()) return false
+        // Fast path via the exact camp registry (BarbarianManager.createNewCamp is the only site creating this
+        // improvement; re-checking the improvement excludes destroyed-but-lingering ghost camps just like the
+        // tile scan did). The common case - no known camp within 6 of any city - costs ~camps x cities int ops.
+        val tileMap = civ.gameInfo.tileMap
+        val campTiles = civ.gameInfo.barbarians.encampments
+            .map { tileMap[it.position] }
+            .filter { it.improvement == Constants.barbarianEncampment && civ.hasExplored(it) }
+        if (campTiles.none { camp -> cities.any { camp.aerialDistanceTo(it.getCenterTile()) <= 6 } })
+            return false
+        // Rare slow path: re-enumerate through the original scan, restricted to contributing cities (a city
+        // without a nearby camp contributes nothing, so dropping it keeps the filtered sequence identical),
+        // so candidate ORDER - and thus stable-sort tie-breaking below - matches the old scan exactly.
         val knownEncampments = cities.asSequence()
+            .filter { city -> campTiles.any { it.aerialDistanceTo(city.getCenterTile()) <= 6 } }
             .flatMap { it.getCenterTile().getTilesInDistance(6) }
-                .filter { it.improvement == Constants.barbarianEncampment && unit.civ.hasExplored(it) }
+                .filter { it.improvement == Constants.barbarianEncampment && civ.hasExplored(it) }
             .distinct()
         val encampmentsCloseToCities = knownEncampments.asSequence()
             .sortedBy { it.aerialDistanceTo(unit.currentTile) }

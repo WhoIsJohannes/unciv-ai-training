@@ -317,8 +317,22 @@ class Tile : IsPartOfGameInfoSerialization {
     fun isExplored(player: Civilization): Boolean {
         if (DebugUtils.VISIBLE_MAP || player.isSpectator())
             return true
+        return isInExploredBy(player)
+    }
+
+    /** Same result as [exploredBy]`.contains(player.civID)`, but O(1) via the [Civilization.exploredTiles]
+     *  mirror when available. Falls back to the serialized set for civs whose setTransients hasn't run yet,
+     *  and for ad-hoc tiles without a [tileMap] (whose default [zeroBasedIndex] would alias tile 0). */
+    @Readonly @Suppress("purity") // BitSet.get is a read - same suppress precedent as UnitMovement
+    private fun isInExploredBy(player: Civilization): Boolean {
+        val explored = player.exploredTiles
+        if (explored != null && ::tileMap.isInitialized)
+            return explored.get(zeroBasedIndex)
         return exploredBy.contains(player.civID)
     }
+
+    /** For seeding the [Civilization.exploredTiles] mirror in Civilization.setTransients only */
+    internal fun isExploredBy(civID: String) = exploredBy.contains(civID)
 
     @Readonly fun isCityCenter(): Boolean = isCityCenterInternal
     @Readonly fun isNaturalWonder(): Boolean = naturalWonder != null
@@ -1198,7 +1212,7 @@ class Tile : IsPartOfGameInfoSerialization {
     fun setExplored(player: Civilization, isExplored: Boolean, explorerPosition: HexCoord? = null) {
         // Hot path: updateViewableTiles re-explores every viewable tile on every unit move,
         // so the already-explored case must stay a minimal no-op (Humans still track exploredRegion)
-        if (isExplored && exploredBy.contains(player.civID)) {
+        if (isExplored && isInExploredBy(player)) {
             if (player.playerType == PlayerType.Human)
                 player.exploredRegion.checkTilePosition(position, explorerPosition)
             return
@@ -1211,11 +1225,15 @@ class Tile : IsPartOfGameInfoSerialization {
             // Disable the undo button if a new tile has been explored
             GUI.clearUndoCheckpoints()
             exploredBy = exploredBy.withItem(player.civID)
+            if (::tileMap.isInitialized)
+                player.exploredTiles?.set(zeroBasedIndex)
 
             if (player.playerType == PlayerType.Human)
                 player.exploredRegion.checkTilePosition(position, explorerPosition)
         } else {
             exploredBy = exploredBy.withoutItem(player.civID)
+            if (::tileMap.isInitialized)
+                player.exploredTiles?.clear(zeroBasedIndex)
         }
     }
 

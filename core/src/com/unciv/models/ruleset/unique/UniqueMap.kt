@@ -1,5 +1,6 @@
 package com.unciv.models.ruleset.unique
 
+import yairm210.purity.annotations.LocalState
 import yairm210.purity.annotations.Readonly
 import java.util.*
 
@@ -45,12 +46,36 @@ open class UniqueMap() {
     fun isEmpty(): Boolean = tagUniqueMap.isEmpty()
     
     @Readonly
-    fun hasUnique(uniqueType: UniqueType, state: GameContext = GameContext.EmptyState) =
-        getUniques(uniqueType).any { it.conditionalsApply(state) && !it.isTimedTriggerable }
+    fun hasUnique(uniqueType: UniqueType, state: GameContext = GameContext.EmptyState): Boolean {
+        val list = typedUniqueMap[uniqueType] ?: return false
+        // Deliberately NO multiplier check - historical semantics of this function
+        for (i in 0..<list.size)
+            if (!list[i].isTimedTriggerable && list[i].conditionalsApply(state)) return true
+        return false
+    }
 
     @Readonly
-    fun hasUnique(uniqueTag: String, state: GameContext = GameContext.EmptyState) =
-        getTagUniques(uniqueTag).any { it.conditionalsApply(state) && !it.isTimedTriggerable }
+    fun hasUnique(uniqueTag: String, state: GameContext = GameContext.EmptyState): Boolean {
+        val list = tagUniqueMap[uniqueTag] ?: return false
+        for (i in 0..<list.size)
+            if (!list[i].isTimedTriggerable && list[i].conditionalsApply(state)) return true
+        return false
+    }
+
+    @Readonly
+    /** Short-circuit equivalent of `getMatchingUniques(...).any()` -
+     *  unlike [hasUnique] this includes the multiplier>0 check that [Unique.getMultiplied] implies. */
+    fun hasMatchingUniqueMultiplied(uniqueType: UniqueType, state: GameContext,
+                                    filter: (Unique) -> Boolean = NO_UNIQUE_FILTER): Boolean {
+        val list = typedUniqueMap[uniqueType] ?: return false
+        for (i in 0..<list.size) {
+            val unique = list[i]
+            if (!unique.isTimedTriggerable && filter(unique) && unique.conditionalsApply(state)
+                && unique.getUniqueMultiplier(state) > 0)
+                return true
+        }
+        return false
+    }
 
     @Readonly
     fun hasTagUnique(tagUnique: String) =
@@ -77,17 +102,26 @@ open class UniqueMap() {
         ?: emptySequence()
 
     @Readonly
-    /** forEachMatchingUnique faster, for cases that require high perf */ 
-    fun getMatchingUniques(uniqueType: UniqueType, state: GameContext = GameContext.EmptyState) = 
-        getUniques(uniqueType)
-            // Same as .filter | .flatMap, but more cpu/mem performant (7.7 GB vs ?? for test)
-            .flatMap {
-                when {
-                    it.isTimedTriggerable -> emptySequence()
-                    !it.conditionalsApply(state) -> emptySequence()
-                    else -> it.getMultiplied(state)
-                }
-            }
+    /** forEachMatchingUnique faster, for cases that require high perf */
+    fun getMatchingUniques(uniqueType: UniqueType, state: GameContext = GameContext.EmptyState): Sequence<Unique> {
+        val list = typedUniqueMap[uniqueType] ?: return emptySequence()
+        return getMatchingUniques(list, state)
+    }
+
+    /** Loop-built equivalent of the old `.filter | .flatMap` sequence chain - same elements, same order
+     *  (each matching unique repeated multiplier times), but no FlatteningSequence/lambda allocations. */
+    @Readonly
+    private fun getMatchingUniques(list: ArrayList<Unique>, state: GameContext): Sequence<Unique> {
+        @LocalState var result: ArrayList<Unique>? = null  // allocated lazily - most queries match nothing
+        for (i in 0..<list.size) {
+            val unique = list[i]
+            if (unique.isTimedTriggerable || !unique.conditionalsApply(state)) continue
+            val multiplier = unique.getUniqueMultiplier(state)
+            if (result == null) result = ArrayList(list.size)
+            for (j in 0..<multiplier) result.add(unique)
+        }
+        return result?.asSequence() ?: emptySequence()
+    }
 
     @Readonly
     fun forEachMatchingUnique(uniqueType: UniqueType, gameContext: GameContext, op: (Unique)->Unit)
@@ -100,16 +134,10 @@ open class UniqueMap() {
 
     @Readonly
     /** forEachMatchingTagUnique faster, for cases that require high perf */
-    fun getMatchingTagUniques(uniqueTag: String, state: GameContext = GameContext.EmptyState) =
-        getTagUniques(uniqueTag)
-            // Same as .filter | .flatMap, but more cpu/mem performant (7.7 GB vs ?? for test)
-            .flatMap {
-                when {
-                    it.isTimedTriggerable -> emptySequence()
-                    !it.conditionalsApply(state) -> emptySequence()
-                    else -> it.getMultiplied(state)
-                }
-            }
+    fun getMatchingTagUniques(uniqueTag: String, state: GameContext = GameContext.EmptyState): Sequence<Unique> {
+        val list = tagUniqueMap[uniqueTag] ?: return emptySequence()
+        return getMatchingUniques(list, state)
+    }
 
     @Readonly
     fun forEachMatchingTagUnique(uniqueTag: String, gameContext: GameContext, filter:(Unique)->Boolean, op: (Unique)->Unit) {
@@ -128,13 +156,20 @@ open class UniqueMap() {
     }
     
     @Readonly
-    fun hasMatchingUnique(uniqueType: UniqueType, state: GameContext = GameContext.EmptyState) = 
-        getUniques(uniqueType).any { it.conditionalsApply(state) }
+    fun hasMatchingUnique(uniqueType: UniqueType, state: GameContext = GameContext.EmptyState): Boolean {
+        val list = typedUniqueMap[uniqueType] ?: return false
+        for (i in 0..<list.size)
+            if (list[i].conditionalsApply(state)) return true
+        return false
+    }
 
     @Readonly
-    fun hasMatchingTagUnique(uniqueTag: String, state: GameContext = GameContext.EmptyState) =
-        getTagUniques(uniqueTag)
-            .any { it.conditionalsApply(state) }
+    fun hasMatchingTagUnique(uniqueTag: String, state: GameContext = GameContext.EmptyState): Boolean {
+        val list = tagUniqueMap[uniqueTag] ?: return false
+        for (i in 0..<list.size)
+            if (list[i].conditionalsApply(state)) return true
+        return false
+    }
 
     @Readonly
     fun getAllUniques() = tagUniqueMap.values.asSequence().flatten()

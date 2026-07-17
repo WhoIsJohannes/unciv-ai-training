@@ -19,10 +19,15 @@ import com.unciv.models.ruleset.unique.UniqueType
 import com.unciv.models.ruleset.unit.BaseUnit
 import com.unciv.utils.addToMapOfSets
 import com.unciv.utils.contains
+import yairm210.purity.annotations.Cache
 import yairm210.purity.annotations.Readonly
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.max
+
+/** Rings up to this radius are cached per tile (see [TileMap.getTilesAtDistance]); 1..6 covers the
+ *  hot callers (neighbors, city work range, encampment scans) at ~126 tile refs per fully-cached tile. */
+private const val MAX_CACHED_RING_DISTANCE = 6
 
 /** An Unciv map with all properties as produced by the [map editor][com.unciv.ui.screens.mapeditorscreen.MapEditorScreen]
  * or [MapGenerator][com.unciv.logic.map.mapgenerator.MapGenerator]; or as part of a running [game][GameInfo].
@@ -91,6 +96,14 @@ class TileMap(initialCapacity: Int = 10) : IsPartOfGameInfoSerialization {
 
     @Transient
     var tileMatrix = ArrayList<ArrayList<Tile?>>() // this works several times faster than a hashmap, the performance difference is really astounding
+
+    /** Small-radius rings per tile, indexed `[Tile.zeroBasedIndex][distance-1]`, each entry built lazily by
+     *  running the [getTilesAtDistance] generator once — so membership AND iteration order are identical.
+     *  Rings are a pure function of map geometry (tileMatrix membership, world wrap, edges), which is frozen
+     *  once [setTransients] has run; entries are never invalidated. The field stays null until the END of
+     *  [setTransients] (which also assigns zeroBasedIndex), so mapgen / partially-built maps use the generator. */
+    @Transient @Cache
+    private var tileRingCache: Array<Array<List<Tile>?>?>? = null
 
     @Transient var leftX = 0
     @Transient var bottomY = 0
@@ -251,10 +264,40 @@ class TileMap(initialCapacity: Int = 10) : IsPartOfGameInfoSerialization {
     @Readonly
     @Deprecated(message = "forEachTileAtDistance is faster. If not viable, then this can still be used",
         replaceWith = ReplaceWith("forEachTileAtDistance"))
-    fun getTilesAtDistance(origin: HexCoord, distance: Int): Sequence<Tile> =
-            if (distance <= 0) // silently take negatives.
-                sequenceOf(get(origin))
-            else
+    fun getTilesAtDistance(origin: HexCoord, distance: Int): Sequence<Tile> {
+        if (distance <= 0) // silently take negatives.
+            return sequenceOf(get(origin))
+        if (distance <= MAX_CACHED_RING_DISTANCE) {
+            val ringCache = tileRingCache
+            if (ringCache != null) {
+                // getOrNull, NOT getIfTileExistsOrNull: cache only for canonical on-map origins,
+                // so the cached ring was generated from a bit-identical origin
+                val originTile = getOrNull(origin.x, origin.y)
+                if (originTile != null)
+                    return getCachedRing(ringCache, originTile, distance).asSequence()
+            }
+        }
+        return generateTilesAtDistance(origin, distance)
+    }
+
+    /** Idempotent lazy fill of [tileRingCache] — pure-cache mutation, hence the purity suppress. */
+    @Readonly @Suppress("purity")
+    private fun getCachedRing(ringCache: Array<Array<List<Tile>?>?>, originTile: Tile, distance: Int): List<Tile> {
+        var perTile = ringCache[originTile.zeroBasedIndex]
+        if (perTile == null) {
+            perTile = arrayOfNulls(MAX_CACHED_RING_DISTANCE)
+            ringCache[originTile.zeroBasedIndex] = perTile
+        }
+        var ring = perTile[distance - 1]
+        if (ring == null) {
+            ring = generateTilesAtDistance(originTile.position, distance).toList()
+            perTile[distance - 1] = ring
+        }
+        return ring
+    }
+
+    @Readonly
+    private fun generateTilesAtDistance(origin: HexCoord, distance: Int): Sequence<Tile> =
                 sequence {
                     val centerX = origin.x
                     val centerY = origin.y
@@ -623,6 +666,11 @@ class TileMap(initialCapacity: Int = 10) : IsPartOfGameInfoSerialization {
         val minColumn = tileList.minOf { HexMath.getColumn(it.position) }
         val maxColumn = tileList.maxOf { HexMath.getColumn(it.position) }
         width = maxColumn - minColumn + 1
+
+        // Geometry (incl. zeroBasedIndex) is final from here on in a game context — enable the ring cache.
+        // NOT for the map editor / mapgen (no gameInfo yet): the editor can toggle worldWrap in place,
+        // which changes ring membership. A fresh array per call discards entries from older geometry.
+        tileRingCache = if (::gameInfo.isInitialized) arrayOfNulls(tileList.size) else null
     }
 
     /** Initialize Civilization.neutralRoads based on Tile.roadOwner

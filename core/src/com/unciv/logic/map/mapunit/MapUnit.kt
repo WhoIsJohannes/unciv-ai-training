@@ -316,12 +316,11 @@ class MapUnit : IsPartOfGameInfoSerialization {
         uniqueType: UniqueType,
         gameContext: GameContext = cache.state,
         checkCivInfoUniques: Boolean = false
-    ) = sequence {
-        yieldAll(
-                tempUniquesMap.getMatchingUniques(uniqueType, gameContext)
-        )
-        if (checkCivInfoUniques)
-            yieldAll(civ.getMatchingUniques(uniqueType, gameContext))
+    ): Sequence<Unique> {
+        // Eager mirror of the old sequence{} builder - same sources, same order, no coroutine machinery
+        @LocalState val result = ArrayList<Unique>()
+        forEachMatchingUnique(uniqueType, gameContext, checkCivInfoUniques) { result.add(it) }
+        return result.asSequence()
     }
 
     @Readonly
@@ -345,7 +344,9 @@ class MapUnit : IsPartOfGameInfoSerialization {
         gameContext: GameContext = cache.state,
         checkCivInfoUniques: Boolean = false
     ): Boolean {
-        return getMatchingUniques(uniqueType, gameContext, checkCivInfoUniques).any()
+        // Short-circuit mirror of getMatchingUniques(...).any()
+        if (tempUniquesMap.hasMatchingUniqueMultiplied(uniqueType, gameContext)) return true
+        return checkCivInfoUniques && civ.hasUnique(uniqueType, gameContext)
     }
 
     @Readonly
